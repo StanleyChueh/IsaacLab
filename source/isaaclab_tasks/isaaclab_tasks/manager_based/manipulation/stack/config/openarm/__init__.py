@@ -11,6 +11,7 @@ from . import (
     stack_ik_abs_env_cfg,
     stack_ik_abs_visuomotor_env_cfg,
     stack_joint_pos_env_cfg,
+    stack_ik_abs_dual_arm_visuomotor_env_cfg,
 )
 
 gym.register(
@@ -56,5 +57,14 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": pickup_ik_abs_cammount_env_cfg.OpenarmPickUpRedCubeCamMountEnvCfg,
+    },
+)
+
+gym.register(
+    id="Isaac-Stack-Cube-OpenArm-IK-Abs-dual-arm-Visuomotor-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": stack_ik_abs_dual_arm_visuomotor_env_cfg.OpenarmDualArmCubeStackVisuomotorAbsIKEnvCfg,
     },
 )
