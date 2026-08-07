@@ -423,5 +423,5 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
             open_command_expr={"openarm_right_finger_joint.*": 0.044},
             close_command_expr={"openarm_right_finger_joint.*": 0.0},
         )
-
+        
         self.image_obs_list = ["front_cam", "wrist_cam", "right_wrist_cam", "body_cam"]
