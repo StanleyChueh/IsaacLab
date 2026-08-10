@@ -154,8 +154,8 @@ OPENARM_UNI_CFG = ArticulationCfg(
 
 OPENARM_BI_HIGH_PD_CFG = OPENARM_BI_CFG.copy()
 OPENARM_BI_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
-OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 400.0
-OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].damping = 80.0
+OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 1000.0
+OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].damping = 10.0
 OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 2e3
 OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 1e2
 """Configuration of OpenArm Bimanual robot with stiffer PD control.
