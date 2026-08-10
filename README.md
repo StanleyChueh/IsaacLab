@@ -23,6 +23,22 @@ R	                    reset/discard
 
 ```
 
+# Record dataset w Meta Quest3 Pro
+
+Subscribe joint topic from dora, and control robot in isaac sim
+
+```
+ ./isaaclab.sh -p scripts/tools/record_demos_openarm.py --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --dataset_file logs/demos/pickup.hdf5 --enable_cameras --num_demos 1   --teleop_device vr_joint_ros2 --vr_joint_udp_host 127.0.0.1 --vr_joint_udp_port 5801
+```
+
+Dora publish code
+
+please refer to https://github.com/StanleyChueh/dora-openarm-data-collection.git 
+
+```
+cd dora-openarm-data-collection
+dora run dataflow-vr-mujoco-ros2.yaml --uv
+```
 
 # Replay dataset
 
