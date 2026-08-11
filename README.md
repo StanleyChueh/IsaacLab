@@ -28,7 +28,13 @@ R	                    reset/discard
 Subscribe joint topic from dora, and control robot in isaac sim
 
 ```
- ./isaaclab.sh -p scripts/tools/record_demos_openarm.py --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --dataset_file logs/demos/pickup.hdf5 --enable_cameras --num_demos 1   --teleop_device vr_joint_ros2 --vr_joint_udp_host 127.0.0.1 --vr_joint_udp_port 5801
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+  --dataset_file logs/demos/pickup.hdf5 \
+  --enable_cameras \
+  --num_demos 1 \
+  --teleop_device vr_joint_ros2_native \
+  --ros2_domain_id 1
 ```
 
 Dora publish code
