@@ -38,11 +38,28 @@ reassigned from IK to JointPositionActionCfg at load time, see swap_to_joint_pos
 
 Usage:
 
- ./isaaclab.sh -p scripts/tools/record_demos_openarm.py --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --dataset_file logs/demos/pickup.hdf5 --enable_cameras --num_demos 1   --teleop_device vr_ros2 --vr_udp_host 127.0.0.1 --vr_udp_port 5800
+ ./isaaclab.sh -p scripts/tools/record_demos_openarm.py  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0  --dataset_file logs/demos/pickup.hdf5 --enable_cameras  --num_demos 1    --teleop_device vr_ros2  --vr_udp_host 127.0.0.1  --vr_udp_port 5800
 
- ./isaaclab.sh -p scripts/tools/record_demos_openarm.py --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --dataset_file logs/demos/pickup.hdf5 --enable_cameras --num_demos 1   --teleop_device vr_joint_ros2 --vr_joint_udp_host 127.0.0.1 --vr_joint_udp_port 5801
+processed:vr_joint_ros2 udp
+ ./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+ --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0  \
+ --dataset_file logs/demos/pickup.hdf5  \
+ --enable_cameras  \
+ --num_demos 1   \
+ --teleop_device vr_joint_ros2  \
+ --vr_joint_udp_host 127.0.0.1 \
+ --vr_joint_udp_port 5801
 
-"""
+
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+  --dataset_file logs/demos/pickup.hdf5 \
+  --enable_cameras \
+  --num_demos 1 \
+  --teleop_device vr_joint_ros2_native \
+  --ros2_domain_id 1
+
+""" 
 
 """Launch Isaac Sim Simulator first."""
 
@@ -59,7 +76,7 @@ parser.add_argument(
     "--teleop_device",
     type=str,
     default="keyboard",
-    choices=["keyboard", "vr_ros2", "vr_joint_ros2"],
+    choices=["keyboard", "vr_ros2", "vr_joint_ros2", "vr_joint_ros2_native"],
     help=(
         "Teleop device. 'keyboard' uses OpenArmKeyboard (single active arm, TAB to switch)."
         " 'vr_ros2' drives BOTH arms simultaneously from a UDP JSON side-channel fed by"
@@ -70,9 +87,21 @@ parser.add_argument(
         " --vr-joint-udp-port (see --vr_joint_udp_host/--vr_joint_udp_port below); it reassigns"
         " the task's arm_action/right_arm_action from IK to JointPositionActionCfg at load time,"
         " so the joint targets apply directly with no Cartesian frame/calibration step (unlike"
-        " 'vr_ros2', it doesn't need --vr_quat_offset). R/N/T keyboard shortcuts (reset/save/"
-        " ramp-test) still work in both VR modes; TAB/arm-switch does not (both arms are always"
-        " live)."
+        " 'vr_ros2', it doesn't need --vr_quat_offset). 'vr_joint_ros2_native' is the same"
+        " joint-space control as 'vr_joint_ros2', but skips the UDP JSON hop entirely: it builds a"
+        " ROS2 OmniGraph (isaacsim.ros2.bridge.ROS2SubscribeJointState) that decodes"
+        " /openarm/vr_joint_command_processed over native ROS2 DDS every frame, and"
+        " arm_action/gripper_action/right_arm_action/right_gripper_action are reassigned (see"
+        " swap_to_native_ros2_joint_actions) to read that decoded message directly in"
+        " apply_actions() instead of using whatever env.step() was called with -- see"
+        " ROS2JointCommandAction's docstring for why the joint targets still go through"
+        " IsaacLab's normal action/actuator pipeline rather than a graph node writing PhysX"
+        " directly (the latter races with IsaacLab's own actuator model and was tried first; it"
+        " silently lost that race and looked like the topic wasn't connected at all). See"
+        " --ros2_topic/--ros2_domain_id below. Much lower latency than the UDP path, at the cost"
+        " of needing isaacsim.ros2.bridge and the same ROS_DOMAIN_ID as the dora side. R/N/T"
+        " keyboard shortcuts (reset/save/ramp-test) still work in all VR modes; TAB/arm-switch"
+        " does not (both arms are always live)."
     ),
 )
 parser.add_argument(
@@ -134,6 +163,29 @@ parser.add_argument(
     type=int,
     default=5801,
     help="Port to bind for --teleop_device vr_joint_ros2's UDP JSON listener.",
+)
+parser.add_argument(
+    "--ros2_topic",
+    type=str,
+    default="/openarm/vr_joint_command_processed",
+    help=(
+        "--teleop_device vr_joint_ros2_native only: ROS2 JointState topic the OmniGraph"
+        " subscribes to. Must match dora-openarm-ros2-bridge/joint_command_processor.py's"
+        " output topic (its --vr-joint-udp-port UDP broadcast carries the same data over a"
+        " different transport, for vr_joint_ros2 instead)."
+    ),
+)
+parser.add_argument(
+    "--ros2_domain_id",
+    type=int,
+    default=1,
+    help=(
+        "--teleop_device vr_joint_ros2_native only: ROS_DOMAIN_ID for the OmniGraph's"
+        " ROS2Context node. Must match the dora side's ROS_DOMAIN_ID (see"
+        " dataflow-vr-mujoco-ros2.yaml's ros2-bridge/joint-command-processor node env) or this"
+        " process simply never sees any packets -- DDS domains that don't match don't discover"
+        " each other, there's no error, just silence."
+    ),
 )
 parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
@@ -203,6 +255,7 @@ import re
 import socket
 import threading
 import time
+from dataclasses import MISSING
 
 import gymnasium as gym
 import torch
@@ -215,7 +268,8 @@ import omni.ui as ui
 
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs.ui import EmptyWindow
-from isaaclab.managers import DatasetExportMode
+from isaaclab.managers import ActionTerm, ActionTermCfg, DatasetExportMode
+from isaaclab.utils import configclass
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -415,13 +469,18 @@ class VRDualArmTeleop:
     here, unlike OpenArmKeyboard's single-arm scheme.
     """
 
-    # Raw gripper values arrive as dora-openarm-kinematics' trigger-mapped joint angle
-    # (_map_trigger_to_gripper): right in [-0.785, 0] rad, left in [0, 0.785] rad, with
-    # trigger=0 (released) at the extreme and trigger=1 (fully squeezed) at 0. Assumed
-    # here that "released" = open and "squeezed" = closed (typical VR grip ergonomics)
-    # -- unverified against the real hardware convention. If the sim gripper opens/closes
-    # backwards from what you're doing with the trigger, flip the sign in _gripper_raw_to_cmd.
-    GRIPPER_RAW_RANGE = 0.785
+    # Raw gripper values arrive as dora-openarm-kinematics' trigger-mapped joint command
+    # (_map_trigger_to_gripper), read directly off whichever MuJoCo model --xml points the
+    # dora `ik` node at (see ik.py's _gripper_endpoints). For the v1_camera model (the one
+    # both dora and this v1_camera_isaac robot now use) that's a prismatic finger joint,
+    # closed=0.0 m .. open=0.044 m on BOTH sides (unlike the older v2 hinge models, which
+    # were signed and in radians -- right [-0.785, 0], left [0, 0.785] -- hence the old
+    # GRIPPER_RAW_RANGE=0.785/abs() scheme this replaced; that range is stale for
+    # v1_camera and collapsed every raw value into the same "closed" half of cmd's [-1, 1],
+    # i.e. the gripper no longer responded to the trigger at all).
+    # trigger=0 (released) -> open (0.044), trigger=1 (fully squeezed) -> closed (0.0).
+    GRIPPER_OPEN_VAL = 0.044
+    GRIPPER_CLOSED_VAL = 0.0
 
     def __init__(
         self,
@@ -526,7 +585,8 @@ class VRDualArmTeleop:
         pass
 
     def _gripper_raw_to_cmd(self, raw: float) -> float:
-        cmd = (2.0 * abs(raw) / self.GRIPPER_RAW_RANGE) - 1.0
+        span = self.GRIPPER_OPEN_VAL - self.GRIPPER_CLOSED_VAL
+        cmd = 2.0 * (raw - self.GRIPPER_CLOSED_VAL) / span - 1.0
         return max(-1.0, min(1.0, cmd))
 
     def _current_ee_pose_b(self, body_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -641,6 +701,189 @@ def swap_to_joint_position_actions(env_cfg) -> None:
     )
 
 
+class ROS2JointCommandAction(ActionTerm):
+    """Action term that applies joint position targets read straight out of a ROS2
+    OmniGraph's ROS2SubscribeJointState node (see build_ros2_joint_command_graph),
+    instead of whatever env.step() was called with.
+
+    This exists because a true no-op action term doesn't actually free these joints up
+    for something else (e.g. an IsaacArticulationController OG node) to drive: IsaacLab's
+    implicit actuator model recomputes and re-applies a PD target for EVERY joint on
+    EVERY Articulation.write_data_to_sim() call regardless of which (if any) action term
+    "owns" it -- actuators are wired up per-asset (ArticulationCfg.actuators), completely
+    independent of the env's action pipeline. With a real no-op, that per-step
+    write_data_to_sim() call keeps re-asserting these joints' STALE cached
+    joint_pos_target (left at whatever it was after the last reset, e.g. the default
+    pose) via set_dof_position_targets(..., ALL_INDICES) -- fighting an
+    IsaacArticulationController node writing the same joints from the other side, with
+    whichever happens to run later in a given physics substep winning. In practice this
+    made the arms hold near their default pose rather than track ROS2 commands at all.
+
+    Reading the OmniGraph's subscriber output directly in apply_actions() and pushing it
+    through the normal set_joint_position_target()/actuator/write_data_to_sim() path
+    instead makes IsaacLab's own pipeline the SOLE writer of these joints' targets again
+    -- eliminating the race -- while the OmniGraph is still only used for what it's
+    needed for: decoding ROS2 messages without importing rclpy into this Python 3.11
+    process (see VRDualArmTeleop's docstring for why that doesn't work directly).
+
+    process_actions() ignores whatever env.step() was called with entirely -- the actual
+    source of truth is read fresh from the OmniGraph in apply_actions() (called once per
+    *simulation* step, i.e. every physics substep, so it's always using the latest
+    decoded ROS2 message).
+    """
+
+    cfg: "ROS2JointCommandActionCfg"
+
+    def __init__(self, cfg: "ROS2JointCommandActionCfg", env) -> None:
+        super().__init__(cfg, env)
+        self._joint_ids, self._joint_names = self._asset.find_joints(cfg.joint_names, preserve_order=True)
+        self._raw_actions = torch.zeros(self.num_envs, len(self._joint_ids), device=self.device)
+        self._default_joint_pos = self._asset.data.default_joint_pos[:, self._joint_ids].clone()
+        self._subscriber_path = f"{cfg.graph_path}/SubscriberJointState"
+
+    @property
+    def action_dim(self) -> int:
+        return len(self._joint_ids)
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    def process_actions(self, actions: torch.Tensor):
+        # Not used for control (see class docstring) -- stashed only so it still shows up
+        # as the recorded episode's "action" the same way every other action term's does.
+        self._raw_actions[:] = actions
+
+    def apply_actions(self):
+        import omni.graph.core as og
+
+        try:
+            names = og.Controller.attribute(f"{self._subscriber_path}.outputs:jointNames").get()
+            positions = og.Controller.attribute(f"{self._subscriber_path}.outputs:positionCommand").get()
+        except Exception:
+            return  # graph/attribute not ready yet (e.g. very first frame) -- try again next step
+        if not names or positions is None or len(positions) == 0:
+            return  # no ROS2 message decoded yet -- leave joints at whatever they're already at
+
+        by_name = dict(zip(names, positions))
+        target = self._default_joint_pos.clone()
+        for i, joint_name in enumerate(self._joint_names):
+            if joint_name in by_name:
+                target[:, i] = by_name[joint_name]
+        self._asset.set_joint_position_target(target, joint_ids=self._joint_ids)
+
+
+@configclass
+class ROS2JointCommandActionCfg(ActionTermCfg):
+    """Configuration for :class:`ROS2JointCommandAction`."""
+
+    class_type: type[ActionTerm] = ROS2JointCommandAction
+    joint_names: list[str] = MISSING
+    """Regex(es) selecting which of the ROS2 message's joints this field owns (e.g. the
+    left arm's 7 joints, or just the left gripper's 1) -- matched the same way as any
+    other joint action term's joint_names."""
+    graph_path: str = "/Graph/ROS_JointCommand"
+    """Must match build_ros2_joint_command_graph's graph_path."""
+
+
+def swap_to_native_ros2_joint_actions(env_cfg) -> None:
+    """Reassign all four of env_cfg.actions' fields (arm_action, gripper_action,
+    right_arm_action, right_gripper_action) to :class:`ROS2JointCommandActionCfg`, for
+    --teleop_device vr_joint_ros2_native. Must run on the parsed cfg BEFORE gym.make(),
+    same as swap_to_joint_position_actions -- ActionsCfg field order/widths are fixed at
+    that point, and the resulting action vector is TOTAL_ACTION_DIM_JOINT (16) wide, same
+    as vr_joint_ros2, purely so downstream code (recorder, dataset shape) doesn't need a
+    third case.
+
+    Unlike swap_to_joint_position_actions, the values env.step() is called with are
+    irrelevant to control here -- see ROS2JointCommandAction's docstring for where the
+    actual targets come from and why.
+    """
+    if not hasattr(env_cfg.actions, "right_arm_action"):
+        raise RuntimeError(
+            "--teleop_device vr_joint_ros2_native requires a dual-arm task (env_cfg.actions has"
+            " no right_arm_action to swap)."
+        )
+    env_cfg.actions.arm_action = ROS2JointCommandActionCfg(asset_name="robot", joint_names=LEFT_ARM_JOINT_REGEX)
+    env_cfg.actions.gripper_action = ROS2JointCommandActionCfg(
+        asset_name="robot", joint_names=[LEFT_GRIPPER_JOINT_NAME]
+    )
+    env_cfg.actions.right_arm_action = ROS2JointCommandActionCfg(
+        asset_name="robot", joint_names=RIGHT_ARM_JOINT_REGEX
+    )
+    env_cfg.actions.right_gripper_action = ROS2JointCommandActionCfg(
+        asset_name="robot", joint_names=[RIGHT_GRIPPER_JOINT_NAME]
+    )
+
+
+def build_ros2_joint_command_graph(
+    topic_name: str,
+    domain_id: int,
+    graph_path: str = "/Graph/ROS_JointCommand",
+) -> None:
+    """Build a ROS2 OmniGraph that decodes `topic_name` (a sensor_msgs/JointState, e.g.
+    dora-openarm-ros2-bridge/joint_command_processor.py's
+    /openarm/vr_joint_command_processed) over native ROS2 DDS every simulation frame.
+
+    Deliberately does NOT include an IsaacArticulationController node -- see
+    ROS2JointCommandAction's docstring for why writing PhysX joint targets directly from
+    the graph races with IsaacLab's own actuator model. This graph only decodes the
+    message into OmniGraph attributes (outputs:jointNames/positionCommand on
+    SubscriberJointState); ROS2JointCommandAction.apply_actions() reads those back out
+    each simulation step and applies them the normal IsaacLab way.
+
+        OnPlaybackTick ─tick─┬──────────────────────────┐
+                             ▼                           ▼
+        ROS2Context ──context──▶ ROS2SubscribeJointState (outputs read directly by
+                                  topicName=`topic_name`   ROS2JointCommandAction, not
+                                                            wired to anything downstream
+                                                            in this graph)
+
+    Must run AFTER the robot has been spawned (i.e. after gym.make()/env creation) purely
+    for consistency with when the rest of this script sets things up -- unlike the
+    IsaacArticulationController version this replaced, nothing here actually depends on
+    the robot prim existing yet.
+    """
+    from isaacsim.core.utils.extensions import enable_extension
+
+    enable_extension("isaacsim.ros2.bridge")
+
+    import omni.graph.core as og
+
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("SubscriberJointState", "isaacsim.ros2.bridge.ROS2SubscribeJointState"),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "SubscriberJointState.inputs:execIn"),
+                ("Context.outputs:context", "SubscriberJointState.inputs:context"),
+            ],
+            keys.SET_VALUES: [
+                ("Context.inputs:domain_id", domain_id),
+                # ROS2Context's useDomainIDEnvVar defaults to True ("use ROS_DOMAIN_ID env var
+                # if set, ignoring domain_id"). This process's shell/conda env has no reason to
+                # have ROS_DOMAIN_ID set to anything in particular, so left at its default this
+                # would non-deterministically either match or silently diverge from whatever
+                # domain_id happens to be picked -- turned off so --ros2_domain_id is always the
+                # one source of truth, matching dora's ROS_DOMAIN_ID (dataflow-vr-mujoco-ros2.yaml
+                # sets it to "1" for ros2-bridge/joint-command-processor).
+                ("Context.inputs:useDomainIDEnvVar", False),
+                ("SubscriberJointState.inputs:topicName", topic_name),
+            ],
+        },
+    )
+    print(f"[ROS2 NATIVE TELEOP] Built {graph_path}: decoding '{topic_name}' (domain_id={domain_id}).")
+
+
 class VRDualArmJointTeleop:
     """Bimanual JOINT-SPACE VR teleop device fed by a UDP JSON side-channel from
     dora-openarm-ros2-bridge/joint_command_processor.py's --vr-joint-udp-port (in the
@@ -657,10 +900,14 @@ class VRDualArmJointTeleop:
         {"t": float, "name": [str, ...], "position": [float, ...]}
     `name`/`position` are the same 16-entry arrays published on the ROS 2 topic
     /openarm/vr_joint_command_processed: left_joint1..7, left gripper joint,
-    right_joint1..7, right gripper joint -- already joint6/joint7 swapped+negated per
-    arm by that node. A joint name missing from the latest packet holds its last
-    commanded target (initialized to the robot's default_joint_pos) rather than
-    snapping to zero; a missing gripper name keeps its previous binary command.
+    right_joint1..7, right gripper joint -- passed through unchanged by that node (no
+    joint6/joint7 swap anymore: the dora `ik` node now solves directly against the
+    v1_camera MuJoCo model, whose joint6/joint7 axes already match this v1_camera_isaac
+    robot's, so the old per-arm swap+negate hack -- needed only when `ik` solved against
+    the v2 model -- was removed on the dora side and must NOT be reintroduced here). A
+    joint name missing from the latest packet holds its last commanded target
+    (initialized to the robot's default_joint_pos) rather than snapping to zero; a
+    missing gripper name keeps its previous binary command.
     """
 
     def __init__(
@@ -755,8 +1002,10 @@ class VRDualArmJointTeleop:
         self._additional_callbacks[key] = func
 
     def _gripper_raw_to_cmd(self, raw: float) -> float:
-        # Same raw-value convention as VRDualArmTeleop -- see its GRIPPER_RAW_RANGE docstring.
-        cmd = (2.0 * abs(raw) / VRDualArmTeleop.GRIPPER_RAW_RANGE) - 1.0
+        # Same raw-value convention as VRDualArmTeleop -- see its GRIPPER_OPEN_VAL/
+        # GRIPPER_CLOSED_VAL docstring.
+        span = VRDualArmTeleop.GRIPPER_OPEN_VAL - VRDualArmTeleop.GRIPPER_CLOSED_VAL
+        cmd = 2.0 * (raw - VRDualArmTeleop.GRIPPER_CLOSED_VAL) / span - 1.0
         return max(-1.0, min(1.0, cmd))
 
     def reset(self):
@@ -799,6 +1048,115 @@ class VRDualArmJointTeleop:
         full[RIGHT_JOINT_GRP_IDX] = right_gripper_state
 
         return full, left_gripper_state, right_gripper_state
+
+
+class ROS2NativeJointTeleop:
+    """Bimanual JOINT-SPACE teleop for --teleop_device vr_joint_ros2_native.
+
+    Unlike VRDualArmJointTeleop, this class does not drive the robot at all -- joint
+    targets are written directly by the ROS2 OmniGraph built in
+    build_ros2_joint_command_graph, which subscribes to
+    dora-openarm-ros2-bridge/joint_command_processor.py's
+    /openarm/vr_joint_command_processed topic over native ROS2 DDS (no UDP JSON hop, no
+    Python-side socket polling). env_cfg.actions' four fields are reassigned to
+    NoOpActionCfg by swap_to_native_ros2_joint_actions so IsaacLab's own action pipeline
+    never writes a competing target for the same joints.
+
+    This class's only two jobs: keep the R/N/T keyboard shortcuts working (main() wires
+    them the same way as every other teleop device), and report the robot's ACTUAL
+    current joint positions each step as build_dual_action's return value, since that's
+    what the recorder logs as the episode's "action" -- there is no separate "commanded"
+    value on this process to log instead, the OmniGraph is the only thing that ever sees
+    the raw ROS2 message.
+    """
+
+    def __init__(self, robot, sim_device: str):
+        self._robot = robot
+        self._sim_device = sim_device
+
+        self._left_joint_ids, self._left_joint_names = robot.find_joints(LEFT_ARM_JOINT_REGEX)
+        self._right_joint_ids, self._right_joint_names = robot.find_joints(RIGHT_ARM_JOINT_REGEX)
+        if len(self._left_joint_ids) != 7 or len(self._right_joint_ids) != 7:
+            raise RuntimeError(
+                "ROS2NativeJointTeleop expected 7 joints per arm, got"
+                f" left={self._left_joint_names}, right={self._right_joint_names}."
+            )
+        left_gripper_ids, _ = robot.find_joints([LEFT_GRIPPER_JOINT_NAME])
+        right_gripper_ids, _ = robot.find_joints([RIGHT_GRIPPER_JOINT_NAME])
+        if len(left_gripper_ids) != 1 or len(right_gripper_ids) != 1:
+            raise RuntimeError(
+                "ROS2NativeJointTeleop expected exactly one match each for"
+                f" '{LEFT_GRIPPER_JOINT_NAME}'/'{RIGHT_GRIPPER_JOINT_NAME}', got"
+                f" left={left_gripper_ids}, right={right_gripper_ids}."
+            )
+        self._left_gripper_id = left_gripper_ids[0]
+        self._right_gripper_id = right_gripper_ids[0]
+
+        self._additional_callbacks: dict = {}
+        self._setup_keyboard()  # R/N/T only -- no WASD, no arm-switch
+
+        print("[ROS2 NATIVE TELEOP] Joint targets are driven directly by a ROS2 OmniGraph -- this"
+              " process only logs state and services R/N/T keyboard shortcuts.")
+
+    def _setup_keyboard(self):
+        import carb.input as ci
+        import omni.appwindow
+        import weakref
+
+        appwindow = omni.appwindow.get_default_app_window()
+        self._keyboard = appwindow.get_keyboard()
+        self._ci = ci.acquire_input_interface()
+        self._sub = self._ci.subscribe_to_keyboard_events(
+            self._keyboard,
+            lambda event, *_, obj=weakref.proxy(self): obj._on_key_event(event),
+        )
+
+    def _on_key_event(self, event) -> bool:
+        import carb.input as ci
+
+        try:
+            name = event.input.name
+        except AttributeError:
+            return True
+        if event.type == ci.KeyboardEventType.KEY_PRESS and name in self._additional_callbacks:
+            self._additional_callbacks[name]()
+        return True
+
+    def __del__(self):
+        try:
+            self._ci.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
+        except Exception:
+            pass
+
+    def add_callback(self, key: str, func):
+        self._additional_callbacks[key] = func
+
+    def reset(self):
+        pass
+
+    def clear_deltas(self):
+        pass
+
+    def build_dual_action(
+        self, left_gripper_state: float, right_gripper_state: float
+    ) -> tuple[torch.Tensor, float, float]:
+        """Ignores left_gripper_state/right_gripper_state (kept only so the call
+        signature matches VRDualArmTeleop/VRDualArmJointTeleop) and instead reads back
+        the robot's actual current joint positions -- real actuation for this mode
+        happens out-of-band through the OmniGraph, not through anything computed here.
+        """
+        left_pos = self._robot.data.joint_pos[0, self._left_joint_ids]
+        right_pos = self._robot.data.joint_pos[0, self._right_joint_ids]
+        left_grip_pos = self._robot.data.joint_pos[0, self._left_gripper_id].item()
+        right_grip_pos = self._robot.data.joint_pos[0, self._right_gripper_id].item()
+
+        full = torch.zeros(TOTAL_ACTION_DIM_JOINT, dtype=torch.float32, device=self._sim_device)
+        full[LEFT_JOINT_SLICE] = left_pos
+        full[LEFT_JOINT_GRP_IDX] = left_grip_pos
+        full[RIGHT_JOINT_SLICE] = right_pos
+        full[RIGHT_JOINT_GRP_IDX] = right_grip_pos
+
+        return full, left_grip_pos, right_grip_pos
 
 
 class JointMirrorBroadcaster:
@@ -1082,6 +1440,12 @@ def main():
         except RuntimeError as e:
             logger.error(str(e))
             return
+    elif args_cli.teleop_device == "vr_joint_ros2_native":
+        try:
+            swap_to_native_ros2_joint_actions(env_cfg)
+        except RuntimeError as e:
+            logger.error(str(e))
+            return
 
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
@@ -1149,6 +1513,8 @@ def main():
 
     use_vr_teleop = args_cli.teleop_device == "vr_ros2"
     use_vr_joint_teleop = args_cli.teleop_device == "vr_joint_ros2"
+    use_vr_joint_teleop_native = args_cli.teleop_device == "vr_joint_ros2_native"
+    use_any_vr_teleop = use_vr_teleop or use_vr_joint_teleop or use_vr_joint_teleop_native
     if use_vr_teleop and total_action_dim != TOTAL_ACTION_DIM:
         logger.error("--teleop_device vr_ros2 requires a dual-arm (14D action) task.")
         return
@@ -1156,6 +1522,12 @@ def main():
         logger.error(
             "--teleop_device vr_joint_ros2 requires a dual-arm task with the arm actions"
             f" swapped to JointPositionActionCfg (16D action, got {total_action_dim})."
+        )
+        return
+    if use_vr_joint_teleop_native and total_action_dim != TOTAL_ACTION_DIM_JOINT:
+        logger.error(
+            "--teleop_device vr_joint_ros2_native requires a dual-arm task with all four action"
+            f" fields swapped to NoOpActionCfg (16D action, got {total_action_dim})."
         )
         return
 
@@ -1177,6 +1549,12 @@ def main():
             udp_port=args_cli.vr_joint_udp_port,
             sim_device=sim_device,
         )
+    elif use_vr_joint_teleop_native:
+        build_ros2_joint_command_graph(
+            topic_name=args_cli.ros2_topic,
+            domain_id=args_cli.ros2_domain_id,
+        )
+        teleop = ROS2NativeJointTeleop(robot=env.scene["robot"], sim_device=sim_device)
     else:
         # Use OpenArmKeyboard (arrow keys + I/O) to avoid Isaac Sim viewport
         # gizmo conflicts with W/A/S/D/Q/E.
@@ -1219,7 +1597,7 @@ def main():
         _refresh_label()
 
     def _refresh_label():
-        if use_vr_teleop or use_vr_joint_teleop:
+        if use_any_vr_teleop:
             label_text = f"Bimanual VR teleop  |  Demos: {demo_count}"
         else:
             arm_indicator = "◄ LEFT" if active_arm == "left" else "RIGHT ►"
@@ -1231,7 +1609,7 @@ def main():
 
     teleop.add_callback("R", reset_episode)
     teleop.add_callback("N", save_episode)
-    if not (use_vr_teleop or use_vr_joint_teleop):
+    if not use_any_vr_teleop:
         teleop.add_callback("TAB", toggle_arm)
     teleop.add_callback("T", request_ramp_test)
 
@@ -1255,6 +1633,11 @@ def main():
         print("  VR (bimanual, pose/IK) — both arms + grippers driven live from the Dora UDP bridge")
     elif use_vr_joint_teleop:
         print("  VR (bimanual, joint-space) — both arms + grippers driven live from the Dora UDP bridge")
+    elif use_vr_joint_teleop_native:
+        print(
+            "  VR (bimanual, joint-space, native ROS2) — both arms + grippers driven live by a ROS2"
+            f" OmniGraph subscribed to '{args_cli.ros2_topic}' (domain_id={args_cli.ros2_domain_id})"
+        )
     else:
         if is_dual_arm:
             print("  TAB        — switch active arm (left ↔ right)")
@@ -1267,7 +1650,7 @@ def main():
     print("  R          — discard & reset episode")
     print("  T          — ramp current pose to rest (matches reset_to_rest_pose.py) and watch")
     print("               the viewport for a pad collision -- doesn't record, doesn't reset")
-    if is_dual_arm and not (use_vr_teleop or use_vr_joint_teleop):
+    if is_dual_arm and not use_any_vr_teleop:
         print(f"\nActive arm: LEFT\n")
     else:
         print()
@@ -1290,7 +1673,7 @@ def main():
                 continue
 
             # Build action vector sized to match the task's action space
-            if use_vr_teleop or use_vr_joint_teleop:
+            if use_any_vr_teleop:
                 full_action, left_gripper_state, right_gripper_state = teleop.build_dual_action(
                     left_gripper_state=left_gripper_state,
                     right_gripper_state=right_gripper_state,

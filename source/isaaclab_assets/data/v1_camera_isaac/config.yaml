@@ -7,7 +7,7 @@ fix_base: true
 root_link_name: null
 link_density: 0.0
 merge_fixed_joints: false
-convert_mimic_joints_to_normal_joints: true
+convert_mimic_joints_to_normal_joints: false
 joint_drive:
   drive_type: force
   target_type: position
