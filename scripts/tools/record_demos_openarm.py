@@ -671,6 +671,13 @@ JOINT_ACTION_SCALE = 1.0
 LEFT_GRIPPER_JOINT_NAME = "openarm_left_finger_joint1"
 RIGHT_GRIPPER_JOINT_NAME = "openarm_right_finger_joint1"
 
+# The second jaw of each gripper. Never published over ROS2 (on hardware it is coupled to
+# joint1 mechanically), but in sim it is a real actuated joint that has to be commanded
+# alongside joint1 or it stays shut -- see openarm.py's "openarm_gripper" actuator comment
+# and ROS2JointCommandActionCfg.mimic_joints.
+LEFT_GRIPPER_FOLLOWER_JOINT_NAME = "openarm_left_finger_joint2"
+RIGHT_GRIPPER_FOLLOWER_JOINT_NAME = "openarm_right_finger_joint2"
+
 
 def swap_to_joint_position_actions(env_cfg) -> None:
     """Reassign env_cfg.actions.arm_action/right_arm_action from the task's default IK
@@ -741,6 +748,15 @@ class ROS2JointCommandAction(ActionTerm):
         self._default_joint_pos = self._asset.data.default_joint_pos[:, self._joint_ids].clone()
         self._subscriber_path = f"{cfg.graph_path}/SubscriberJointState"
 
+        # Followers are driven but excluded from action_dim -- see the cfg's docstring.
+        follower_names = list(cfg.follower_joints)
+        if follower_names:
+            self._follower_ids, resolved = self._asset.find_joints(follower_names, preserve_order=True)
+            self._follower_sources = [cfg.follower_joints[n] for n in resolved]
+            self._follower_default_pos = self._asset.data.default_joint_pos[:, self._follower_ids].clone()
+        else:
+            self._follower_ids, self._follower_sources = [], []
+
     @property
     def action_dim(self) -> int:
         return len(self._joint_ids)
@@ -776,6 +792,18 @@ class ROS2JointCommandAction(ActionTerm):
                 target[:, i] = by_name[joint_name]
         self._asset.set_joint_position_target(target, joint_ids=self._joint_ids)
 
+        # Follower joints (the grippers' *_finger_joint2). The dora/ROS2 side never
+        # publishes them -- on hardware that jaw is mechanically coupled to joint1 -- but
+        # in sim it is a genuine actuated joint (see openarm.py's "openarm_gripper"
+        # comment). Left uncommanded it would sit at its default target, i.e. clamped
+        # shut, while joint1 opens. Copy the leader's commanded value onto it.
+        if self._follower_ids:
+            f_target = self._follower_default_pos.clone()
+            for i, source in enumerate(self._follower_sources):
+                if source in by_name:
+                    f_target[:, i] = by_name[source]
+            self._asset.set_joint_position_target(f_target, joint_ids=self._follower_ids)
+
 
 @configclass
 class ROS2JointCommandActionCfg(ActionTermCfg):
@@ -786,6 +814,14 @@ class ROS2JointCommandActionCfg(ActionTermCfg):
     """Regex(es) selecting which of the ROS2 message's joints this field owns (e.g. the
     left arm's 7 joints, or just the left gripper's 1) -- matched the same way as any
     other joint action term's joint_names."""
+    follower_joints: dict[str, str] = {}
+    """Extra joints to drive alongside :attr:`joint_names`, mapped to the joint whose
+    commanded value they copy, e.g.
+    ``{"openarm_left_finger_joint2": "openarm_left_finger_joint1"}``.
+
+    These are deliberately NOT part of :attr:`joint_names`: they must not widen
+    :attr:`action_dim`, because the recorded action vector is fixed at
+    TOTAL_ACTION_DIM_JOINT (16). See :meth:`ROS2JointCommandAction.apply_actions`."""
     graph_path: str = "/Graph/ROS_JointCommand"
     """Must match build_ros2_joint_command_graph's graph_path."""
 
@@ -810,13 +846,17 @@ def swap_to_native_ros2_joint_actions(env_cfg) -> None:
         )
     env_cfg.actions.arm_action = ROS2JointCommandActionCfg(asset_name="robot", joint_names=LEFT_ARM_JOINT_REGEX)
     env_cfg.actions.gripper_action = ROS2JointCommandActionCfg(
-        asset_name="robot", joint_names=[LEFT_GRIPPER_JOINT_NAME]
+        asset_name="robot",
+        joint_names=[LEFT_GRIPPER_JOINT_NAME],
+        follower_joints={LEFT_GRIPPER_FOLLOWER_JOINT_NAME: LEFT_GRIPPER_JOINT_NAME},
     )
     env_cfg.actions.right_arm_action = ROS2JointCommandActionCfg(
         asset_name="robot", joint_names=RIGHT_ARM_JOINT_REGEX
     )
     env_cfg.actions.right_gripper_action = ROS2JointCommandActionCfg(
-        asset_name="robot", joint_names=[RIGHT_GRIPPER_JOINT_NAME]
+        asset_name="robot",
+        joint_names=[RIGHT_GRIPPER_JOINT_NAME],
+        follower_joints={RIGHT_GRIPPER_FOLLOWER_JOINT_NAME: RIGHT_GRIPPER_JOINT_NAME},
     )
 
 
@@ -897,7 +937,8 @@ class VRDualArmJointTeleop:
     --vr_quat_offset in the pose-based path).
 
     Wire format per packet (see joint_command_processor.py's VrJointUdpBroadcaster):
-        {"t": float, "name": [str, ...], "position": [float, ...]}
+        {"t": float, "name": [str, ...], "position": [float, ...],
+         "button_x": bool, "button_y": bool}
     `name`/`position` are the same 16-entry arrays published on the ROS 2 topic
     /openarm/vr_joint_command_processed: left_joint1..7, left gripper joint,
     right_joint1..7, right gripper joint -- passed through unchanged by that node (no
@@ -908,6 +949,14 @@ class VRDualArmJointTeleop:
     joint name missing from the latest packet holds its last commanded target
     (initialized to the robot's default_joint_pos) rather than snapping to zero; a
     missing gripper name keeps its previous binary command.
+
+    `button_x`/`button_y` are the Quest controller's X/Y buttons, forwarded from
+    dora's quest_receiver.py through joint_command_processor.py. build_dual_action()
+    watches for a rising edge (False -> True) on each and fires a callback -- X calls
+    main()'s start_recording() (arms recording; nothing is saved before this press,
+    see requires_manual_arm), Y calls reset_episode() (same as the R key: discard &
+    reset). See main()'s teleop.add_callback("X_START", ...) / ("R", ...) wiring, which
+    populates self._additional_callbacks the exact same way a keypress would.
     """
 
     def __init__(
@@ -944,6 +993,8 @@ class VRDualArmJointTeleop:
         self._thread.start()
 
         self._additional_callbacks: dict = {}
+        self._prev_button_x = False
+        self._prev_button_y = False
         self._setup_keyboard()  # R/N/T only -- no WASD, no arm-switch
 
         print(f"[VR JOINT TELEOP] Listening for Dora bridge UDP JSON on {udp_host}:{udp_port}")
@@ -1027,6 +1078,21 @@ class VRDualArmJointTeleop:
         with self._lock:
             packet = dict(self._latest)
 
+        button_x = bool(packet.get("button_x", False))
+        button_y = bool(packet.get("button_y", False))
+        if button_x and not self._prev_button_x:
+            start_cb = self._additional_callbacks.get("X_START")
+            if start_cb is not None:
+                print("[VR JOINT TELEOP] X pressed -> start recording")
+                start_cb()
+        if button_y and not self._prev_button_y:
+            reset_cb = self._additional_callbacks.get("R")
+            if reset_cb is not None:
+                print("[VR JOINT TELEOP] Y pressed -> discard & reset episode")
+                reset_cb()
+        self._prev_button_x = button_x
+        self._prev_button_y = button_y
+
         by_name = dict(zip(packet.get("name", []), packet.get("position", [])))
 
         for i, name in enumerate(self._left_joint_names):
@@ -1062,17 +1128,32 @@ class ROS2NativeJointTeleop:
     NoOpActionCfg by swap_to_native_ros2_joint_actions so IsaacLab's own action pipeline
     never writes a competing target for the same joints.
 
-    This class's only two jobs: keep the R/N/T keyboard shortcuts working (main() wires
-    them the same way as every other teleop device), and report the robot's ACTUAL
-    current joint positions each step as build_dual_action's return value, since that's
-    what the recorder logs as the episode's "action" -- there is no separate "commanded"
-    value on this process to log instead, the OmniGraph is the only thing that ever sees
-    the raw ROS2 message.
+    This class's jobs: keep the R/N/T keyboard shortcuts working (main() wires them the
+    same way as every other teleop device), report the robot's ACTUAL current joint
+    positions each step as build_dual_action's return value (since that's what the
+    recorder logs as the episode's "action" -- there is no separate "commanded" value on
+    this process to log instead, the OmniGraph is the only thing that ever sees the raw
+    ROS2 message), and watch for the Quest X/Y buttons.
+
+    The X/Y buttons ride along on the SAME /openarm/vr_joint_command_processed message
+    the OmniGraph already decodes for joint targets -- joint_command_processor.py
+    appends two extra "joint" entries named "button_x"/"button_y" (position 1.0/0.0 for
+    pressed/released) after the real arm/gripper joints. ROS2JointCommandAction's action
+    terms only ever look up their OWN joint_names in that name/position map (see its
+    apply_actions()), so these two extra entries are silently ignored there -- but this
+    class reads the same graph_path/SubscriberJointState outputs independently, purely
+    to pull "button_x"/"button_y" back out and fire a callback on a rising edge -- X
+    calls main()'s start_recording() (arms recording; nothing is saved before this
+    press, see requires_manual_arm), Y calls reset_episode() (same as the R key:
+    discard & reset). No second OmniGraph subscriber needed.
     """
 
-    def __init__(self, robot, sim_device: str):
+    def __init__(self, robot, sim_device: str, graph_path: str = "/Graph/ROS_JointCommand"):
         self._robot = robot
         self._sim_device = sim_device
+        self._subscriber_path = f"{graph_path}/SubscriberJointState"
+        self._prev_button_x = False
+        self._prev_button_y = False
 
         self._left_joint_ids, self._left_joint_names = robot.find_joints(LEFT_ARM_JOINT_REGEX)
         self._right_joint_ids, self._right_joint_names = robot.find_joints(RIGHT_ARM_JOINT_REGEX)
@@ -1137,6 +1218,34 @@ class ROS2NativeJointTeleop:
     def clear_deltas(self):
         pass
 
+    def _poll_buttons(self) -> None:
+        import omni.graph.core as og
+
+        try:
+            names = og.Controller.attribute(f"{self._subscriber_path}.outputs:jointNames").get()
+            positions = og.Controller.attribute(f"{self._subscriber_path}.outputs:positionCommand").get()
+        except Exception:
+            return  # graph/attribute not ready yet -- try again next step
+        if not names or positions is None or len(positions) == 0:
+            return
+
+        by_name = dict(zip(names, positions))
+        button_x = by_name.get("button_x", 0.0) > 0.5
+        button_y = by_name.get("button_y", 0.0) > 0.5
+
+        if button_x and not self._prev_button_x:
+            start_cb = self._additional_callbacks.get("X_START")
+            if start_cb is not None:
+                print("[ROS2 NATIVE TELEOP] X pressed -> start recording")
+                start_cb()
+        if button_y and not self._prev_button_y:
+            reset_cb = self._additional_callbacks.get("R")
+            if reset_cb is not None:
+                print("[ROS2 NATIVE TELEOP] Y pressed -> discard & reset episode")
+                reset_cb()
+        self._prev_button_x = button_x
+        self._prev_button_y = button_y
+
     def build_dual_action(
         self, left_gripper_state: float, right_gripper_state: float
     ) -> tuple[torch.Tensor, float, float]:
@@ -1144,7 +1253,12 @@ class ROS2NativeJointTeleop:
         signature matches VRDualArmTeleop/VRDualArmJointTeleop) and instead reads back
         the robot's actual current joint positions -- real actuation for this mode
         happens out-of-band through the OmniGraph, not through anything computed here.
+        Also polls the same OmniGraph subscriber for the button_x/button_y "joint"
+        entries and fires the save/discard callbacks on a rising edge -- see class
+        docstring.
         """
+        self._poll_buttons()
+
         left_pos = self._robot.data.joint_pos[0, self._left_joint_ids]
         right_pos = self._robot.data.joint_pos[0, self._right_joint_ids]
         left_grip_pos = self._robot.data.joint_pos[0, self._left_gripper_id].item()
@@ -1515,6 +1629,12 @@ def main():
     use_vr_joint_teleop = args_cli.teleop_device == "vr_joint_ros2"
     use_vr_joint_teleop_native = args_cli.teleop_device == "vr_joint_ros2_native"
     use_any_vr_teleop = use_vr_teleop or use_vr_joint_teleop or use_vr_joint_teleop_native
+    # vr_joint_ros2/vr_joint_ros2_native have a Quest X button wired to "arm" recording
+    # (see VRDualArmJointTeleop/ROS2NativeJointTeleop's button_x handling) -- for those
+    # two modes recording starts OFF after every reset and stays off until X is
+    # pressed, so pre-X teleop (e.g. positioning the arm) is never saved. Keyboard and
+    # vr_ros2 have no such button, so they keep the old always-on behavior.
+    requires_manual_arm = use_vr_joint_teleop or use_vr_joint_teleop_native
     if use_vr_teleop and total_action_dim != TOTAL_ACTION_DIM:
         logger.error("--teleop_device vr_ros2 requires a dual-arm (14D action) task.")
         return
@@ -1569,6 +1689,13 @@ def main():
     demo_count = 0
     success_step_count = 0
     ramp_test_requested = False
+    # Whether env.step()'s data is actually meant to be kept. Starts True for modes
+    # with no arm button (keyboard, vr_ros2) -- unchanged old behavior, always
+    # recording. Starts False for requires_manual_arm modes -- nothing is recorded
+    # until start_recording() (button X) fires; every env.step() taken before that
+    # still runs (so the operator can pre-position the arm) but its data is discarded
+    # by the recorder_manager.reset() inside start_recording() the moment X is pressed.
+    recording_armed = not requires_manual_arm
 
     def reset_episode():
         nonlocal should_reset
@@ -1579,8 +1706,27 @@ def main():
         nonlocal ramp_test_requested
         ramp_test_requested = True
 
+    def start_recording():
+        """button_x handler (vr_joint_ros2 / vr_joint_ros2_native only, see
+        requires_manual_arm) -- arms recording and wipes whatever env.step() data has
+        piled up in the recorder_manager's buffer since the last reset (IsaacLab's
+        env.step() unconditionally feeds every step into that buffer; there is no
+        separate "recording enabled" switch inside RecorderManager itself), so the
+        episode that eventually gets exported (by save_episode() or the auto-success
+        check below) only contains steps taken AFTER this button press.
+        """
+        nonlocal recording_armed
+        if recording_armed:
+            return  # already armed -- ignore repeat X presses within the same episode
+        env.recorder_manager.reset([0])
+        recording_armed = True
+        print("Recording started (button X)")
+
     def save_episode():
         nonlocal should_reset
+        if requires_manual_arm and not recording_armed:
+            print("Not recording yet -- press X to start recording before saving.")
+            return
         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
         env.recorder_manager.set_success_to_episodes(
             [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
@@ -1612,6 +1758,8 @@ def main():
     if not use_any_vr_teleop:
         teleop.add_callback("TAB", toggle_arm)
     teleop.add_callback("T", request_ramp_test)
+    if requires_manual_arm:
+        teleop.add_callback("X_START", start_recording)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     instruction_display = InstructionDisplay(xr=False)
@@ -1646,6 +1794,9 @@ def main():
         print("  A/D        — EE left / right         (+y/-y)")
         print("  PgUp/PgDn  — EE up / down            (+z/-z)")
         print("  ↑/↓        — pitch ±  |  ←/→ — yaw ±  |  [/] — roll ±")
+    if requires_manual_arm:
+        print("  X (Quest)  — start recording (arms the episode; nothing is saved before this)")
+        print("  Y (Quest)  — discard & reset episode")
     print("  N          — save episode as success")
     print("  R          — discard & reset episode")
     print("  T          — ramp current pose to rest (matches reset_to_rest_pose.py) and watch")
@@ -1704,9 +1855,22 @@ def main():
                         right_gripper_state=right_gripper_state if is_dual_arm else None,
                     )
 
-            # Success check
+                # ── Debug: right arm left-finger contact force vs cube_2 ────────
+                # Diagnoses the "right arm left finger doesn't grip" report -- prints
+                # only while contact force is nonzero, so a silent terminal during a
+                # grasp attempt means that finger truly isn't touching the cube.
+                # Remove once the underlying cause is confirmed/fixed.
+                if "contact_right_left_finger" in env.scene.sensors:
+                    force_matrix = env.scene["contact_right_left_finger"].data.force_matrix_w
+                    if force_matrix is not None:
+                        force_norm = force_matrix[0].norm(dim=-1).max().item()
+                        if force_norm > 1e-4:
+                            print(f"[contact] openarm_right_left_finger vs cube_2 force: {force_norm:.3f} N")
+
+            # Success check -- gated on recording_armed so a not-yet-armed episode
+            # (requires_manual_arm modes, before X is pressed) can never auto-export.
             if success_term is not None:
-                if bool(success_term.func(env, **success_term.params)[0]):
+                if recording_armed and bool(success_term.func(env, **success_term.params)[0]):
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
                         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
@@ -1739,11 +1903,17 @@ def main():
                 teleop.reset()
                 success_step_count = 0
                 should_reset = False
+                # requires_manual_arm modes go back to un-armed after every reset --
+                # the next episode isn't recorded until X is pressed again. Other
+                # modes stay always-armed (old behavior).
+                recording_armed = not requires_manual_arm
                 # Reset gripper states to open
                 left_gripper_state = 1.0
                 right_gripper_state = 1.0
                 _refresh_label()
                 print(f"Ready. Active arm: {active_arm.upper()}")
+                if requires_manual_arm:
+                    print("Press X to start recording.")
 
             if env.sim.is_stopped():
                 break

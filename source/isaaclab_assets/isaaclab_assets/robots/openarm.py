@@ -34,6 +34,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 OPENARM_BI_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"/home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/v1_camera_isaac.usd",
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
@@ -46,8 +47,21 @@ OPENARM_BI_CFG = ArticulationCfg(
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={
-            "openarm_left_joint.*": 0.0,
-            "openarm_right_joint.*": 0.0,
+            "openarm_left_joint1": 0.0,
+            "openarm_left_joint2": 0.0,
+            "openarm_left_joint3": 0.0,
+            "openarm_left_joint4": 1.570796,
+            "openarm_left_joint5": 0.0,
+            "openarm_left_joint6": 0.0,
+            "openarm_left_joint7": 0.0,
+            
+            "openarm_right_joint1": 0.0,
+            "openarm_right_joint2": 0.0,
+            "openarm_right_joint3": 0.0,
+            "openarm_right_joint4": 1.570796, 
+            "openarm_right_joint5": 0.0,
+            "openarm_right_joint6": 0.0,
+            "openarm_right_joint7": 0.0,
             "openarm_left_finger_joint.*": 0.0,
             "openarm_right_finger_joint.*": 0.0,
         },
@@ -85,6 +99,24 @@ OPENARM_BI_CFG = ArticulationCfg(
             damping=10.0,
         ),
         "openarm_gripper": ImplicitActuatorCfg(
+            # BOTH finger joints must be listed. *_finger_joint2 (which drives the
+            # *_left_finger link) is additionally a native PhysX mimic joint of joint1
+            # (gearing=-1) baked into v1_camera_isaac.usd by the URDF importer, and it is
+            # tempting to therefore leave it out and let the mimic carry it. That is wrong:
+            # a joint absent from every actuator group keeps the USD's drive, and the
+            # importer authors NO PhysicsDriveAPI on a mimic joint, so joint2 came up with
+            # stiffness=0, damping=0 and effort_limit=0 -- measured directly off
+            # root_physx_view. Its only tie to joint1 was then the mimic constraint, which
+            # the importer makes *compliant* (physxMimicJoint:rotY:naturalFrequency=25,
+            # dampingRatio=0.005). Per PhysX's own compliance formulation that lands ~23x
+            # softer than a rigid constraint, so the left finger simply yielded whenever it
+            # pushed on anything -- the gripper looked like it closed but could not hold.
+            # Listing joint2 here does NOT fight the mimic: the mimic enforces pos2 == pos1,
+            # and the action terms command both joints the same value, so drive and
+            # constraint agree. Keep the two in sync -- every BinaryJointPositionActionCfg
+            # for this robot must name both finger joints (see the openarm stack/pickup
+            # env cfgs); driving joint1 alone while joint2 is actuated would peg joint2 at
+            # its default and genuinely fight the mimic.
             joint_names_expr=[
                 "openarm_left_finger_joint.*",
                 "openarm_right_finger_joint.*",

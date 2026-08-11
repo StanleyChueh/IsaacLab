@@ -25,6 +25,7 @@ class EventCfg:
     init_openarm_arm_pose = EventTerm(
         func=mdp.reset_scene_to_default,
         mode="reset",
+        params={"reset_joint_targets": True},
     )
 
 @configclass
@@ -44,21 +45,54 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
             "openarm_left_joint1": 0.0,
             "openarm_left_joint2": 0.0,
             "openarm_left_joint3": 0.0,
-            "openarm_left_joint4": 0.0,
+            "openarm_left_joint4": 1.570796,
             "openarm_left_joint5": 0.0,
             "openarm_left_joint6": 0.0,
             "openarm_left_joint7": 0.0,
-            "openarm_right_joint.*": 0.0, 
+            
+            "openarm_right_joint1": 0.0,
+            "openarm_right_joint2": 0.0,
+            "openarm_right_joint3": 0.0,
+            "openarm_right_joint4": 1.570796, 
+            "openarm_right_joint5": 0.0,
+            "openarm_right_joint6": 0.0,
+            "openarm_right_joint7": 0.0,
             "openarm_left_finger_joint.*": 0.0,
             "openarm_right_finger_joint.*": 0.0,
         }
 
-        # Arm: stiffness high enough to hold pose under load
-        self.scene.robot.actuators["openarm_arm"].stiffness = 2000.0
-        self.scene.robot.actuators["openarm_arm"].damping = 10.0
-        # Gripper: compliant gains + effort cap so the finger-cube contact force
-        # stays small and does not generate a wrist-twisting reaction torque.
-        # effort_limit_sim=8 N caps grasp force; still enough to hold the cube.
+        # Arm: kp/kv taken from the real OpenArm MuJoCo actuator XML (position actuators,
+        # kp=stiffness, kv=damping). kp groups by joint pair (matches the effort/velocity
+        # limit groupings in openarm.py); kv does not, so it's set per individual joint.
+        self.scene.robot.actuators["openarm_arm"].stiffness = {
+            "openarm_left_joint[1-2]": 230.0,
+            "openarm_right_joint[1-2]": 230.0,
+            "openarm_left_joint[3-4]": 290.0, #190
+            "openarm_right_joint[3-4]": 290.0, #190
+            "openarm_left_joint[5-7]": 30.0,
+            "openarm_right_joint[5-7]": 30.0,
+        }
+        self.scene.robot.actuators["openarm_arm"].damping = {
+            "openarm_left_joint1": 14.0,
+            "openarm_right_joint1": 14.0,
+            "openarm_left_joint2": 10.9,
+            "openarm_right_joint2": 10.9,
+            "openarm_left_joint3": 12.9,
+            "openarm_right_joint3": 12.9,
+            "openarm_left_joint4": 12.9,
+            "openarm_right_joint4": 12.9,
+            "openarm_left_joint5": 0.2,
+            "openarm_right_joint5": 0.2,
+            "openarm_left_joint6": 0.4,
+            "openarm_right_joint6": 0.4,
+            "openarm_left_joint7": 1.0,
+            "openarm_right_joint7": 1.0,
+        }
+        # Gripper: kp=500, kv=10 from the XML's finger1_ctrl. effort_limit_sim stays capped at
+        # 8 N (not in the XML, forcerange there is +-100) -- that's a deliberate cap so the
+        # finger-cube contact force stays small and doesn't generate a wrist-twisting reaction
+        # torque; the implicit actuator clips final torque to effort_limit_sim regardless of
+        # kp/kv, so raising the gains here doesn't reopen that issue.
         self.scene.robot.actuators["openarm_gripper"].stiffness = 200.0
         self.scene.robot.actuators["openarm_gripper"].damping = 20.0
         self.scene.robot.actuators["openarm_gripper"].effort_limit_sim = 8.0
@@ -75,9 +109,14 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
         )
         self.actions.gripper_action = mdp.BinaryJointPositionActionCfg(
             asset_name="robot",
-            joint_names=["openarm_left_finger_joint.*"],
-            open_command_expr={"openarm_left_finger_joint.*": 0.044},
-            close_command_expr={"openarm_left_finger_joint.*": 0.0},
+            # Both finger joints are commanded. joint2 is a PhysX mimic of joint1 AND is
+            # actuated (see openarm.py's "openarm_gripper" comment): the mimic enforces
+            # pos2 == pos1 and these two targets are equal, so they agree rather than fight.
+            # Naming joint1 alone would leave the actuated joint2 pinned at its default and
+            # genuinely fight the mimic.
+            joint_names=["openarm_left_finger_joint1", "openarm_left_finger_joint2"],
+            open_command_expr={"openarm_left_finger_joint1": 0.044, "openarm_left_finger_joint2": 0.044},
+            close_command_expr={"openarm_left_finger_joint1": 0.0, "openarm_left_finger_joint2": 0.0},
         )
         
         # 3. 方塊配置
@@ -91,7 +130,7 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
         # Pad is centered on y=0, i.e. centered on the robot.
         # To hide the pad: comment out self.scene.workspace_pad below.
         # To change height: edit PAD_HEIGHT (pad pos[2] and CUBE_Z follow automatically).
-        PAD_HEIGHT = 0.19  # 17 cm real-world + 2 cm extra, temporarily, for the same manual test
+        PAD_HEIGHT = 0.28  # 17 cm real-world + 2 cm extra, temporarily, for the same manual test
         CUBE_SIZE = 0.055  # matches the real cube (5.5 cm per side)
         # Default Blocks/*.usd asset side length -- NOT verified directly against the USD file
         # (it's a remote Nucleus asset, no local copy to inspect), but empirically confirmed
@@ -102,12 +141,12 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
         CUBE_BASE_SIZE = 0.0509
         CUBE_SCALE = CUBE_SIZE / CUBE_BASE_SIZE
         CUBE_Z = PAD_HEIGHT + CUBE_SIZE / 2   # pad top + half-block height
-        PAD_SIZE_X = 0.485  # length, orthogonal to the robot
+        PAD_SIZE_X = 0.48  # length, orthogonal to the robot
         PAD_SIZE_Y = 0.57   # width, parallel to the robot
         # 12 cm real-world clearance + 3 cm extra, temporarily, for manual sim-vs-real mirror
         # testing (sim's gripper was reaching the pad before the real one did) -- revert to
         # 0.12 once that's diagnosed/fixed.
-        PAD_NEAR_EDGE_X = 0.15  # distance from robot base (x=0) to pad's near edge
+        PAD_NEAR_EDGE_X = 0.03  # distance from robot base (x=0) to pad's near edge
         PAD_CENTER_X = PAD_NEAR_EDGE_X + PAD_SIZE_X / 2
         self.scene.workspace_pad = AssetBaseCfg(
             prim_path="{ENV_REGEX_NS}/workspace_pad",

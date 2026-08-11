@@ -2,24 +2,25 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""OpenArm pick-up task: grasp and lift the red cube (cube_2) with the LEFT arm only.
+"""OpenArm pick-up task: grasp and lift the red cube (cube_2), reachable by either arm.
 
 Action space (14D flat):
   [0:6]   left arm IK delta pose  (dx dy dz drx dry drz)
   [6]     left gripper command    (±1.0)
-  [7:13]  right arm IK delta pose (kept zero during single-arm pick-up)
+  [7:13]  right arm IK delta pose (TAB-switch to control the right arm if cube_2 lands on
+          that side -- see Cube randomisation below)
   [13]    right gripper command   (±1.0)
 
 Scene: only cube_2 (red) is present — cube_1 and cube_3 are removed.
 
-Cube randomisation: left-arm workspace only.
+Cube randomisation: full pad width -- left arm, right arm, and the middle.
   Looking at the robot from the front camera (1,0,0.5):
     x = forward from robot base (depth in front of robot)
-    y = left  (positive y = robot's left arm side)
-  cube_2 is randomized within x:[0.20, 0.27]  y:[0.08, 0.27]
+    y = left  (positive y = robot's left arm side, negative y = right arm side)
+  cube_2 is randomized within x:[0.20, 0.27]  y:[-0.27, 0.27]
   — keeps >=8cm clearance from the robot base, stays within 15cm of the pad's near edge, and
-    still reaches near the pad's side edge in y; see PickUpEventCfg's docstring for the full
-    reasoning.
+    reaches near both of the pad's side edges in y (middle falls out for free as the continuum
+    between the two halves); see PickUpEventCfg's docstring for the full reasoning.
 
 Success condition: cube_2 centre rises 2.5 cm above its resting height (see `cube_rest_z` in
 OpenarmPickUpRedCubeEnvCfg.__post_init__ -- resting height itself depends on the pad/cube
@@ -36,7 +37,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
-from isaaclab.sensors import FrameTransformerCfg
+from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR
@@ -74,20 +75,30 @@ def cube_pickup_success(
 
 @configclass
 class PickUpEventCfg:
-    """Reset robot to default pose; randomize cube_2 in the left-arm workspace only.
+    """Reset robot to default pose; randomize cube_2 across the full pad width (left arm,
+    right arm, and the middle), keeping the same forward/depth reach as before.
 
     cube_2 default world position: [0.55, 0.05, CUBE_Z]  (CUBE_Z ≈ 0.15 m)
-    Target randomisation range:    x=[0.20, 0.27]  y=[0.08, 0.27]
-    Required offsets:              x=[-0.35, -0.28]  y=[0.03, 0.22]
+    Target randomisation range:    x=[0.20, 0.27]  y=[-0.27, 0.27]
+    Required offsets:              x=[-0.35, -0.28]  y=[-0.32, 0.22]
 
     x range keeps the cube within 15cm of the pad's near edge (the side closest to the robot
     base, x=0.12 -- see PAD_NEAR_EDGE_X in stack_joint_pos_env_cfg.py): x=0.27 is exactly
     0.12+0.15. The near bound (x=0.20) still keeps >=8cm clearance from the robot origin -- an
     earlier, more compact x=[0.17,0.27] band had a near corner only ~17cm from the origin, close
     enough for the gripper to clip the base while reaching; widening the near edge out to 0.20
-    fixed that. y is unchanged: [0.08, 0.27], reaching close to the pad's real y=+-0.285
-    half-width so generated demos cover positions near that edge too, not just a narrow central
-    band. Not verified against the arm's actual comfortable reach limit at the y=0.27 corner --
+    fixed that.
+
+    y now spans both arms symmetrically: [-0.27, 0.27] (positive y = robot's left-arm side,
+    negative y = right-arm side, near-zero = middle -- see the module docstring's "Looking at
+    the robot from the front camera" convention). This mirrors the previous left-only bound
+    (0.08 to 0.27) onto the negative side too, keeping the same ~1.5cm margin from the pad's
+    real y=+-0.285 half-width on both edges, and folds the middle in "for free" since it's just
+    the continuum between the two halves. During teleop, TAB-switch to whichever arm the cube
+    lands in front of -- gripper_joint_names/gripper_open_val/gripper_threshold below are still
+    left-arm-only, so if you Mimic-annotate these demos afterward, right-arm/middle grasps won't
+    be recognized as "gripper closed" by that logic; this only affects raw teleop recording.
+    Not verified against either arm's actual comfortable reach limit at the y=+-0.27 corners --
     if teleop feels strained or Mimic's generation success rate drops, narrow it back down.
     """
 
@@ -102,7 +113,7 @@ class PickUpEventCfg:
         params={
             "pose_range": {
                 "x": (-0.35, -0.28),   # cube_2 default x=0.55 → actual x:[0.20, 0.27]
-                "y": (0.03, 0.22),     # cube_2 default y=0.05 → actual y:[0.08, 0.27]
+                "y": (-0.32, 0.22),    # cube_2 default y=0.05 → actual y:[-0.27, 0.27]
             },
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("cube_2"),
@@ -336,12 +347,14 @@ class PickUpObservationsCfg:
 
 @configclass
 class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStackVisuomotorEnvCfg):
-    """OpenArm pick-up task: grasp and lift the red cube (cube_2) with the left arm.
+    """OpenArm pick-up task: grasp and lift the red cube (cube_2), reachable by either arm.
 
     Key differences from the visuomotor stack env:
       - Only cube_2 (red) is present in the scene (cube_1 and cube_3 removed).
-      - cube_2 is randomized within the left arm's reachable workspace only.
-      - ee_frame targets openarm_left_ee_tcp (required by eef_pos/eef_quat obs).
+      - cube_2 is randomized across the full pad width -- left arm, right arm, and the middle.
+      - ee_frame targets openarm_left_ee_tcp (required by eef_pos/eef_quat obs) -- still
+        left-only, so Mimic auto-annotation (gripper_joint_names/eef tracking below) only
+        understands left-arm grasps even though the cube can now land on the right side too.
       - subtask_terms observation group added for Mimic auto-annotation.
       - Success terminates when cube_2 rises above 0.20 m.
       - Right arm IK action kept so TAB-switching works during teleoperation.
@@ -397,6 +410,20 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
             ],
         )
 
+        # ── Debug: contact sensor on the right arm's left finger ───────────────
+        # Diagnoses the "right arm left finger doesn't seem to grip" symptom -- reports
+        # whether that link is generating contact force against cube_2 at all (vs.
+        # generating contact but not holding, which would look identical from the outside).
+        # Not part of the task's observation/action space; only read for debug printing in
+        # record_demos_openarm.py's main loop.
+        self.scene.contact_right_left_finger = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/openarm_right_left_finger",
+            update_period=0.0,
+            history_length=6,
+            debug_vis=True,
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube_2"],
+        )
+
         # ── Terminations ─────────────────────────────────────────────────────
         self.terminations.time_out = None
         self.terminations.success = TerminationTermCfg(
@@ -405,7 +432,7 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
             time_out=False,
         )
 
-        # ── Events: robot reset + cube_2 randomised in left-arm workspace ────
+        # ── Events: robot reset + cube_2 randomised across the full pad width ────
         self.events = PickUpEventCfg()
 
         # ── Right arm action (for TAB-switching during keyboard recording) ────
@@ -419,9 +446,14 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         )
         self.actions.right_gripper_action = mdp_core.BinaryJointPositionActionCfg(
             asset_name="robot",
-            joint_names=["openarm_right_finger_joint.*"],
-            open_command_expr={"openarm_right_finger_joint.*": 0.044},
-            close_command_expr={"openarm_right_finger_joint.*": 0.0},
+            # Both finger joints are commanded. joint2 is a PhysX mimic of joint1 AND is
+            # actuated (see openarm.py's "openarm_gripper" comment): the mimic enforces
+            # pos2 == pos1 and these two targets are equal, so they agree rather than fight.
+            # Naming joint1 alone would leave the actuated joint2 pinned at its default and
+            # genuinely fight the mimic.
+            joint_names=["openarm_right_finger_joint1", "openarm_right_finger_joint2"],
+            open_command_expr={"openarm_right_finger_joint1": 0.044, "openarm_right_finger_joint2": 0.044},
+            close_command_expr={"openarm_right_finger_joint1": 0.0, "openarm_right_finger_joint2": 0.0},
         )
         
         self.image_obs_list = ["front_cam", "wrist_cam", "right_wrist_cam", "body_cam"]

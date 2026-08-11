@@ -89,11 +89,19 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
         )
 
         # ── Left wrist camera (attached to openarm_left_ee_tcp) ──────────
-        # Position tuned manually in Isaac Sim:
-        #   Isaac Sim stage Translate = (0.06156, 0.00072, -0.20867)
-        #   Isaac Sim stage Orient    = (-180, 6.001, -90) degrees
-        # The translation maps directly to pos; the orientation is unchanged
-        # from the original (±180° on X is the same rotation).
+        # Position matches the real camera mount defined in the v1_camera URDF
+        # (source: isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf):
+        #   openarm_left_camera_joint: parent=openarm_left_link7, xyz=(0,0,0.06), rpy=(0,0,0)
+        #   openarm_left_ee_tcp_joint: parent=openarm_left_link7, xyz=(0,0,0), rpy=(0,0,0)
+        # ee_tcp is coincident with link7 (identity offset), so relative to ee_tcp the camera
+        # mount is a plain +6cm translation along local Z, no rotation -- pos below is that
+        # translation. The URDF has no optical-axis convention for the mount (fixed joints only
+        # define where the camera sits, not which way its lens points), so `rot` below is kept
+        # from the previous manually-tuned value (Isaac Sim stage Orient = (-180, 6.001, -90)
+        # degrees) since ee_tcp/link7's orientation didn't change -- only the origin moved from
+        # a hand-eyeballed 20cm-behind-the-gripper position to the URDF's true 6cm mount point.
+        # Re-check the rendered image after this change: field of view differs substantially
+        # this close to the gripper, so `rot` may need re-tuning in the Isaac Sim GUI.
         self.scene.wrist_cam = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_left_ee_tcp/wrist_cam",
             update_period=0.0,
@@ -107,14 +115,17 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 clipping_range=(0.05, 2.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.06156, 0.00072, -0.20867),
-                rot=(-0.70614, 0.03701, 0.03701, -0.70614),
+                pos=(0.06, 0.001, 0.11125),
+                rot=(0.68057, -0.19188, -0.19188, 0.68057),
                 convention="ros",
             ),
         )
+        # rot:(x,-w,-z,y)=>Please follow this order,don't asy why
 
         # ── Right wrist camera (attached to openarm_right_ee_tcp) ─────────
-        # Same offset as the left wrist camera.
+        # Same URDF-derived offset as the left wrist camera (openarm_right_camera_joint is
+        # identical: parent=openarm_right_link7, xyz=(0,0,0.06), rpy=(0,0,0); ee_tcp is likewise
+        # coincident with link7). See the wrist_cam comment above for the full derivation.
         self.scene.right_wrist_cam = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_right_ee_tcp/right_wrist_cam",
             update_period=0.0,
@@ -128,8 +139,8 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 clipping_range=(0.05, 2.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.06156, 0.00072, -0.20867),
-                rot=(-0.70614, 0.03701, 0.03701, -0.70614),
+                pos=(0.06, 0.001, 0.11125),
+                rot=(0.68057, -0.19188, -0.19188, 0.68057),
                 convention="ros",
             ),
         )
@@ -153,11 +164,12 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 clipping_range=(0.1, 3.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.01, 0.0, 0.65),
-                rot=(0.17853, -0.68420, 0.68420, -0.17853),
+                pos=(0.05732, 0.0, 0.67196),
+                rot=(0.22105, -0.67167, 0.67167, -0.22105),
                 convention="ros",
             ),
         )
+        # rot:(x,-w,-z,y)=>Please follow this order,don't asy why
 
         # Re-render after reset so the first frames are clean
         self.num_rerenders_on_reset = 3

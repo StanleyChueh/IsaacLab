@@ -45,7 +45,7 @@
     <collision name="openarm_left_link0_collision">
       <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link0_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link0_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -65,7 +65,7 @@
     <collision name="openarm_left_link1_collision">
       <origin rpy="0.0 0.0 0.0" xyz="-0.0 0.0 -0.0625"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link1_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link1_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -92,7 +92,7 @@
     <collision name="openarm_left_link2_collision">
       <origin rpy="0.0 0.0 0.0" xyz="0.0301 0.0 -0.1225"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link2_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link2_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -173,7 +173,7 @@
     <collision name="openarm_left_link5_collision">
       <origin rpy="0.0 0.0 0.0" xyz="-0.0 -0.0 -0.438"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link5_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link5_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -200,7 +200,7 @@
     <collision name="openarm_left_link6_collision">
       <origin rpy="0.0 0.0 0.0" xyz="-0.0375 -0.0 -0.5585"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link6_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link6_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -227,7 +227,7 @@
     <collision name="openarm_left_link7_collision">
       <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.0 -0.5585"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link7_symp_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/arm/collision/link7_symp.stl" scale="0.001 -0.001 0.001"/>
         <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
       </geometry>
     </collision>
@@ -493,7 +493,7 @@
     <collision name="openarm_left_right_finger_collision">
       <origin rpy="0.0 0.0 0.0" xyz="0.0 0.05 -0.673001"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/end_effector/parallel_link/meshes/collision/finger_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/end_effector/parallel_link/meshes/collision/finger.stl" scale="0.001 -0.001 0.001"/>
       </geometry>
     </collision>
     <inertial>
@@ -566,7 +566,7 @@
     <collision name="openarm_right_right_finger_collision">
       <origin rpy="0.0 0.0 0.0" xyz="0.0 0.05 -0.673001"/>
       <geometry>
-        <mesh filename="package://v1_camera_isaac/mesh/end_effector/parallel_link/meshes/collision/finger_mirrored.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://v1_camera_isaac/mesh/end_effector/parallel_link/meshes/collision/finger.stl" scale="0.001 -0.001 0.001"/>
       </geometry>
     </collision>
     <inertial>

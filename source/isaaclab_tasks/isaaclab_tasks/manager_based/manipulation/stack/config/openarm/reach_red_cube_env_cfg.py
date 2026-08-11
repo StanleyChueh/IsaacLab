@@ -124,7 +124,12 @@ class OpenarmReachRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStack
         )
         self.actions.right_gripper_action = mdp.BinaryJointPositionActionCfg(
             asset_name="robot",
-            joint_names=["openarm_right_finger_joint.*"],
-            open_command_expr={"openarm_right_finger_joint.*": 0.044},
-            close_command_expr={"openarm_right_finger_joint.*": 0.0},
+            # Both finger joints are commanded. joint2 is a PhysX mimic of joint1 AND is
+            # actuated (see openarm.py's "openarm_gripper" comment): the mimic enforces
+            # pos2 == pos1 and these two targets are equal, so they agree rather than fight.
+            # Naming joint1 alone would leave the actuated joint2 pinned at its default and
+            # genuinely fight the mimic.
+            joint_names=["openarm_right_finger_joint1", "openarm_right_finger_joint2"],
+            open_command_expr={"openarm_right_finger_joint1": 0.044, "openarm_right_finger_joint2": 0.044},
+            close_command_expr={"openarm_right_finger_joint1": 0.0, "openarm_right_finger_joint2": 0.0},
         )
