@@ -164,8 +164,8 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 clipping_range=(0.1, 3.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.05732, 0.0, 0.67196),
-                rot=(0.22105, -0.67167, 0.67167, -0.22105),
+                pos=(0.04563, 0.0, 0.97524),
+                rot=(0.1203, -0.6968, 0.6968, -0.1203),
                 convention="ros",
             ),
         )
