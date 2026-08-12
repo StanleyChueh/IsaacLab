@@ -188,38 +188,64 @@ def _scan_episodes(hdf5_files: list) -> list:
     return infos
 
 
-# Isaac Sim's physics Articulation for the bimanual OpenArm orders its 22 joint DOFs as:
-# [0:14] left/right arm joints INTERLEAVED (left_joint1, right_joint1, left_joint2, ...,
-# left_joint7, right_joint7), then [14]=openarm_left_finger_joint1 (the actuated left-gripper
-# finger), [15]=its mimic follower joint2, [16]=openarm_left_hand (passive stub, always ~0),
-# [17]=openarm_right_finger_joint1, [18]=its mimic follower, [19]=openarm_right_hand (passive),
-# [20:22]=left/right_ee_tcp_joint (passive stubs). Confirmed 2026-07-xx by printing
-# robot.data.joint_names from a live Articulation for OPENARM_BI_CFG and cross-checking against
-# the USD's PhysicsDriveAPI (only index 14 has one -- 15/18 are pure USD mimic joints with no
-# drive, matching the URDF's <mimic joint="..."/> tag). LJ_IDX below picks out exactly the 7 left
-# arm joints (even indices 0:14:2) plus this one real actuated left-gripper joint (14) -- the
-# same 8 values, in the same order, that OpenArmFollower.get_observation()/send_action() call
-# LJ1.pos..LJ8.pos on the real robot.
+# Isaac Sim's physics Articulation for the bimanual OpenArm orders its 18 joint DOFs as:
+#    0,2,4,6,8,10,12 = openarm_left_joint1..7      (arms INTERLEAVED, left on even indices)
+#    1,3,5,7,9,11,13 = openarm_right_joint1..7
+#   14 = openarm_left_finger_joint1    15 = its mimic follower joint2
+#   16 = openarm_right_finger_joint1   17 = its mimic follower joint2
+# Re-confirmed 2026-08-12 by printing robot.data.joint_names from a live Articulation for this
+# task. An older revision of this comment described a 22-DOF layout with the right gripper at
+# index 17 -- that is stale, and 17 is the right gripper's MIMIC FOLLOWER, not the actuated joint.
+# Taking it would mostly work (the mimic tracks joint1) and quietly stop working the moment the
+# follower lags, so RJ_IDX uses 16.
+#
+# Only the leader finger of each gripper is exported: its follower is a pure USD mimic with no
+# drive (matching the URDF's <mimic joint="..."/> tag), so it carries no independent information.
+# The resulting per-arm 8 values, in this order, are exactly what
+# OpenArmFollower.get_observation()/send_action() call LJ1.pos..LJ8.pos / RJ1.pos..RJ8.pos on the
+# real robot -- so a deploy or replay script can build a motor frame from these names directly.
 LJ_IDX = list(range(0, 14, 2)) + [14]
 LJ_NAMES = [f"LJ{i}.pos" for i in range(1, 8)] + ["LJ8.pos"]
+RJ_IDX = list(range(1, 14, 2)) + [16]
+RJ_NAMES = [f"RJ{i}.pos" for i in range(1, 8)] + ["RJ8.pos"]
+
+# Dual-arm layout is left-arm-block THEN right-arm-block (not interleaved like the articulation),
+# because that is the order the real robot's action dict is written and read in.
+BOTH_IDX = LJ_IDX + RJ_IDX
+BOTH_NAMES = LJ_NAMES + RJ_NAMES
+
+# Which columns are grippers, per layout width -- see _smooth_actions, which must not blur them.
+GRIPPER_DIMS = {8: (7,), 16: (7, 15)}
 
 
 def _smooth_actions(actions: np.ndarray, sigma: float = 2.0) -> np.ndarray:
-    """Gaussian-smooth the 7 arm-joint dims (0:7); leave the gripper dim (7) unsmoothed.
+    """Gaussian-smooth every arm-joint dim; leave each gripper dim untouched.
 
     Generated Mimic trajectories are ~5× more jerky than source demos due to
     nearest-neighbour stitching discontinuities in the EE-pose commands used to step the
     sim -- discontinuities that still show up as small jumps in the resulting joint-position
     trajectory. sigma=2.0 gives ~95% jerk reduction while preserving the overall trajectory
-    shape. Gripper is kept sharp so grasp/release timing is not blurred.
+    shape. Grippers are kept sharp so grasp/release timing is not blurred.
+
+    The gripper columns are looked up by width rather than assumed to be the last one: in the
+    dual-arm layout the left gripper sits at 7, in the MIDDLE of the vector, with the right arm's
+    joints after it. Smoothing "everything but the last column" would blur a grasp closed and
+    round off the right arm's joints twice.
     """
+    gripper_dims = GRIPPER_DIMS.get(actions.shape[1])
+    if gripper_dims is None:
+        raise ValueError(
+            f"Don't know where the gripper columns are for a {actions.shape[1]}-wide action;"
+            f" expected one of {sorted(GRIPPER_DIMS)}."
+        )
+    arm_dims = [d for d in range(actions.shape[1]) if d not in gripper_dims]
     smoothed = actions.copy()
-    smoothed[:, :7] = gaussian_filter1d(actions[:, :7].astype(np.float64),
-                                        sigma=sigma, axis=0).astype(np.float32)
+    smoothed[:, arm_dims] = gaussian_filter1d(actions[:, arm_dims].astype(np.float64),
+                                              sigma=sigma, axis=0).astype(np.float32)
     return smoothed
 
 
-def _load_episode(hdf5_path: str, ep_name: str, cameras: list) -> dict | None:
+def _load_episode(hdf5_path: str, ep_name: str, cameras: list, joint_idx: list = None) -> dict | None:
     """Load a single episode. Each call opens its own h5py handle (thread-safe)."""
     with h5py.File(hdf5_path, "r") as f:
         ep = f["data"][ep_name]
@@ -235,7 +261,11 @@ def _load_episode(hdf5_path: str, ep_name: str, cameras: list) -> dict | None:
         # target commanded at step t", and it puts action and observation in the identical LJ1..8
         # representation -- so a policy trained on this data can drive the real robot directly,
         # no IK bridge needed. Costs the episode's last frame (no "next" state exists for it).
-        joint_pos = ep["states/articulation/robot/joint_position"][:, LJ_IDX]  # (T_total, 8)
+        # Read every DOF, then reorder in numpy. h5py's fancy indexing requires strictly
+        # increasing indices, and the dual-arm layout deliberately is not: it is the left block
+        # followed by the right block, while the articulation interleaves them. The full array is
+        # (T, 18) floats, so reading all of it costs nothing worth optimising.
+        joint_pos = ep["states/articulation/robot/joint_position"][:][:, joint_idx or LJ_IDX]
         if len(joint_pos) < 2:
             return None
         states  = joint_pos[:-1]
@@ -267,6 +297,8 @@ def _load_episode(hdf5_path: str, ep_name: str, cameras: list) -> dict | None:
 def _joint_names(dim: int) -> list:
     if dim == 8:
         return LJ_NAMES
+    if dim == 16:
+        return BOTH_NAMES
     return [f"joint_{i}" for i in range(dim)]
 
 
@@ -344,6 +376,21 @@ def _ep_stats(arr: np.ndarray) -> dict:
 
 # ── main streaming pipeline ────────────────────────────────────────────────────
 
+RIGHT_ARM_MOVED_THRESHOLD = 0.05
+"""rad -- how far any right-arm joint must travel across an episode for --arms auto to call the
+recording bimanual. Comfortably above sensor/settling noise (a held-still arm drifts ~1e-3) and
+far below any real motion."""
+
+
+def _right_arm_moves(hdf5_path: str, ep_name: str) -> float:
+    """Peak-to-peak travel (rad) of the most-moved right-arm joint in one episode."""
+    with h5py.File(hdf5_path, "r") as f:
+        jp = f["data"][ep_name]["states/articulation/robot/joint_position"][:, RJ_IDX]
+    if len(jp) < 2:
+        return 0.0
+    return float(np.ptp(jp, axis=0).max())
+
+
 def hdf5_to_lerobot(
     hdf5_files: list,
     out: str,
@@ -351,6 +398,7 @@ def hdf5_to_lerobot(
     fps: int,
     cameras: list,
     chunks_size: int,
+    arms: str = "auto",
 ):
     out_dir = Path(out)
     if out_dir.exists():
@@ -365,8 +413,26 @@ def hdf5_to_lerobot(
 
     total_episodes = len(ep_infos)
 
+    # ── Phase 1b: decide which arms to export ─────────────────────────────────
+    # Exporting only the left arm out of a bimanual recording is silent and irreversible-looking:
+    # the dataset is well-formed, trains, and replays -- it just has no right arm in it, which
+    # only shows up when a hand-over demo turns out to be impossible to reproduce. So 'auto'
+    # measures whether the right arm actually did anything, and always says which way it went.
+    if arms == "auto":
+        travel = max(_right_arm_moves(path, name) for path, name in ep_infos)
+        joint_idx = BOTH_IDX if travel > RIGHT_ARM_MOVED_THRESHOLD else LJ_IDX
+        verdict = "BOTH arms" if joint_idx is BOTH_IDX else "LEFT arm only"
+        _print(f"Arms: {verdict} (auto -- right arm moved at most {travel:.3f} rad across"
+               f" {total_episodes} episode(s), threshold {RIGHT_ARM_MOVED_THRESHOLD})")
+    elif arms == "both":
+        joint_idx = BOTH_IDX
+        _print("Arms: BOTH arms (forced by --arms both)")
+    else:
+        joint_idx = LJ_IDX
+        _print("Arms: LEFT arm only (forced by --arms left)")
+
     # ── Phase 2: probe first episode for dimensions ───────────────────────────
-    first = _load_episode(ep_infos[0][0], ep_infos[0][1], cameras)
+    first = _load_episode(ep_infos[0][0], ep_infos[0][1], cameras, joint_idx)
     assert first is not None, "First episode is empty."
 
     active_cameras = [c for c in cameras if f"cam_{c}" in first]
@@ -448,7 +514,7 @@ def hdf5_to_lerobot(
 
     def _loader_worker():
         for ep_path, ep_name in ep_infos:
-            load_q.put(_load_episode(ep_path, ep_name, cameras))
+            load_q.put(_load_episode(ep_path, ep_name, cameras, joint_idx))
         load_q.put(None)   # sentinel
 
     loader_thread = threading.Thread(target=_loader_worker, daemon=True)
@@ -638,6 +704,11 @@ if __name__ == "__main__":
                     help="Episodes per chunk (default 100)")
     ap.add_argument("--load-workers",type=int, default=8,
                     help="Parallel HDF5 reader threads (default 8)")
+    ap.add_argument("--arms", choices=["auto", "left", "both"], default="auto",
+                    help="Which arms to export. 'both' gives a 16D LJ1-8+RJ1-8 state/action;"
+                         " 'left' gives the 8D LJ1-8 single-arm layout older datasets use;"
+                         " 'auto' (default) picks 'both' when the right arm actually moves in the"
+                         " recording, and prints which it chose.")
     args = ap.parse_args()
 
     hdf5_to_lerobot(
@@ -647,4 +718,5 @@ if __name__ == "__main__":
         fps=args.fps,
         cameras=args.cameras,
         chunks_size=args.chunks_size,
+        arms=args.arms,
     )
