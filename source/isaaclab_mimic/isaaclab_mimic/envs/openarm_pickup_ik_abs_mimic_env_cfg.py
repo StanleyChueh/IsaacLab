@@ -4,9 +4,13 @@
 
 """Isaac Lab Mimic env config for the OpenArm pick-up task (IK relative)."""
 
-from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
+from isaaclab.envs.mimic_env_cfg import MimicEnvCfg
 from isaaclab.utils import configclass
 
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+    TASK_MODE_LEFT,
+    apply_task_mode,
+)
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.pickup_ik_abs_env_cfg import (
     OpenarmPickUpRedCubeEnvCfg,
 )
@@ -16,9 +20,16 @@ from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.pickup_ik_ab
 class OpenArmPickUpIKAbsMimicEnvCfg(OpenarmPickUpRedCubeEnvCfg, MimicEnvCfg):
     """Isaac Lab Mimic environment config for Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0.
 
-    Two subtasks:
-      1. grasp  — left gripper closes around cube_2  (term signal: "grasp")
-      2. lift   — cube_2 rises above 0.30 m          (last subtask, no term signal)
+    The subtask structure, the subtask term signals, the success condition and cube_2's spawn
+    side all come from a task mode (see
+    isaaclab_tasks/.../config/openarm/openarm_task_modes.py). This cfg installs the ``left``
+    mode -- single-arm pick-up with the left arm, right arm idle -- so the env is coherent on
+    its own; ``annotate_demos.py --task_mode`` / ``generate_dataset.py --task_mode`` re-apply a
+    different one on the parsed cfg before gym.make() when the demos were recorded under it.
+
+    Whichever mode is in force, it must be the SAME one the demos were recorded with
+    (``record_demos_openarm.py --task_mode``): the mode decides which arm the subtask signals
+    describe, and a signal that never fires makes annotate_demos.py reject every episode.
     """
 
     def __post_init__(self):
@@ -42,52 +53,8 @@ class OpenArmPickUpIKAbsMimicEnvCfg(OpenarmPickUpRedCubeEnvCfg, MimicEnvCfg):
         self.datagen_config.max_num_failures = 25
         self.datagen_config.seed = 1
 
-        subtask_configs = []
-
-        # Subtask 1: reach and grasp cube_2 (red cube)
-        subtask_configs.append(
-            SubTaskConfig(
-                object_ref="cube_2",
-                subtask_term_signal="grasp",
-                # Shorter tail: 2-5 extra steps keeps the seam boundary tight
-                # and reduces the random positional spread at transition.
-                subtask_term_offset_range=(2, 5),
-                selection_strategy="nearest_neighbor_object",
-                # nn_k=5: more candidates → pick the closest source demo geometry
-                selection_strategy_kwargs={"nn_k": 10},
-                # Near-zero noise: clean data for policy training.
-                # Add noise only if you explicitly want data augmentation.
-                action_noise=0.001,
-                # 50 interp steps ≈ ~1.7 s at 30 Hz — longer approach gives a
-                # smoother velocity profile into the source segment, reducing the
-                # velocity discontinuity at the interpolation/playback boundary.
-                num_interpolation_steps=50,
-                num_fixed_steps=0,
-                apply_noise_during_interpolation=False,
-                description="Reach and grasp the red cube",
-                next_subtask_description="Lift the red cube",
-            )
-        )
-
-        # Subtask 2 (last): lift cube_2 above the table — no explicit term signal
-        subtask_configs.append(
-            SubTaskConfig(
-                object_ref="cube_2",
-                subtask_term_signal=None,
-                subtask_term_offset_range=(0, 0),
-                selection_strategy="nearest_neighbor_object",
-                selection_strategy_kwargs={"nn_k": 10},
-                action_noise=0.001,
-                # Since generation_select_src_per_subtask=False, subtask 2 is always
-                # from the same demo as subtask 1 → the seam is naturally tight and
-                # fewer interp steps are needed here.
-                num_interpolation_steps=10,
-                num_fixed_steps=0,
-                apply_noise_during_interpolation=False,
-                description="Lift the red cube above the table",
-            )
-        )
-
-        # Key must match what get_robot_eef_pose / target_eef_pose_to_action use;
-        # "left_eef" identifies the left end-effector that Mimic will control.
-        self.subtask_configs["left_eef"] = subtask_configs
+        # Subtask sequences, per-arm subtask term signals, success condition and cube spawn
+        # side. The eef keys this installs ("left_eef"/"right_eef") are the ones
+        # OpenArmPickUpIKAbsMimicEnv serves; re-applying another mode later replaces all of it
+        # consistently, which is why none of it is spelled out here.
+        apply_task_mode(self, TASK_MODE_LEFT)

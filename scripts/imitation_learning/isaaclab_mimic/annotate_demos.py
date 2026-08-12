@@ -29,6 +29,19 @@ parser.add_argument(
 )
 parser.add_argument("--auto", action="store_true", default=False, help="Automatically annotate subtasks.")
 parser.add_argument(
+    "--task_mode",
+    type=str,
+    default=None,
+    choices=["left", "right", "handover"],
+    help=(
+        "OpenArm pick-up tasks only: which task variant the demos were recorded under. MUST"
+        " match the --task_mode passed to record_demos_openarm.py, because the mode decides"
+        " which subtask term signals exist and which arm they describe -- annotating a"
+        " right-arm demo against the left arm's signals means the signals never fire and every"
+        " episode is rejected. Omit to use whatever the task cfg already declares."
+    ),
+)
+parser.add_argument(
     "--enable_pinocchio",
     action="store_true",
     default=False,
@@ -201,6 +214,16 @@ def main():
 
     env_cfg.env_name = env_name
 
+    # Task mode before anything reads terminations.success below -- it rewrites that term along
+    # with the subtask signals this script is here to annotate.
+    if args_cli.task_mode is not None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+            apply_task_mode,
+        )
+
+        apply_task_mode(env_cfg, args_cli.task_mode)
+        print(f"Task mode: {args_cli.task_mode}")
+
     # extract success checking function to invoke manually
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
@@ -353,13 +376,31 @@ def replay_episode(
     """
     global current_action_index, skip_episode, is_paused
     # read initial state and actions from the loaded episode
-    initial_state = episode.data["initial_state"]
     actions = episode.data["actions"]
+    if "initial_state" in episode.data:
+        initial_state = episode.data["initial_state"]
+        first_action_index = 0
+    else:
+        # record_demos_openarm.py's VR modes arm recording on a button press, which calls
+        # recorder_manager.reset() mid-episode -- that drops the initial_state recorded at env
+        # reset along with the pre-arming steps, so those datasets only carry per-step states.
+        # states[i] is the state *after* actions[i] was applied, so resetting to states[0] means
+        # the replay has to resume at actions[1] to keep the action/state pairing intact.
+        initial_state = episode.get_state(0)
+        if initial_state is None:
+            raise ValueError(
+                "The episode has neither an 'initial_state' nor any recorded states to reset to,"
+                " so it cannot be replayed for annotation."
+            )
+        first_action_index = 1
     env.sim.reset()
     env.recorder_manager.reset()
     env.reset_to(initial_state, None, is_relative=True)
     first_action = True
-    for action_index, action in enumerate(actions):
+    # Index into the FULL recorded action array either way -- manual annotation turns the marked
+    # current_action_index into a mask over episode.data["actions"], so a shifted start must not
+    # shift the indices that get marked.
+    for action_index, action in enumerate(actions[first_action_index:], start=first_action_index):
         current_action_index = action_index
         if first_action:
             first_action = False

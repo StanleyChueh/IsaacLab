@@ -36,6 +36,16 @@ reassigned from IK to JointPositionActionCfg at load time, see swap_to_joint_pos
   [8:15]  right arm joint-position delta-from-default
   [15:16] right gripper command (±1.0)
 
+Action space, --teleop_device vr_joint_ros2_native (16D flat -- all four action fields are
+reassigned to ROS2JointCommandActionCfg at load time, see swap_to_native_ros2_joint_actions).
+Every column is the ABSOLUTE joint target decoded from the ROS2 message that step, i.e. the
+command actually applied, not the pose that resulted from it (see
+ROS2NativeJointTeleop.build_dual_action):
+  [0:7]   left arm joint positions (rad)
+  [7:8]   left gripper joint1 position (m, 0.0 closed .. 0.044 open)
+  [8:15]  right arm joint positions
+  [15:16] right gripper joint1 position
+
 Usage:
 
  ./isaaclab.sh -p scripts/tools/record_demos_openarm.py  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0  --dataset_file logs/demos/pickup.hdf5 --enable_cameras  --num_demos 1    --teleop_device vr_ros2  --vr_udp_host 127.0.0.1  --vr_udp_port 5800
@@ -72,6 +82,29 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Record dual-arm OpenArm demonstrations with arm switching.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task.")
+parser.add_argument(
+    "--task_mode",
+    type=str,
+    default=None,
+    choices=["left", "right", "handover"],
+    help=(
+        "Which variant of the OpenArm pick-up task to record, i.e. which arm(s) the demo is"
+        " about, which arm(s) you may drive, and therefore what ends it. Any mode replaces the"
+        " task's default cube_2 with a can (see openarm_task_modes.py). 'left'/'right':"
+        " single-arm pick-up -- ONLY that arm is teleoperable (the other is held at its rest"
+        " pose), the can spawns only on that arm's half of the pad, and the demo auto-ends once"
+        " THAT arm is holding it in the air. 'handover': both arms are teleoperable, the can"
+        " spawns on the RIGHT half, the right arm picks it up and passes it to the left, and the"
+        " demo auto-ends once the LEFT arm is holding it in the air with the right gripper open."
+        " Every mode records BOTH arms' joints either way -- the gating is on control, not on"
+        " what lands in the dataset. Omit to keep the task cfg's own settings (cube_2 anywhere on"
+        " the pad, both arms live, auto-end on cube height alone, which accepts episodes where"
+        " nothing was ever grasped -- fine for raw teleop, not for Mimic source demos). Whatever"
+        " is chosen here must be passed to annotate_demos.py too, since it also selects which"
+        " subtask term signals exist. See"
+        " isaaclab_tasks/.../config/openarm/openarm_task_modes.py."
+    ),
+)
 parser.add_argument(
     "--teleop_device",
     type=str,
@@ -272,6 +305,10 @@ from isaaclab.managers import ActionTerm, ActionTermCfg, DatasetExportMode
 from isaaclab.utils import configclass
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+    CONTROLLED_ARMS,
+    apply_task_mode,
+)
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 
@@ -405,6 +442,17 @@ except ImportError:
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
 
 logger = logging.getLogger(__name__)
+
+# ─── Tasks whose real target object is the can ────────────────────────────────
+# These tasks' own cfgs still describe the ORIGINAL cube (cube_2) -- apply_task_mode() is what
+# swaps in the can, along with the per-arm signals and success condition. Recording one of them
+# without --task_mode therefore silently produces cube demos: the run looks completely normal,
+# and the mistake only surfaces later as a dataset whose object is the wrong shape. Cheaper to
+# refuse up front than to discover it after a recording session (see main()).
+CAN_TARGET_TASKS = (
+    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
+    "Isaac-PickUp-RedCube-OpenArm-CamMount-IK-Abs-v0",
+)
 
 # ─── Action space layout ──────────────────────────────────────────────────────
 # Must match the order fields are inserted into the env's ActionsCfg:
@@ -777,6 +825,17 @@ class ROS2JointCommandAction(ActionTerm):
     def apply_actions(self):
         import omni.graph.core as og
 
+        # Arm locked out by --task_mode (see CONTROLLED_ARMS): pin these joints to their rest
+        # pose and never read the ROS2 command. Actively re-asserting the default target each
+        # step, rather than just returning early, is what actually holds the arm still -- the
+        # operator's headset keeps publishing joint targets for BOTH arms regardless of task
+        # mode, and an early return would leave this arm's last commanded target standing.
+        if self.cfg.locked:
+            self._asset.set_joint_position_target(self._default_joint_pos, joint_ids=self._joint_ids)
+            if self._follower_ids:
+                self._asset.set_joint_position_target(self._follower_default_pos, joint_ids=self._follower_ids)
+            return
+
         try:
             names = og.Controller.attribute(f"{self._subscriber_path}.outputs:jointNames").get()
             positions = og.Controller.attribute(f"{self._subscriber_path}.outputs:positionCommand").get()
@@ -824,6 +883,12 @@ class ROS2JointCommandActionCfg(ActionTermCfg):
     TOTAL_ACTION_DIM_JOINT (16). See :meth:`ROS2JointCommandAction.apply_actions`."""
     graph_path: str = "/Graph/ROS_JointCommand"
     """Must match build_ros2_joint_command_graph's graph_path."""
+    locked: bool = False
+    """Ignore the incoming ROS2 command and hold these joints at their rest pose.
+
+    Set by --task_mode for the arm the mode says must not move (see CONTROLLED_ARMS). The width
+    of this term -- and therefore of the recorded action vector -- is unaffected: a locked arm
+    still contributes its columns to every recorded row, it just contributes a constant."""
 
 
 def swap_to_native_ros2_joint_actions(env_cfg) -> None:
@@ -1129,11 +1194,10 @@ class ROS2NativeJointTeleop:
     never writes a competing target for the same joints.
 
     This class's jobs: keep the R/N/T keyboard shortcuts working (main() wires them the
-    same way as every other teleop device), report the robot's ACTUAL current joint
-    positions each step as build_dual_action's return value (since that's what the
-    recorder logs as the episode's "action" -- there is no separate "commanded" value on
-    this process to log instead, the OmniGraph is the only thing that ever sees the raw
-    ROS2 message), and watch for the Quest X/Y buttons.
+    same way as every other teleop device), report each step's COMMANDED joint positions
+    as build_dual_action's return value (that's what the recorder logs as the episode's
+    "action" -- see _read_command_map/build_dual_action for why it must be the command
+    and not the resulting measured pose), and watch for the Quest X/Y buttons.
 
     The X/Y buttons ride along on the SAME /openarm/vr_joint_command_processed message
     the OmniGraph already decodes for joint targets -- joint_command_processor.py
@@ -1148,12 +1212,19 @@ class ROS2NativeJointTeleop:
     discard & reset). No second OmniGraph subscriber needed.
     """
 
-    def __init__(self, robot, sim_device: str, graph_path: str = "/Graph/ROS_JointCommand"):
+    def __init__(
+        self,
+        robot,
+        sim_device: str,
+        graph_path: str = "/Graph/ROS_JointCommand",
+        locked_arms: tuple[str, ...] = (),
+    ):
         self._robot = robot
         self._sim_device = sim_device
         self._subscriber_path = f"{graph_path}/SubscriberJointState"
         self._prev_button_x = False
         self._prev_button_y = False
+        self._locked_arms = locked_arms
 
         self._left_joint_ids, self._left_joint_names = robot.find_joints(LEFT_ARM_JOINT_REGEX)
         self._right_joint_ids, self._right_joint_names = robot.find_joints(RIGHT_ARM_JOINT_REGEX)
@@ -1218,18 +1289,33 @@ class ROS2NativeJointTeleop:
     def clear_deltas(self):
         pass
 
-    def _poll_buttons(self) -> None:
+    def _read_command_map(self) -> dict | None:
+        """The latest ROS2 joint command the OmniGraph decoded, as {joint name: position}.
+
+        These are the exact same two attributes ROS2JointCommandAction.apply_actions()
+        reads to actually drive the joints; reading them a second time here is what lets
+        build_dual_action log the COMMAND that was applied rather than the pose that
+        resulted from it.
+
+        Returns None whenever there is nothing to read (graph not built yet, or no ROS2
+        message decoded so far) -- same "leave everything as it is and try again next
+        step" contract apply_actions() uses.
+        """
         import omni.graph.core as og
 
         try:
             names = og.Controller.attribute(f"{self._subscriber_path}.outputs:jointNames").get()
             positions = og.Controller.attribute(f"{self._subscriber_path}.outputs:positionCommand").get()
         except Exception:
-            return  # graph/attribute not ready yet -- try again next step
+            return None  # graph/attribute not ready yet -- try again next step
         if not names or positions is None or len(positions) == 0:
+            return None  # no ROS2 message decoded yet
+        return dict(zip(names, positions))
+
+    def _poll_buttons(self, by_name: dict | None) -> None:
+        if by_name is None:
             return
 
-        by_name = dict(zip(names, positions))
         button_x = by_name.get("button_x", 0.0) > 0.5
         button_y = by_name.get("button_y", 0.0) > 0.5
 
@@ -1250,27 +1336,71 @@ class ROS2NativeJointTeleop:
         self, left_gripper_state: float, right_gripper_state: float
     ) -> tuple[torch.Tensor, float, float]:
         """Ignores left_gripper_state/right_gripper_state (kept only so the call
-        signature matches VRDualArmTeleop/VRDualArmJointTeleop) and instead reads back
-        the robot's actual current joint positions -- real actuation for this mode
-        happens out-of-band through the OmniGraph, not through anything computed here.
-        Also polls the same OmniGraph subscriber for the button_x/button_y "joint"
-        entries and fires the save/discard callbacks on a rising edge -- see class
-        docstring.
-        """
-        self._poll_buttons()
+        signature matches VRDualArmTeleop/VRDualArmJointTeleop) and instead returns the
+        joint targets the OmniGraph is driving the robot with this step -- real actuation
+        for this mode happens out-of-band through the graph, not through anything
+        computed here. Also polls the same decoded message for the button_x/button_y
+        "joint" entries and fires the save/discard callbacks on a rising edge -- see
+        class docstring.
 
-        left_pos = self._robot.data.joint_pos[0, self._left_joint_ids]
-        right_pos = self._robot.data.joint_pos[0, self._right_joint_ids]
-        left_grip_pos = self._robot.data.joint_pos[0, self._left_gripper_id].item()
-        right_grip_pos = self._robot.data.joint_pos[0, self._right_gripper_id].item()
+        Logging the COMMAND rather than the robot's measured joint positions is what
+        makes these episodes replayable (replay_demos.py --action_mode openarm_joint_abs
+        feeds each recorded row straight back in as an absolute joint target). Measured
+        positions were recorded here originally, and for the arms that only cost a step
+        of tracking lag -- but for the grippers it silently destroyed every grasp in the
+        dataset. Closing on the cube blocks the fingers at the cube's surface, so the
+        measured value stalls there (e.g. 0.0325 m) while the command keeps going to
+        ~0 m; it is precisely that command/measured gap that the implicit actuator turns
+        into grip force. Replaying the stalled measured value commands zero error, hence
+        zero squeeze, and the cube slips out of a gripper that never visibly closes.
+
+        Any joint the decoded message doesn't carry -- and every step before the first
+        message arrives -- falls back to the measured position, which is the closest
+        thing to "what it was told to do" available at that point. In practice recording
+        can only be armed by the button_x entry of that same message, so the fallback
+        only ever covers pre-arming steps that are discarded anyway.
+        """
+        by_name = self._read_command_map()
+        self._poll_buttons(by_name)
 
         full = torch.zeros(TOTAL_ACTION_DIM_JOINT, dtype=torch.float32, device=self._sim_device)
-        full[LEFT_JOINT_SLICE] = left_pos
-        full[LEFT_JOINT_GRP_IDX] = left_grip_pos
-        full[RIGHT_JOINT_SLICE] = right_pos
-        full[RIGHT_JOINT_GRP_IDX] = right_grip_pos
+        full[LEFT_JOINT_SLICE] = self._robot.data.joint_pos[0, self._left_joint_ids]
+        full[LEFT_JOINT_GRP_IDX] = self._robot.data.joint_pos[0, self._left_gripper_id]
+        full[RIGHT_JOINT_SLICE] = self._robot.data.joint_pos[0, self._right_joint_ids]
+        full[RIGHT_JOINT_GRP_IDX] = self._robot.data.joint_pos[0, self._right_gripper_id]
 
-        return full, left_grip_pos, right_grip_pos
+        if by_name is not None:
+            # Column order within each arm's slice is this class's find_joints() order,
+            # which replay_demos.py's JointPositionActionCfg over the same regex resolves
+            # identically -- so index by name, never by the message's own ordering.
+            for offset, joint_name in enumerate(self._left_joint_names):
+                if joint_name in by_name:
+                    full[LEFT_JOINT_SLICE.start + offset] = float(by_name[joint_name])
+            for offset, joint_name in enumerate(self._right_joint_names):
+                if joint_name in by_name:
+                    full[RIGHT_JOINT_SLICE.start + offset] = float(by_name[joint_name])
+            # Only each gripper's joint1 is ever published (joint2 is the follower that
+            # ROS2JointCommandAction copies it onto -- see its apply_actions()).
+            if LEFT_GRIPPER_JOINT_NAME in by_name:
+                full[LEFT_JOINT_GRP_IDX] = float(by_name[LEFT_GRIPPER_JOINT_NAME])
+            if RIGHT_GRIPPER_JOINT_NAME in by_name:
+                full[RIGHT_JOINT_GRP_IDX] = float(by_name[RIGHT_GRIPPER_JOINT_NAME])
+
+        # An arm locked out by --task_mode is held at its rest pose by ROS2JointCommandAction,
+        # which never reads the message above. Log THAT, not the command the operator's headset
+        # is still publishing for it: the recorded action has to be what the robot was actually
+        # told to do, or replay_demos.py would drive the locked arm through motions this episode
+        # never contained (and the recorded state, which is measured, would contradict it).
+        default_pos = self._robot.data.default_joint_pos
+        for arm in self._locked_arms:
+            if arm == "left":
+                full[LEFT_JOINT_SLICE] = default_pos[0, self._left_joint_ids]
+                full[LEFT_JOINT_GRP_IDX] = default_pos[0, self._left_gripper_id]
+            else:
+                full[RIGHT_JOINT_SLICE] = default_pos[0, self._right_joint_ids]
+                full[RIGHT_JOINT_GRP_IDX] = default_pos[0, self._right_gripper_id]
+
+        return full, full[LEFT_JOINT_GRP_IDX].item(), full[RIGHT_JOINT_GRP_IDX].item()
 
 
 class JointMirrorBroadcaster:
@@ -1530,6 +1660,48 @@ def build_dual_arm_action(
         return full, left_gripper_state, gripper_cmd
 
 
+def lock_arms_in_native_action_cfg(env_cfg, locked_arms: tuple[str, ...]) -> None:
+    """Mark the ROS2JointCommandActionCfg fields of *locked_arms* as ``locked``.
+
+    Only meaningful for --teleop_device vr_joint_ros2_native, where control does NOT flow
+    through the action vector env.step() is called with (the targets are read from the ROS2
+    OmniGraph inside apply_actions), so masking the action vector -- what
+    mask_locked_arms_in_action does for every other device -- would gate nothing at all.
+    Must run AFTER swap_to_native_ros2_joint_actions has installed those cfg fields.
+    """
+    for arm in locked_arms:
+        prefix = "" if arm == "left" else "right_"
+        for field in (f"{prefix}arm_action", f"{prefix}gripper_action"):
+            getattr(env_cfg.actions, field).locked = True
+
+
+def mask_locked_arms_in_action(
+    full_action: torch.Tensor, locked_arms: tuple[str, ...], is_joint_layout: bool
+) -> torch.Tensor:
+    """Zero out the action columns of every arm in *locked_arms*, in place.
+
+    Zero is "hold still" in both layouts this covers, which is why one mask serves both:
+    the IK layout's arm terms are relative (``use_relative_mode=True``, so a zero delta pose
+    means stay put) and the joint layout's are JointPositionActionCfg with
+    ``use_default_offset=True`` (so a zero target resolves to the arm's default pose).
+
+    The gripper column is masked to +1.0 rather than 0.0 -- it feeds a BinaryJointPositionAction,
+    where the sign is the command and 0.0 would read as "close". A locked arm must sit there with
+    its hand open, not slowly crush whatever is in front of it.
+    """
+    arm_slices = {
+        "left": (LEFT_JOINT_SLICE if is_joint_layout else LEFT_IK_SLICE,
+                 LEFT_JOINT_GRP_IDX if is_joint_layout else LEFT_GRP_IDX),
+        "right": (RIGHT_JOINT_SLICE if is_joint_layout else RIGHT_IK_SLICE,
+                  RIGHT_JOINT_GRP_IDX if is_joint_layout else RIGHT_GRP_IDX),
+    }
+    for arm in locked_arms:
+        arm_slice, grp_idx = arm_slices[arm]
+        full_action[arm_slice] = 0.0
+        full_action[grp_idx] = 1.0
+    return full_action
+
+
 def main():
     rate_limiter = RateLimiter(args_cli.step_hz)
 
@@ -1548,6 +1720,35 @@ def main():
         logger.error(f"Failed to parse env config: {e}")
         return
 
+    # Refuse the silent-cube trap rather than recording a session's worth of wrong-object demos.
+    if args_cli.task_mode is None and args_cli.task.split(":")[-1] in CAN_TARGET_TASKS:
+        logger.error(
+            f"'{args_cli.task}' targets the can, but that swap only happens via --task_mode, which"
+            " was not passed -- this run would have recorded the base task's CUBE instead."
+            " Re-run with --task_mode left|right|handover (and pass the SAME one to"
+            " annotate_demos.py)."
+        )
+        return
+
+    # Task mode first: it rewrites terminations.success, so it has to land before the
+    # success_term is lifted off the cfg below.
+    locked_arms: tuple[str, ...] = ()
+    if args_cli.task_mode is not None:
+        try:
+            apply_task_mode(env_cfg, args_cli.task_mode)
+        except ValueError as e:
+            logger.error(str(e))
+            return
+        controlled = CONTROLLED_ARMS[args_cli.task_mode]
+        locked_arms = tuple(arm for arm in ("left", "right") if arm not in controlled)
+        print(f"[TASK MODE] {args_cli.task_mode}")
+        print(f"[TASK MODE] Teleoperable arm(s): {', '.join(controlled).upper()}")
+        if locked_arms:
+            print(
+                f"[TASK MODE] Locked at rest pose: {', '.join(locked_arms).upper()}"
+                " (still recorded, just not driveable)"
+            )
+
     if args_cli.teleop_device == "vr_joint_ros2":
         try:
             swap_to_joint_position_actions(env_cfg)
@@ -1560,6 +1761,8 @@ def main():
         except RuntimeError as e:
             logger.error(str(e))
             return
+        # Must follow the swap -- it is the cfg fields the swap just installed that carry the flag.
+        lock_arms_in_native_action_cfg(env_cfg, locked_arms)
 
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
@@ -1674,14 +1877,19 @@ def main():
             topic_name=args_cli.ros2_topic,
             domain_id=args_cli.ros2_domain_id,
         )
-        teleop = ROS2NativeJointTeleop(robot=env.scene["robot"], sim_device=sim_device)
+        teleop = ROS2NativeJointTeleop(
+            robot=env.scene["robot"], sim_device=sim_device, locked_arms=locked_arms
+        )
     else:
         # Use OpenArmKeyboard (arrow keys + I/O) to avoid Isaac Sim viewport
         # gizmo conflicts with W/A/S/D/Q/E.
         teleop = OpenArmKeyboard(pos_sensitivity=0.05, rot_sensitivity=0.1, sim_device=sim_device)
 
     # ── State ─────────────────────────────────────────────────────────────────
-    active_arm = "left"
+    # A single-arm task mode pins the keyboard's active arm to the arm that mode is about (and
+    # disables TAB below) -- starting on "left" in --task_mode right would otherwise hand the
+    # operator a locked arm to drive until they noticed.
+    active_arm = "left" if "left" not in locked_arms else "right"
     left_gripper_state = 1.0   # 1.0 = open, -1.0 = close
     right_gripper_state = 1.0
     should_reset = False
@@ -1755,7 +1963,9 @@ def main():
 
     teleop.add_callback("R", reset_episode)
     teleop.add_callback("N", save_episode)
-    if not use_any_vr_teleop:
+    # No TAB in a single-arm task mode: the other arm is locked, so switching to it would just
+    # look like the teleop had died.
+    if not use_any_vr_teleop and not locked_arms:
         teleop.add_callback("TAB", toggle_arm)
     teleop.add_callback("T", request_ramp_test)
     if requires_manual_arm:
@@ -1844,6 +2054,15 @@ def main():
                     teleop_7d=teleop_7d,
                     gripper_state=left_gripper_state,
                     device=sim_device,
+                )
+            # Enforce --task_mode's arm gating. Skipped for vr_joint_ros2_native, where the
+            # action vector isn't what drives the robot -- that path is gated at the action
+            # term instead (see lock_arms_in_native_action_cfg). Applied to the OTHER devices
+            # here rather than inside each teleop class so there is exactly one place where a
+            # locked arm can leak through.
+            if locked_arms and is_dual_arm and not use_vr_joint_teleop_native:
+                full_action = mask_locked_arms_in_action(
+                    full_action, locked_arms, is_joint_layout=use_vr_joint_teleop
                 )
             actions = full_action.unsqueeze(0).expand(env.num_envs, -1)
 
