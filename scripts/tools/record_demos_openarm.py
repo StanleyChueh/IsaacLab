@@ -106,6 +106,20 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--manual_save",
+    action="store_true",
+    default=False,
+    help=(
+        "Never auto-export on the task's success condition -- an episode ends only when you say"
+        " so (Quest button X a second time, or the N key). Use this when the success condition is"
+        " not reliably recognised and you would rather judge the demo yourself than have episodes"
+        " that refuse to end: --task_mode handover in particular has to recognise a whole"
+        " right-grasp -> pass -> release -> land sequence, and any step it misses leaves the"
+        " episode running. Recording still STARTS the same way (button X). Without this flag the"
+        " success condition can also end the episode, and button X remains available either way."
+    ),
+)
+parser.add_argument(
     "--teleop_device",
     type=str,
     default="keyboard",
@@ -305,6 +319,7 @@ from isaaclab.managers import ActionTerm, ActionTermCfg, DatasetExportMode
 from isaaclab.utils import configclass
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm import openarm_task_modes
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
     CONTROLLED_ARMS,
     apply_task_mode,
@@ -453,6 +468,27 @@ CAN_TARGET_TASKS = (
     "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
     "Isaac-PickUp-RedCube-OpenArm-CamMount-IK-Abs-v0",
 )
+
+# ─── Motion gate: no robot motion before the episode is armed ─────────────────
+MOTION_GATE = {"enabled": True}
+"""Whether teleop is allowed to move the robot at all, right now.
+
+For the two Quest-button modes (see requires_manual_arm) this is False from every reset until
+button X arms the episode, so the robot sits at its rest pose instead of tracking the headset.
+Recording and motion are then the same switch: nothing moves before X, and everything that moves
+after it is in the episode.
+
+A dict rather than a module-level bool because ROS2JointCommandAction.apply_actions() reads it
+from inside the action pipeline, and rebinding a bare global would not be seen through the
+`from ... import` style binding this module's own helpers use.
+
+Deliberately replaces the older "let the arm track before X, then throw those steps away" design.
+That kept the robot continuously following the operator so arming never caused a jump, but it also
+meant the robot moved -- and could knock the can over -- during setup, before any episode existed
+to hold that motion. NOTE the trade this makes: because the robot no longer follows the headset
+before X, whatever pose the operator's real arms are in at the moment X is pressed is applied in
+one step. Align to the rest pose before arming, or the episode opens with a jump.
+"""
 
 # ─── Action space layout ──────────────────────────────────────────────────────
 # Must match the order fields are inserted into the env's ActionsCfg:
@@ -825,12 +861,14 @@ class ROS2JointCommandAction(ActionTerm):
     def apply_actions(self):
         import omni.graph.core as og
 
-        # Arm locked out by --task_mode (see CONTROLLED_ARMS): pin these joints to their rest
-        # pose and never read the ROS2 command. Actively re-asserting the default target each
-        # step, rather than just returning early, is what actually holds the arm still -- the
-        # operator's headset keeps publishing joint targets for BOTH arms regardless of task
-        # mode, and an early return would leave this arm's last commanded target standing.
-        if self.cfg.locked:
+        # Two independent reasons to ignore the ROS2 command and pin these joints to their rest
+        # pose: the arm is locked out for the whole run by --task_mode (see CONTROLLED_ARMS), or
+        # the episode has not been armed yet (button X -- see MOTION_GATE).
+        #
+        # Actively re-asserting the default target each step, rather than just returning early, is
+        # what actually holds the joints still: the operator's headset keeps publishing targets for
+        # both arms regardless, and an early return would leave the last commanded target standing.
+        if self.cfg.locked or not MOTION_GATE["enabled"]:
             self._asset.set_joint_position_target(self._default_joint_pos, joint_ids=self._joint_ids)
             if self._follower_ids:
                 self._asset.set_joint_position_target(self._follower_default_pos, joint_ids=self._follower_ids)
@@ -1833,10 +1871,11 @@ def main():
     use_vr_joint_teleop_native = args_cli.teleop_device == "vr_joint_ros2_native"
     use_any_vr_teleop = use_vr_teleop or use_vr_joint_teleop or use_vr_joint_teleop_native
     # vr_joint_ros2/vr_joint_ros2_native have a Quest X button wired to "arm" recording
-    # (see VRDualArmJointTeleop/ROS2NativeJointTeleop's button_x handling) -- for those
-    # two modes recording starts OFF after every reset and stays off until X is
-    # pressed, so pre-X teleop (e.g. positioning the arm) is never saved. Keyboard and
-    # vr_ros2 have no such button, so they keep the old always-on behavior.
+    # (see VRDualArmJointTeleop/ROS2NativeJointTeleop's button_x handling) -- for those two modes
+    # BOTH recording and robot motion start OFF after every reset and stay off until X is pressed
+    # (see MOTION_GATE): the robot holds its rest pose, so there is no pre-X teleop to save and
+    # nothing that can disturb the scene before the episode begins. Keyboard and vr_ros2 have no
+    # such button, so they keep the old always-on behavior.
     requires_manual_arm = use_vr_joint_teleop or use_vr_joint_teleop_native
     if use_vr_teleop and total_action_dim != TOTAL_ACTION_DIM:
         logger.error("--teleop_device vr_ros2 requires a dual-arm (14D action) task.")
@@ -1897,13 +1936,14 @@ def main():
     demo_count = 0
     success_step_count = 0
     ramp_test_requested = False
-    # Whether env.step()'s data is actually meant to be kept. Starts True for modes
-    # with no arm button (keyboard, vr_ros2) -- unchanged old behavior, always
-    # recording. Starts False for requires_manual_arm modes -- nothing is recorded
-    # until start_recording() (button X) fires; every env.step() taken before that
-    # still runs (so the operator can pre-position the arm) but its data is discarded
-    # by the recorder_manager.reset() inside start_recording() the moment X is pressed.
+    # Whether env.step()'s data is meant to be kept AND the robot is allowed to move -- for the
+    # button modes these are deliberately the same switch. Starts True for modes with no arm
+    # button (keyboard, vr_ros2) -- unchanged old behavior, always live, always recording. Starts
+    # False for requires_manual_arm modes: env.step() still runs (the sim must keep ticking to
+    # service ROS2 and render), but MOTION_GATE holds the robot at its rest pose and nothing is
+    # recorded until start_recording() (button X) fires.
     recording_armed = not requires_manual_arm
+    MOTION_GATE["enabled"] = recording_armed
 
     def reset_episode():
         nonlocal should_reset
@@ -1914,21 +1954,60 @@ def main():
         nonlocal ramp_test_requested
         ramp_test_requested = True
 
+    # ── Hand-over progress reporting ──────────────────────────────────────────
+    # Only meaningful in --task_mode handover, whose success condition is a 4-stage sequence rather
+    # than a single test. Printing each transition turns "the episode never ended" into "it never
+    # got past stage 1", which is the difference between a guess and a diagnosis.
+    _HANDOVER_STAGE_LABELS = {
+        0: "waiting for the RIGHT arm to grasp the can",
+        1: "right arm has it -- waiting for the LEFT arm to take it while the right still holds",
+        2: "passed to the left arm -- waiting for release and the can to land",
+        3: "complete",
+    }
+    handover_stage_seen: dict[str, int | None] = {"value": None}
+
+    def _report_handover_stage():
+        if args_cli.task_mode != "handover":
+            return
+        try:
+            stage = int(openarm_task_modes.handover_stage(env)[0])
+        except Exception:
+            return
+        if stage != handover_stage_seen["value"]:
+            handover_stage_seen["value"] = stage
+            print(f"[HANDOVER {stage}/3] {_HANDOVER_STAGE_LABELS.get(stage, '?')}")
+
+    def on_button_x():
+        """button_x handler -- a toggle: first press starts the episode, second press saves it.
+
+        Manual saving exists because the hand-over's auto-success condition has to recognise a
+        whole multi-step sequence (see handover_success) and any one of its steps going
+        unrecognised leaves the operator with an episode that will not end. A button the operator
+        controls does not depend on the sequence being detected at all.
+        """
+        if recording_armed:
+            save_episode()
+        else:
+            start_recording()
+
     def start_recording():
         """button_x handler (vr_joint_ros2 / vr_joint_ros2_native only, see
-        requires_manual_arm) -- arms recording and wipes whatever env.step() data has
-        piled up in the recorder_manager's buffer since the last reset (IsaacLab's
-        env.step() unconditionally feeds every step into that buffer; there is no
-        separate "recording enabled" switch inside RecorderManager itself), so the
-        episode that eventually gets exported (by save_episode() or the auto-success
-        check below) only contains steps taken AFTER this button press.
+        requires_manual_arm) -- releases the robot AND arms recording, in that order.
+
+        Also wipes whatever env.step() data has piled up in the recorder_manager's buffer since
+        the last reset (IsaacLab's env.step() unconditionally feeds every step into that buffer;
+        there is no separate "recording enabled" switch inside RecorderManager itself), so the
+        episode that eventually gets exported (by save_episode() or the auto-success check below)
+        only contains steps taken AFTER this button press. Those discarded steps are now all
+        rest-pose ones, since MOTION_GATE kept the robot still until this fired.
         """
         nonlocal recording_armed
         if recording_armed:
             return  # already armed -- ignore repeat X presses within the same episode
         env.recorder_manager.reset([0])
         recording_armed = True
-        print("Recording started (button X)")
+        MOTION_GATE["enabled"] = True
+        print("Recording started (button X) -- robot released")
 
     def save_episode():
         nonlocal should_reset
@@ -1969,7 +2048,7 @@ def main():
         teleop.add_callback("TAB", toggle_arm)
     teleop.add_callback("T", request_ramp_test)
     if requires_manual_arm:
-        teleop.add_callback("X_START", start_recording)
+        teleop.add_callback("X_START", on_button_x)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     instruction_display = InstructionDisplay(xr=False)
@@ -2005,8 +2084,15 @@ def main():
         print("  PgUp/PgDn  — EE up / down            (+z/-z)")
         print("  ↑/↓        — pitch ±  |  ←/→ — yaw ±  |  [/] — roll ±")
     if requires_manual_arm:
-        print("  X (Quest)  — start recording (arms the episode; nothing is saved before this)")
-        print("  Y (Quest)  — discard & reset episode")
+        print("  X (Quest)  — press ONCE to release the robot and start recording; press AGAIN to")
+        print("               save the episode. Until the first press the robot stays at its rest")
+        print("               pose and ignores your controllers, and nothing is saved. Line your")
+        print("               arms up with the rest pose before the first press -- the robot takes")
+        print("               your current pose in one step.")
+        print("  Y (Quest)  — discard & reset episode (re-freezes the robot until X)")
+        if args_cli.manual_save:
+            print("  (--manual_save: the task's success condition will NOT end an episode; only")
+            print("   button X or the N key will.)")
     print("  N          — save episode as success")
     print("  R          — discard & reset episode")
     print("  T          — ramp current pose to rest (matches reset_to_rest_pose.py) and watch")
@@ -2055,15 +2141,18 @@ def main():
                     gripper_state=left_gripper_state,
                     device=sim_device,
                 )
-            # Enforce --task_mode's arm gating. Skipped for vr_joint_ros2_native, where the
-            # action vector isn't what drives the robot -- that path is gated at the action
-            # term instead (see lock_arms_in_native_action_cfg). Applied to the OTHER devices
-            # here rather than inside each teleop class so there is exactly one place where a
-            # locked arm can leak through.
-            if locked_arms and is_dual_arm and not use_vr_joint_teleop_native:
-                full_action = mask_locked_arms_in_action(
-                    full_action, locked_arms, is_joint_layout=use_vr_joint_teleop
-                )
+            # Enforce the arm gating. Both cases below are skipped for vr_joint_ros2_native, where
+            # the action vector isn't what drives the robot -- that path is gated inside
+            # ROS2JointCommandAction instead (--task_mode via cfg.locked, button X via
+            # MOTION_GATE). Applied to the OTHER devices here rather than inside each teleop class
+            # so there is exactly one place a gated arm can leak through.
+            if is_dual_arm and not use_vr_joint_teleop_native:
+                # Not armed yet (button X pending): freeze BOTH arms, not just the locked one.
+                gated = ("left", "right") if not MOTION_GATE["enabled"] else locked_arms
+                if gated:
+                    full_action = mask_locked_arms_in_action(
+                        full_action, gated, is_joint_layout=use_vr_joint_teleop
+                    )
             actions = full_action.unsqueeze(0).expand(env.num_envs, -1)
 
             if running:
@@ -2088,8 +2177,14 @@ def main():
 
             # Success check -- gated on recording_armed so a not-yet-armed episode
             # (requires_manual_arm modes, before X is pressed) can never auto-export.
-            if success_term is not None:
-                if recording_armed and bool(success_term.func(env, **success_term.params)[0]):
+            #
+            # Still EVALUATED under --manual_save, just never acted on: the evaluation is what
+            # drives the hand-over stage machine, and the progress print below is the only way to
+            # see which step of the sequence a stuck episode never reached.
+            if success_term is not None and recording_armed:
+                succeeded = bool(success_term.func(env, **success_term.params)[0])
+                _report_handover_stage()
+                if succeeded and not args_cli.manual_save:
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
                         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
@@ -2122,17 +2217,19 @@ def main():
                 teleop.reset()
                 success_step_count = 0
                 should_reset = False
-                # requires_manual_arm modes go back to un-armed after every reset --
-                # the next episode isn't recorded until X is pressed again. Other
-                # modes stay always-armed (old behavior).
+                # requires_manual_arm modes go back to un-armed after every reset -- the next
+                # episode isn't recorded, and the robot won't move, until X is pressed again.
+                # Other modes stay always-armed (old behavior).
                 recording_armed = not requires_manual_arm
+                MOTION_GATE["enabled"] = recording_armed
+                handover_stage_seen["value"] = None
                 # Reset gripper states to open
                 left_gripper_state = 1.0
                 right_gripper_state = 1.0
                 _refresh_label()
                 print(f"Ready. Active arm: {active_arm.upper()}")
                 if requires_manual_arm:
-                    print("Press X to start recording.")
+                    print("Robot held at rest pose. Press X to release it and start recording.")
 
             if env.sim.is_stopped():
                 break

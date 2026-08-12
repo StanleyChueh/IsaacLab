@@ -44,12 +44,13 @@ generalise from.
     while it is lifted.
 
 ``handover``
-    Bimanual hand-over (Mimic plan C). The right arm picks the can up low and presents it, the
-    left arm takes it higher up, the right arm lets go. Both arms are teleoperable. Success
-    requires the left arm to be holding it in the air, the right gripper open, AND the right arm
-    to have held it earlier in the episode -- see :func:`handover_success`, whose latch is what
-    stops a plain left-arm pick from ending the episode now that the can can spawn under either
-    hand.
+    Bimanual hand-over (Mimic plan C). Both arms are teleoperable, and the episode is the whole
+    sequence: the right arm picks the can up and presents it, the left arm takes it while the
+    right is still holding on, the right lets go, and finally the left arm releases it and the can
+    drops back down. Success fires on that last landing -- see :func:`handover_success`, which
+    walks a stage counter through the sequence rather than testing any single instant, because no
+    instant distinguishes a hand-over from a plain left-arm pick now that the can can spawn under
+    either hand.
 
 Subtask term signals published per mode -- these are what ``annotate_demos.py`` annotates and
 what a Mimic env cfg's ``subtask_term_signal`` entries must reference:
@@ -79,6 +80,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
 from isaaclab.sensors import FrameTransformer, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
+from isaaclab.utils.math import quat_apply_inverse
 
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
@@ -95,8 +97,19 @@ LEFT_FINGER_JOINTS = ["openarm_left_finger_joint1", "openarm_left_finger_joint2"
 RIGHT_FINGER_JOINTS = ["openarm_right_finger_joint1", "openarm_right_finger_joint2"]
 GRIPPER_OPEN_VAL = 0.044
 """Fully-open finger position (m) -- matches the tasks' BinaryJointPositionActionCfg."""
-GRIPPER_THRESHOLD = 0.018
-"""How far (m) a jaw must have travelled from open before it counts as closed on something."""
+GRIPPER_THRESHOLD = 0.010
+"""How far (m) a jaw must have travelled from open before it counts as closed on something.
+
+Sized against the can, and it has to be: a jaw closing on a 60 mm-wide can stops at the can's
+surface, so it travels much LESS than one closing on the small cube this number was originally
+picked for. Measured at equilibrium with the gripper commanded shut on the can, the two jaws
+settle at 0.0285 and 0.0308 -- travels of 0.0155 and 0.0132 from the 0.044 open position. The
+old 0.018 sat above both, so a genuinely closed, load-bearing grip read as "not closed" and no
+grasp signal could ever fire.
+
+0.010 clears the smaller of those two travels with margin while still being far from the ~0 travel
+of a jaw that is simply open. It does not have to carry the whole "is this a grasp" decision on its
+own -- :func:`object_grasped_by` also requires the hand to be on the can."""
 
 # ── The manipulated object -- one prop, every mode ────────────────────────────
 CAN_NAME = "can"
@@ -128,6 +141,28 @@ CAN_HALF_HEIGHT = 0.1
 how far its own origin sits above its base: the asset's origin is at the geometric centre, not the
 base, so resting on the pad means ``pos[2] = pad_top + CAN_HALF_HEIGHT``."""
 
+CAN_REST_OFFSET = -0.002
+"""m -- PhysX rest offset for the can's colliders. Negative, i.e. the surface PhysX holds other
+shapes off of sits INSIDE the can's visible surface, so a closing gripper keeps going until its
+fingers slightly overlap the render mesh instead of stopping short of it.
+
+This exists because the asset's colliders are not one shape but three, and the widest is not the
+one you grasp. Measured in-sim at :data:`CAN_SCALE` (world diameters):
+
+    body collider   0.0580   vs body visual  0.0586   -- collider already 0.6 mm inside
+    bottom collider 0.0588
+    lid-ring collider 0.0603  vs lid visual   0.0600   -- and 1.7 mm PROUD of the body visual
+
+So a gripper closing on the can's body is stopped ~0.9 mm early per side by a lid rim it never
+looks like it is touching -- the visible gap. -2 mm pulls every collider comfortably inside the
+render mesh (lid ring becomes 0.0563 effective, under the 0.0586 body) and leaves the grip looking
+closed. Scaling the collision meshes themselves would be the other fix, but they live inside a
+third-party USD, and per-collider scale is not something UsdFileCfg can express.
+
+Costs ~1.3 mm of the can sinking into the pad at rest (rest offsets sum across a contact pair),
+which is well under what is visible on a 200 mm can. Do not make this much larger for that reason,
+and do not make it positive -- a positive rest offset is an actual air gap at every contact."""
+
 EEF_TO_CAN_THRESHOLD = 0.07
 """Max distance (m) from a TCP to the can's origin for a single-arm grasp to count as holding it.
 A hand steadying a free-standing 200 mm can (60 mm diameter, 30 mm radius post-scale) grips near
@@ -140,6 +175,30 @@ EEF_TO_CAN_THRESHOLD_HANDOVER = 0.11
 Larger than :data:`EEF_TO_CAN_THRESHOLD` because a hand-over holds the can at two DIFFERENT
 heights at once (giving hand low, receiving hand high) -- budgeting a ~9 cm vertical offset from
 the origin on each side: sqrt(0.03^2 + 0.09^2) ~= 0.095 m, plus margin."""
+
+GRASP_AXIAL_TOLERANCE = 0.12
+"""m -- how far along the can's own axis, measured from its centre, a hand may be and still count
+as holding it. The can is 200 mm long, so a hand on it is anywhere within ~100 mm of the centre
+along that axis; this is that half-length plus margin for gripping right at the rim.
+
+This exists because "distance from the hand to the object's origin" is the wrong test for a long
+object: gripping the can perfectly at its top rim puts the hand ~100 mm from the origin, which no
+sane origin-distance threshold accepts, while a threshold loose enough to accept it would also
+accept a hand floating 100 mm off to the side. :func:`object_grasped_by` therefore splits the
+hand-to-can vector into its along-the-can and across-the-can parts and bounds them separately --
+a cylinder test rather than a sphere test."""
+
+EEF_TCP_TO_GRASP_OFFSET = (0.0, 0.0, 0.1025)
+"""m -- offset from the ``*_ee_tcp`` link's origin to the point midway between its jaws, in that
+link's LOCAL frame. Applied to both arms' FrameTransformers (see :func:`apply_task_mode`).
+
+Despite the name, ``openarm_*_ee_tcp`` is NOT at the tool centre point: measured in-sim it sits on
+the wrist, coincident with ``link7`` and 102.5 mm short of the fingers, and the offset is identical
+on both arms and invariant to arm pose (re-measured after moving the arm: 0.10250). Reporting that
+link as the end-effector makes every hand-to-object distance overshoot by 102.5 mm, which is enough
+on its own to stop any grasp signal from ever firing -- a real closed grasp measured 0.1236 m
+against a 0.07 m threshold. It also feeds Mimic, which transforms source segments relative to the
+eef pose it is given, so a frame 10 cm behind the hand mis-places every generated trajectory."""
 
 
 # ── Signal primitives ─────────────────────────────────────────────────────────
@@ -164,15 +223,34 @@ def object_grasped_by(
     gripper_open_val: float = GRIPPER_OPEN_VAL,
     gripper_threshold: float = GRIPPER_THRESHOLD,
     diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+    axial_threshold: float = GRASP_AXIAL_TOLERANCE,
 ) -> torch.Tensor:
-    """(N,) bool: the arm behind *ee_frame_cfg* has its gripper closed on the object."""
+    """(N,) bool: the arm behind *ee_frame_cfg* has its gripper closed ON the object.
+
+    "On the object" is a cylinder test, not a sphere one: the hand-to-can vector is split into the
+    part along the can's own axis and the part across it, and each is bounded separately
+    (*axial_threshold* and *diff_threshold*). See :data:`GRASP_AXIAL_TOLERANCE` for why -- a 200 mm
+    can gripped at its rim is 100 mm from its own origin, so no single radius both accepts that and
+    rejects a hand hovering 100 mm to the side.
+
+    The can's axis is taken from its current orientation rather than assumed vertical, so this
+    keeps working while the can is tilted mid-hand-over or lying down.
+    """
     robot: Articulation = env.scene[robot_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     obj: RigidObject = env.scene[object_cfg.name]
 
-    pose_diff = torch.linalg.vector_norm(obj.data.root_pos_w - ee_frame.data.target_pos_w[:, 0, :], dim=1)
+    # Hand position relative to the can, expressed in the CAN's frame: component z is along the
+    # can's length, (x, y) is across it.
+    to_hand_w = ee_frame.data.target_pos_w[:, 0, :] - obj.data.root_pos_w
+    to_hand_local = quat_apply_inverse(obj.data.root_quat_w, to_hand_w)
+
+    radial = torch.linalg.vector_norm(to_hand_local[:, :2], dim=1)
+    axial = torch.abs(to_hand_local[:, 2])
+
+    on_object = torch.logical_and(radial < diff_threshold, axial < axial_threshold)
     return torch.logical_and(
-        pose_diff < diff_threshold,
+        on_object,
         _gripper_is_closed(robot, gripper_joint_names, gripper_open_val, gripper_threshold),
     )
 
@@ -300,6 +378,44 @@ def object_held_by_both_obs(
     return both.unsqueeze(-1).float()
 
 
+HANDOVER_STAGE_WAITING = 0
+HANDOVER_STAGE_RIGHT_HELD = 1
+HANDOVER_STAGE_PASSED_TO_LEFT = 2
+HANDOVER_STAGE_DONE = 3
+"""How far through the hand-over each env has got. See :func:`handover_success`."""
+
+_HANDOVER_STAGE_ATTR = "_openarm_handover_stage"
+"""Attribute :func:`handover_success` stores its per-env stage counter under."""
+
+
+def handover_stage(env) -> torch.Tensor:
+    """(N,) long: how far each env has got through the hand-over. Created on first use.
+
+    Exposed so a caller can report progress -- record_demos_openarm.py prints each transition, so
+    a hand-over that never completes shows WHICH step it stalled on rather than just failing to
+    end the episode.
+    """
+    stage = getattr(env, _HANDOVER_STAGE_ATTR, None)
+    if stage is None or stage.shape[0] != env.num_envs:
+        stage = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        setattr(env, _HANDOVER_STAGE_ATTR, stage)
+    return stage
+
+
+def reset_handover_stage(env, env_ids: torch.Tensor) -> None:
+    """Clear the hand-over progress of the envs being reset. Installed as a "reset" event term.
+
+    An event term rather than something :func:`handover_success` infers for itself, because it is
+    the only mechanism that is guaranteed to run on exactly the envs being reset, exactly when they
+    reset. Deriving the boundary inside the success function instead means guessing from the step
+    counter, and under record_demos_openarm.py's button-X flow that guess is wrong: the success
+    check is not evaluated at all until the episode is armed, so a short episode followed by a
+    late arming looks like time moving forwards and the previous hand-over's completed stage
+    survives into the new episode -- which would end it instantly, on the operator's first press.
+    """
+    handover_stage(env)[env_ids] = HANDOVER_STAGE_WAITING
+
+
 def handover_success(
     env,
     min_height: float,
@@ -309,64 +425,76 @@ def handover_success(
     gripper_open_val: float = GRIPPER_OPEN_VAL,
     gripper_threshold: float = GRIPPER_THRESHOLD,
     diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+    drop_tolerance: float = 0.02,
 ) -> torch.Tensor:
-    """(N,) bool: the LEFT arm holds the can in the air, the RIGHT gripper has let go, and the
-    right arm DID hold the can earlier in this episode.
+    """(N,) bool: the whole hand-over has played out, ending with the can back down on a surface.
 
-    The hand-over runs right -> left: the right arm is the giving hand, the left arm the
-    receiving one, so the episode is done exactly when the left arm has it and the right has
-    let go.
+    The episode is the entire sequence, not any single instant, so this walks a per-env stage
+    counter forward and only reports success at the end of it:
 
-    That last clause is a latch, and it is what makes this condition mean "a hand-over happened"
-    rather than merely "the left arm is holding the can". An earlier version left it out and
-    leaned on geometry instead: the can used to spawn only on the right half, out of comfortable
-    left-arm reach, so the instantaneous state was supposedly unreachable without a hand-over.
-    The can now spawns anywhere on the pad (see :func:`reset_object_free`), including directly
-    under the left hand, so that argument is gone -- without the latch a plain left-arm pick ends
-    the episode and gets exported as a hand-over demo.
+    ========================================  ==========================================
+    :data:`HANDOVER_STAGE_WAITING`            nothing yet
+    :data:`HANDOVER_STAGE_RIGHT_HELD`         the RIGHT (giving) arm has grasped the can
+    :data:`HANDOVER_STAGE_PASSED_TO_LEFT`     the LEFT (receiving) arm has it, and had it
+                                              while the right arm was still holding on --
+                                              i.e. an actual pass, not a re-pick off the pad
+    :data:`HANDOVER_STAGE_DONE`               the left arm let go and the can came back down
+    ========================================  ==========================================
 
-    The latch lives on the env rather than in a module-level dict so it cannot outlive the env it
-    describes, and it is cleared on the episode's first evaluated step.
+    Stages only ever advance, so a momentary loss of contact mid-pass cannot walk the episode
+    backwards, and the counter is reset per episode.
+
+    Why a sequence and not a snapshot: the can now spawns anywhere on the pad (see
+    :func:`reset_object_free`), including directly under the left hand, so no instantaneous
+    condition can distinguish a hand-over from a plain left-arm pick. Requiring the right arm to
+    have held it first, and to still be holding it at the moment the left arm takes it, is what
+    makes the demo a hand-over rather than "the left arm picked something up".
+
+    Args:
+        min_height: how high the can must get to count as carried rather than dragged. Applied at
+            the pass, which is the point of the task -- not at the end, where the can is by
+            definition back down.
+        drop_tolerance: how close (m) to its resting height the can must return before it counts
+            as having landed. Absolute height, so a can that rolls off the pad onto the floor
+            satisfies it too.
     """
     obj: RigidObject = env.scene[object_cfg.name]
-    robot: Articulation = env.scene[robot_cfg.name]
 
-    right_holds = object_grasped_by(
-        env,
-        ee_frame_cfg=SceneEntityCfg("right_ee_frame"),
-        gripper_joint_names=RIGHT_FINGER_JOINTS,
-        object_cfg=object_cfg,
-        robot_cfg=robot_cfg,
-        gripper_open_val=gripper_open_val,
-        gripper_threshold=gripper_threshold,
-        diff_threshold=diff_threshold,
-    )
-    latch = getattr(env, _HANDOVER_LATCH_ATTR, None)
-    if latch is None or latch.shape[0] != env.num_envs:
-        latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        setattr(env, _HANDOVER_LATCH_ATTR, latch)
-    # Forget the previous episode's hand-over. episode_length_buf is 0 at reset and 1 on the first
-    # stepped evaluation, so this clears exactly once per episode and never mid-episode.
-    latch &= env.episode_length_buf > 1
-    latch |= right_holds
+    stage = handover_stage(env)
 
-    left_holds = object_grasped_by(
-        env,
-        ee_frame_cfg=left_ee_frame_cfg,
-        gripper_joint_names=LEFT_FINGER_JOINTS,
-        object_cfg=object_cfg,
-        robot_cfg=robot_cfg,
-        gripper_open_val=gripper_open_val,
-        gripper_threshold=gripper_threshold,
-        diff_threshold=diff_threshold,
-    )
-    right_released = ~_gripper_is_closed(robot, RIGHT_FINGER_JOINTS, gripper_open_val, gripper_threshold)
+    def _held_by(frame_name, fingers):
+        return object_grasped_by(
+            env,
+            ee_frame_cfg=SceneEntityCfg(frame_name),
+            gripper_joint_names=fingers,
+            object_cfg=object_cfg,
+            robot_cfg=robot_cfg,
+            gripper_open_val=gripper_open_val,
+            gripper_threshold=gripper_threshold,
+            diff_threshold=diff_threshold,
+        )
+
+    right_holds = _held_by("right_ee_frame", RIGHT_FINGER_JOINTS)
+    left_holds = _held_by(left_ee_frame_cfg.name, LEFT_FINGER_JOINTS)
+
+    # 0 -> 1: the giving hand has the can.
+    stage[(stage == HANDOVER_STAGE_WAITING) & right_holds] = HANDOVER_STAGE_RIGHT_HELD
+
+    # 1 -> 2: both hands on it at once, up in the air. Demanding the overlap (rather than just
+    # "left holds it now") is what rules out the right arm putting the can down and the left arm
+    # picking it back up, which is not a hand-over.
     lifted = obj.data.root_pos_w[:, 2] > min_height
-    return torch.logical_and(torch.logical_and(left_holds, right_released), torch.logical_and(lifted, latch))
+    passed = (stage == HANDOVER_STAGE_RIGHT_HELD) & right_holds & left_holds & lifted
+    stage[passed] = HANDOVER_STAGE_PASSED_TO_LEFT
 
+    # 2 -> 3: nobody is holding it and it has come back down. Checking both grippers, not just the
+    # left, keeps a "pass it back" ending from counting.
+    landed = obj.data.root_pos_w[:, 2] <= (_object_rest_z(env) + drop_tolerance)
+    released = ~left_holds & ~right_holds
+    dropped = (stage == HANDOVER_STAGE_PASSED_TO_LEFT) & released & landed
+    stage[dropped] = HANDOVER_STAGE_DONE
 
-_HANDOVER_LATCH_ATTR = "_openarm_handover_right_held"
-"""Attribute :func:`handover_success` stores its per-env latch under."""
+    return stage == HANDOVER_STAGE_DONE
 
 
 # ── Object spawn region -- the SAME for every mode ────────────────────────────
@@ -588,7 +716,9 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     subtask_configs = {
         LEFT_EEF: [
             _subtask("grasp_left", "Approach the presented can and take it"),
-            _subtask(None, "Carry the can away"),
+            # Last subtask, so it runs to the end of the episode -- which now means carrying the
+            # can clear and then letting it drop, since that landing is what ends the demo.
+            _subtask(None, "Carry the can away, then release it and let it drop"),
         ],
         RIGHT_EEF: [
             _subtask("grasp_right", "Reach and grasp the can", interp=50, offset=(2, 5)),
@@ -640,18 +770,27 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
             " task (or a subclass), whose left TCP frame it mirrors for the right arm."
         )
 
-    # ── Right-arm TCP frame (mirror of the task's left 'ee_frame') ────────────
-    env_cfg.scene.right_ee_frame = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/openarm_right_link1",
-        debug_vis=False,
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/openarm_right_ee_tcp",
-                name="end_effector",
-                offset=OffsetCfg(pos=(0.0, 0.0, 0.0)),
-            )
-        ],
-    )
+    # ── Per-arm grasp-point frames ────────────────────────────────────────────
+    # BOTH are (re)built here, including the left one the base task already defines, because both
+    # need the same correction: the *_ee_tcp link they target is on the wrist, 102.5 mm short of
+    # the jaws, so the frames as shipped report a point no grasp ever happens at. See
+    # EEF_TCP_TO_GRASP_OFFSET. Overriding the left frame here rather than in the base task keeps
+    # the fix scoped to the modes whose signals depend on it.
+    def _grasp_frame(side: str) -> FrameTransformerCfg:
+        return FrameTransformerCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/Robot/openarm_{side}_link1",
+            debug_vis=False,
+            target_frames=[
+                FrameTransformerCfg.FrameCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/Robot/openarm_{side}_ee_tcp",
+                    name="end_effector",
+                    offset=OffsetCfg(pos=EEF_TCP_TO_GRASP_OFFSET),
+                )
+            ],
+        )
+
+    env_cfg.scene.ee_frame = _grasp_frame("left")
+    env_cfg.scene.right_ee_frame = _grasp_frame("right")
 
     # ── Right EEF pose observations ──────────────────────────────────────────
     # The task publishes only the left TCP as eef_pos/eef_quat. A dual-arm Mimic env needs one
@@ -691,6 +830,7 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
                 max_depenetration_velocity=1.0,
                 disable_gravity=False,
             ),
+            collision_props=sim_utils.CollisionPropertiesCfg(rest_offset=CAN_REST_OFFSET),
             semantic_tags=[("class", CAN_NAME)],
         ),
     )
@@ -759,6 +899,9 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
         env_cfg.terminations.success = TerminationTermCfg(
             func=handover_success, params={"min_height": lift_height, **common()}, time_out=False
         )
+        # handover_success is stateful, so its state has to be cleared per episode by something
+        # that actually runs on reset -- see reset_handover_stage.
+        env_cfg.events.reset_handover_stage = EventTerm(func=reset_handover_stage, mode="reset")
 
     # ── Object spawn ─────────────────────────────────────────────────────────
     # The base task's own randomisation term is dropped in every mode: the object it targeted

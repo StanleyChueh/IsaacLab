@@ -43,6 +43,20 @@ parser.add_argument(
 )
 parser.add_argument("--dataset_file", type=str, default="datasets/dataset.hdf5", help="Dataset file to be replayed.")
 parser.add_argument(
+    "--task_mode",
+    type=str,
+    default=None,
+    choices=["left", "right", "handover"],
+    help=(
+        "OpenArm pick-up tasks only: which task variant the dataset was recorded under. The mode"
+        " swaps the task's default cube_2 for the can, so replaying a mode-recorded dataset"
+        " against the plain task fails with KeyError: 'cube_2' -- the scene contains an object the"
+        " recording has no state for. Normally you do NOT need to pass this: the object is"
+        " detected from the dataset and the scene is fixed up automatically. Pass it to be"
+        " explicit, or if detection guesses wrong."
+    ),
+)
+parser.add_argument(
     "--validate_states",
     action="store_true",
     default=False,
@@ -258,6 +272,24 @@ def peek_episode_actions(dataset_file: str, episode_name: str) -> np.ndarray | N
         return episode_group["actions"][:]
 
 
+def peek_episode_rigid_objects(dataset_file: str, episode_name: str) -> list[str]:
+    """Names of the rigid objects an episode recorded state for, and nothing else.
+
+    Same reason as :func:`peek_episode_actions` for going straight to h5py: this has to be known
+    before gym.make(), and loading the episode properly would drag in every camera frame.
+
+    The scene the env is built with has to contain exactly the objects the recording did, or
+    ManagerBasedEnv.reset_to() raises KeyError on the first missing one -- it looks up each of the
+    env's rigid objects in the recorded state.
+    """
+    with h5py.File(dataset_file, "r") as file_stream:
+        episode_group = file_stream["data"][episode_name]
+        states = episode_group.get("initial_state") or episode_group.get("states")
+        if states is None or "rigid_object" not in states:
+            return []
+        return list(states["rigid_object"].keys())
+
+
 def detect_openarm_action_mode(actions: np.ndarray | None) -> str:
     """Infer which action mode a recorded action array was produced with.
 
@@ -360,6 +392,29 @@ def main():
         raise ValueError(f"None of the selected episode indices exist in a dataset of {episode_count} episodes.")
     dataset_actions = peek_episode_actions(args_cli.dataset_file, episode_names[first_episode_index])
     dataset_action_dim = dataset_actions.shape[1] if dataset_actions is not None and dataset_actions.ndim == 2 else None
+
+    # ── Match the scene to the objects the dataset actually recorded ──────────
+    # A dataset recorded with record_demos_openarm.py --task_mode has the can in place of the
+    # task's cube_2. Rebuilding the plain task for it puts a cube_2 in the scene that the recording
+    # never saw, and reset_to() dies on the first frame with KeyError: 'cube_2'.
+    recorded_objects = peek_episode_rigid_objects(args_cli.dataset_file, episode_names[first_episode_index])
+    task_mode = args_cli.task_mode
+    if task_mode is None and "can" in recorded_objects and "cube_2" not in recorded_objects:
+        # Every mode builds the SAME scene -- they differ only in which arm may be driven, the
+        # success condition and the spawn range, none of which affect a replay of recorded actions
+        # against recorded states. So any mode reconstructs the right scene; say which was assumed.
+        task_mode = "right"
+        print(
+            f"[INFO] Dataset records objects {recorded_objects} -- applying --task_mode {task_mode}"
+            " so the scene matches. Pass --task_mode explicitly to override."
+        )
+    if task_mode is not None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+            apply_task_mode,
+        )
+
+        apply_task_mode(env_cfg, task_mode)
+        print(f"[TASK MODE] {task_mode}")
 
     action_mode = args_cli.action_mode
     if action_mode == "auto":

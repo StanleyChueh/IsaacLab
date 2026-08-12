@@ -416,11 +416,14 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         # generating contact but not holding, which would look identical from the outside).
         # Not part of the task's observation/action space; only read for debug printing in
         # record_demos_openarm.py's main loop.
+        # debug_vis stays OFF: it draws a marker at every contact point, which lands a red ball on
+        # the object exactly when the fingers close on it -- i.e. in every frame of the recorded
+        # wrist/front camera images, which are training data.
         self.scene.contact_right_left_finger = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_right_left_finger",
             update_period=0.0,
             history_length=6,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube_2"],
         )
 
