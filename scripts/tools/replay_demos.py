@@ -43,6 +43,21 @@ parser.add_argument(
 )
 parser.add_argument("--dataset_file", type=str, default="datasets/dataset.hdf5", help="Dataset file to be replayed.")
 parser.add_argument(
+    "--replay_mode",
+    type=str,
+    default="actions",
+    choices=["actions", "states"],
+    help=(
+        "'actions' (default) re-simulates the recorded actions, so the physics is live and the"
+        " result can differ from the recording. 'states' writes the recorded joint positions and"
+        " object poses to the sim frame by frame, reproducing the demo exactly -- use it to look"
+        " at what a dataset contains. A --teleop_device vr_joint_ros2_native dataset cannot be"
+        " replayed faithfully with 'actions': its robot was driven by a joint command re-read"
+        " every physics substep, while only one sample per step is logged, so the replayed control"
+        " signal is coarser than the one that produced the demo and the grasp drifts off."
+    ),
+)
+parser.add_argument(
     "--task_mode",
     type=str,
     default=None,
@@ -270,6 +285,56 @@ def peek_episode_actions(dataset_file: str, episode_name: str) -> np.ndarray | N
         if "actions" not in episode_group:
             return None
         return episode_group["actions"][:]
+
+
+def replay_recorded_states(env, dataset_file_handler, episode_names, episode_indices) -> None:
+    """Play the recorded STATES back frame by frame, instead of re-simulating recorded actions.
+
+    Exact by construction: every frame the robot's joints and the object's pose are written to be
+    what the recording measured, so what you see is the demo, not an attempt to reproduce it.
+
+    This exists because action replay cannot be exact for a --teleop_device vr_joint_ros2_native
+    dataset. There the robot is driven by ROS2JointCommandAction, which reads a fresh joint command
+    on every physics substep, while only ONE sample per environment step is logged as the action
+    row. Replaying that single sample -- held flat across the whole step -- reconstructs a coarser
+    control signal than the one that produced the demo, and in a contact-rich task the difference
+    compounds until the gripper misses the object entirely (measured: fingers close to 0.019 rather
+    than stopping at 0.032 on the can).
+
+    The trade is that nothing here is simulated: contacts are not resolved, and an action that
+    would no longer work is not exposed. Use this to SEE a dataset; use action replay to test
+    whether a dataset's actions still drive the task.
+    """
+    device = env.device
+    env_ids = torch.tensor([0], device=device)
+
+    for count, episode_index in enumerate(episode_indices, start=1):
+        if episode_index >= len(episode_names):
+            continue
+        episode: EpisodeData = dataset_file_handler.load_episode(episode_names[episode_index], device)
+        # States are recorded post-step, one per action, so their count is the episode length.
+        num_frames = 0
+        probe = episode.get_state(0)
+        while episode.get_state(num_frames) is not None:
+            num_frames += 1
+        if probe is None or num_frames == 0:
+            print(f"   {count}: episode #{episode_index} has no recorded states; skipping.")
+            continue
+
+        print(f"   {count}: playing back #{episode_index} episode ({num_frames} frames) from recorded states")
+        for frame in range(num_frames):
+            if not simulation_app.is_running() or simulation_app.is_exiting():
+                return
+            while is_paused:
+                env.sim.render()
+            # scene.reset_to rather than env.reset_to: the latter re-runs the reset EVENTS first
+            # (which would re-randomise the object) and drives the recorder, neither of which has
+            # any business firing once per frame.
+            env.scene.reset_to(episode.get_state(frame), env_ids, is_relative=True)
+            env.sim.forward()
+            env.sim.render()
+
+    print("Finished playing back all selected episodes.")
 
 
 def peek_episode_rigid_objects(dataset_file: str, episode_name: str) -> list[str]:
@@ -504,6 +569,12 @@ def main():
     # reset before starting
     env.reset()
     teleop_interface.reset()
+
+    if args_cli.replay_mode == "states":
+        replay_recorded_states(env, dataset_file_handler, episode_names, episode_indices_to_replay)
+        env.close()
+        simulation_app.close()
+        return
 
     # simulate environment -- run everything in inference mode
     replayed_episode_count = 0
