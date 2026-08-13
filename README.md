@@ -109,7 +109,11 @@ Record source demo (keyboard teleoperation)
 Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 
 ```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringle.hdf5     --output_file logs/demos/pickup_annotated.hdf5     --task_mode handover --auto --from_states --enable_cameras
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
+    --input_file logs/demos/pickup_pringle.hdf5 \
+    --output_file logs/demos/pickup_annotated.hdf5 \
+    --task_mode handover --auto --from_states --enable_cameras
 ```
 
 Generate augmented dataset
