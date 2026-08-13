@@ -238,10 +238,7 @@ python mirror_bridge.py --calibration calibration.json --udp-port 9999     --rig
 sim-to-real
 
 ```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_sim_real_check --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --max-joint-speed 10.0 --plot sim_vs_real_20260703.png
+ env -u PYTHONPATH -u LD_LIBRARY_PATH   ~/miniforge3/envs/lerobot-openarm-cf/bin/python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_VR_pringles --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --handshake-tolerance 1.0 --ramp-duration 10.0     --max-steps 3000 --plot sim_vs_real_20260812.png
 ```
 
 real-to-sim
