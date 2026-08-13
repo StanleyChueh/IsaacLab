@@ -97,19 +97,27 @@ LEFT_FINGER_JOINTS = ["openarm_left_finger_joint1", "openarm_left_finger_joint2"
 RIGHT_FINGER_JOINTS = ["openarm_right_finger_joint1", "openarm_right_finger_joint2"]
 GRIPPER_OPEN_VAL = 0.044
 """Fully-open finger position (m) -- matches the tasks' BinaryJointPositionActionCfg."""
-GRIPPER_THRESHOLD = 0.010
+GRIPPER_THRESHOLD = 0.005
 """How far (m) a jaw must have travelled from open before it counts as closed on something.
 
 Sized against the can, and it has to be: a jaw closing on a 60 mm-wide can stops at the can's
 surface, so it travels much LESS than one closing on the small cube this number was originally
-picked for. Measured at equilibrium with the gripper commanded shut on the can, the two jaws
-settle at 0.0285 and 0.0308 -- travels of 0.0155 and 0.0132 from the 0.044 open position. The
-old 0.018 sat above both, so a genuinely closed, load-bearing grip read as "not closed" and no
-grasp signal could ever fire.
+picked for. Two rounds of measurement, each of which moved this number down:
 
-0.010 clears the smaller of those two travels with margin while still being far from the ~0 travel
-of a jaw that is simply open. It does not have to carry the whole "is this a grasp" decision on its
-own -- :func:`object_grasped_by` also requires the hand to be on the can."""
+* commanding the gripper fully shut on the can in isolation settles the jaws at 0.0285/0.0308,
+  i.e. travels of 0.0155/0.0132. That ruled out the original 0.018, which sat above both.
+* but a real recorded teleop grasp closes LESS far than a full command does. Across the ten
+  hand-over demos in logs/demos/pickup_pringle.hdf5 the gripping jaw reaches only ~0.0343-0.0358,
+  i.e. travels of 0.0082-0.0097 -- every one of them under 0.010. That is why annotation rejected
+  all ten episodes: right_holds was False on all 116 frames of every demo, so the hand-over
+  sequence never left stage 0.
+
+0.005 clears the smallest measured real grasp (0.0082) with room to spare while staying far from
+the ~0 travel of a jaw that is simply open. It does not have to carry the whole "is this a grasp"
+decision on its own -- :func:`object_grasped_by` also requires the hand to be on the can.
+
+Beware of tuning this against a commanded close rather than a recorded one: the two differ by
+roughly a factor of two, and only the recorded value is what any annotation actually sees."""
 
 # ── The manipulated object -- one prop, every mode ────────────────────────────
 CAN_NAME = "can"

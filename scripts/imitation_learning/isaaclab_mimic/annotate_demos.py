@@ -42,6 +42,22 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--from_states",
+    action="store_true",
+    default=False,
+    help=(
+        "Drive the replay from the episode's recorded STATES instead of trusting its recorded"
+        " actions to reproduce it. Annotation normally re-simulates the actions and reads the"
+        " subtask signals off the result, which silently requires that replaying those actions"
+        " open-loop reproduces the demo. For a --teleop_device vr_joint_ros2_native recording it"
+        " does not: the robot was driven by a joint command re-read every physics substep while"
+        " only one sample per step is logged, so the arms drift, the grasp never happens, and"
+        " every episode is rejected with 'The final task was not completed'. Restoring each"
+        " recorded state before its step makes the scene exactly what was recorded, so the signals"
+        " describe the real demo. Requires per-step states in the dataset."
+    ),
+)
+parser.add_argument(
     "--enable_pinocchio",
     action="store_true",
     default=False,
@@ -75,6 +91,7 @@ import contextlib
 import os
 
 import gymnasium as gym
+import h5py
 import torch
 
 import isaaclab_mimic.envs  # noqa: F401
@@ -93,6 +110,9 @@ from isaaclab.utils import configclass
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_joint_actions import (
+    match_action_space_to_dataset,
+)
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 is_paused = False
@@ -224,6 +244,21 @@ def main():
         apply_task_mode(env_cfg, args_cli.task_mode)
         print(f"Task mode: {args_cli.task_mode}")
 
+    # Match the action space to the recording before gym.make(). Annotation REPLAYS each episode's
+    # recorded actions to evaluate the subtask signals, so the env has to accept them: a dataset
+    # from record_demos_openarm.py's joint-space VR modes carries a 16D joint action, which the
+    # task's own 14D IK action space rejects outright ("Invalid action shape, expected: 14,
+    # received: 16"). Reads the actions straight out of h5py rather than through load_episode(),
+    # which would pull in the episode's camera frames just to measure the action width.
+    with h5py.File(args_cli.input_file, "r") as _f:
+        _first_ep = next(iter(_f["data"].keys()), None)
+        _actions = _f["data"][_first_ep]["actions"][:] if _first_ep and "actions" in _f["data"][_first_ep] else None
+    _action_mode = match_action_space_to_dataset(env_cfg, _actions)
+    print(
+        f"Action space: {_action_mode}"
+        + ("" if _action_mode == "task_default" else f" (swapped to match the {_actions.shape[1]}D recording)")
+    )
+
     # extract success checking function to invoke manually
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
@@ -321,7 +356,9 @@ def main():
 
                 is_episode_annotated_successfully = False
                 if args_cli.auto:
-                    is_episode_annotated_successfully = annotate_episode_in_auto_mode(env, episode, success_term)
+                    is_episode_annotated_successfully = annotate_episode_in_auto_mode(
+                        env, episode, success_term, from_states=args_cli.from_states
+                    )
                 else:
                     is_episode_annotated_successfully = annotate_episode_in_manual_mode(
                         env, episode, success_term, subtask_term_signal_names, subtask_start_signal_names
@@ -359,6 +396,7 @@ def replay_episode(
     env: ManagerBasedRLMimicEnv,
     episode: EpisodeData,
     success_term: TerminationTermCfg | None = None,
+    from_states: bool = False,
 ) -> bool:
     """Replays an episode in the environment.
 
@@ -369,6 +407,8 @@ def replay_episode(
         env: The environment to replay the episode in.
         episode: The recorded episode data to replay.
         success_term: Optional termination term to check for task success.
+        from_states: Restore each recorded state before its step instead of relying on the recorded
+            actions to reproduce the demo. See --from_states.
 
     Returns:
         True if the episode was successfully replayed and the success condition was met (if provided),
@@ -397,6 +437,7 @@ def replay_episode(
     env.recorder_manager.reset()
     env.reset_to(initial_state, None, is_relative=True)
     first_action = True
+    succeeded_at_any_point = False
     # Index into the FULL recorded action array either way -- manual annotation turns the marked
     # current_action_index into a mask over episode.data["actions"], so a shifted start must not
     # shift the indices that get marked.
@@ -410,11 +451,46 @@ def replay_episode(
                 if skip_episode:
                     return False
                 continue
+        # Put the scene back where the recording actually was, before the step whose PRE-step
+        # recorders will read it. states[i] is the state after actions[i], so the state to restore
+        # ahead of actions[action_index] is states[action_index - 1] -- exactly the alignment the
+        # action-driven path produces when the replay tracks perfectly.
+        if from_states and action_index > first_action_index:
+            _restore_recorded_state(env, episode, action_index - 1)
+
         action_tensor = torch.Tensor(action).reshape([1, action.shape[0]])
         env.step(torch.Tensor(action_tensor))
+
+        # Evaluated EVERY step, not only at the end, because a success term may be stateful: the
+        # hand-over condition walks a stage counter (right grasps -> passes to left -> released and
+        # landed) that can only advance if it is called while each stage is happening. Called once
+        # at the end it sees a single instant, matches nothing, and reports failure forever.
+        if success_term is not None and bool(success_term.func(env, **success_term.params)[0]):
+            succeeded_at_any_point = True
+
+    # The last recorded state is never restored by the loop above (which restores the state
+    # BEFORE each action), so put it in place before the final verdict.
+    if from_states:
+        _restore_recorded_state(env, episode, len(actions) - 1)
+
     if success_term is not None:
-        if not bool(success_term.func(env, **success_term.params)[0]):
+        if not (succeeded_at_any_point or bool(success_term.func(env, **success_term.params)[0])):
             return False
+    return True
+
+
+def _restore_recorded_state(env: ManagerBasedRLMimicEnv, episode: EpisodeData, state_index: int) -> bool:
+    """Write one recorded state into the sim. Returns False if the episode has no such state.
+
+    Uses scene.reset_to rather than env.reset_to: the latter re-runs the reset EVENTS first (which
+    would re-randomise the object out from under the recording) and drives the recorder manager,
+    neither of which belongs in a per-step restore.
+    """
+    state = episode.get_state(state_index)
+    if state is None:
+        return False
+    env.scene.reset_to(state, None, is_relative=True)
+    env.sim.forward()
     return True
 
 
@@ -422,6 +498,7 @@ def annotate_episode_in_auto_mode(
     env: ManagerBasedRLMimicEnv,
     episode: EpisodeData,
     success_term: TerminationTermCfg | None = None,
+    from_states: bool = False,
 ) -> bool:
     """Annotates an episode in automatic mode.
 
@@ -439,7 +516,7 @@ def annotate_episode_in_auto_mode(
     """
     global skip_episode
     skip_episode = False
-    is_episode_annotated_successfully = replay_episode(env, episode, success_term)
+    is_episode_annotated_successfully = replay_episode(env, episode, success_term, from_states=from_states)
     if skip_episode:
         print("\tSkipping the episode.")
         return False
@@ -508,7 +585,7 @@ def annotate_episode_in_manual_mode(
             print('\tPress "S" to annotate subtask signals.')
             print('\tPress "Q" to skip the episode.\n')
             marked_subtask_action_indices = []
-            task_success_result = replay_episode(env, episode, success_term)
+            task_success_result = replay_episode(env, episode, success_term, from_states=args_cli.from_states)
             if skip_episode:
                 print("\tSkipping the episode.")
                 return False
