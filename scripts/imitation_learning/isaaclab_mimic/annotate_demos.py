@@ -491,6 +491,13 @@ def _restore_recorded_state(env: ManagerBasedRLMimicEnv, episode: EpisodeData, s
         return False
     env.scene.reset_to(state, None, is_relative=True)
     env.sim.forward()
+    # Refresh the sensors, NOT just the physics. sim.forward() propagates the articulation
+    # kinematics, but a FrameTransformer (which is what every end-effector pose in the subtask
+    # signals is read from) only recomputes in scene.update(). Without this the signals compare a
+    # freshly-moved object against an end-effector pose left over from the previous step, which
+    # reads as the hand being ~10 cm from where it really is -- enough to make a grasp that plainly
+    # happens in the video look like it never did.
+    env.scene.update(dt=env.physics_dt)
     return True
 
 

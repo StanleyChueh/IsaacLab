@@ -151,6 +151,7 @@ def setup_env_config(
     device: str,
     generation_num_trials: int | None = None,
     recorder_cfg: RecorderManagerBaseCfg | None = None,
+    task_mode: str | None = None,
 ) -> tuple[Any, Any]:
     """Configure the environment for data generation.
 
@@ -161,6 +162,8 @@ def setup_env_config(
         num_envs: Number of environments to run
         device: Device to run on
         generation_num_trials: Optional override for number of trials
+        task_mode: OpenArm pick-up tasks only -- which task variant to generate. Must match the
+            mode the source demos were annotated under.
 
     Returns:
         tuple containing:
@@ -176,6 +179,18 @@ def setup_env_config(
         env_cfg.datagen_config.generation_num_trials = generation_num_trials
 
     env_cfg.env_name = env_name
+
+    # Applied BEFORE the success term is lifted off the cfg below: the mode rewrites that term,
+    # along with the subtask structure and the per-arm subtask signals that generation matches
+    # against the source dataset. Applying it afterwards would both miss the new success condition
+    # and come too late, since terminations is set to None a few lines down.
+    if task_mode is not None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+            apply_task_mode,
+        )
+
+        apply_task_mode(env_cfg, task_mode)
+        print(f"Task mode: {task_mode}")
 
     # Extract success checking function
     success_term = None

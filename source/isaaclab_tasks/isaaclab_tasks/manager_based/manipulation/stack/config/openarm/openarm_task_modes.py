@@ -45,12 +45,12 @@ generalise from.
 
 ``handover``
     Bimanual hand-over (Mimic plan C). Both arms are teleoperable, and the episode is the whole
-    sequence: the right arm picks the can up and presents it, the left arm takes it while the
-    right is still holding on, the right lets go, and finally the left arm releases it and the can
-    drops back down. Success fires on that last landing -- see :func:`handover_success`, which
-    walks a stage counter through the sequence rather than testing any single instant, because no
-    instant distinguishes a hand-over from a plain left-arm pick now that the can can spawn under
-    either hand.
+    sequence: the right arm picks the can up and presents it, the left arm takes it, and the right
+    lets go. The demo is DONE there -- the left arm simply carries the can back to a neutral pose
+    holding it. It is not put down again, and nothing about where it ends up gates success. See
+    :func:`handover_success`, which walks a stage counter through the sequence rather than testing
+    any single instant, because no instant distinguishes a hand-over from a plain left-arm pick now
+    that the can can spawn under either hand.
 
 Subtask term signals published per mode -- these are what ``annotate_demos.py`` annotates and
 what a Mimic env cfg's ``subtask_term_signal`` entries must reference:
@@ -345,47 +345,6 @@ def object_lifted_and_grasped_obs(
     ).unsqueeze(-1).float()
 
 
-def object_held_by_both_obs(
-    env,
-    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-    right_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("right_ee_frame"),
-    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    gripper_open_val: float = GRIPPER_OPEN_VAL,
-    gripper_threshold: float = GRIPPER_THRESHOLD,
-    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
-) -> torch.Tensor:
-    """(N, 1) float: BOTH grippers are closed on the object at the same time.
-
-    This is the hand-over instant itself -- the only moment in the episode when the object sits
-    inside two closed grippers -- so it marks the end of the right arm's "present it" subtask and
-    the point from which the left arm carries it.
-    """
-    both = torch.logical_and(
-        object_grasped_by(
-            env,
-            ee_frame_cfg=left_ee_frame_cfg,
-            gripper_joint_names=LEFT_FINGER_JOINTS,
-            object_cfg=object_cfg,
-            robot_cfg=robot_cfg,
-            gripper_open_val=gripper_open_val,
-            gripper_threshold=gripper_threshold,
-            diff_threshold=diff_threshold,
-        ),
-        object_grasped_by(
-            env,
-            ee_frame_cfg=right_ee_frame_cfg,
-            gripper_joint_names=RIGHT_FINGER_JOINTS,
-            object_cfg=object_cfg,
-            robot_cfg=robot_cfg,
-            gripper_open_val=gripper_open_val,
-            gripper_threshold=gripper_threshold,
-            diff_threshold=diff_threshold,
-        ),
-    )
-    return both.unsqueeze(-1).float()
-
-
 HANDOVER_STAGE_WAITING = 0
 HANDOVER_STAGE_RIGHT_HELD = 1
 HANDOVER_STAGE_PASSED_TO_LEFT = 2
@@ -410,6 +369,46 @@ def handover_stage(env) -> torch.Tensor:
     return stage
 
 
+"""Note: there is deliberately no time limit on how long the giving hand's grasp stays "recent".
+
+An earlier version expired it after a fixed number of steps, on the theory that a long gap meant
+the can had been put down rather than passed. Measured on real demos that theory is simply wrong:
+in demo_8 of logs/demos/pickup_pringle.hdf5 the right arm holds the can continuously from step 52
+to step 134, but DETECTION of that grasp drops out for 19 steps in the middle while the can sits at
+0.404-0.425 -- nowhere near the pad. Any fixed window is a guess about detection dropout length,
+and this one rejected a hand-over that plainly happens.
+
+What actually separates a pass from "set it down, pick it up again" is whether the can was ever put
+down, which :data:`HANDOVER_PUT_DOWN_MARGIN` tests directly and physically. So that is the only
+thing that clears the latch."""
+
+HANDOVER_PUT_DOWN_MARGIN = 0.005
+"""m above resting height below which an unheld can counts as having been SET DOWN, cancelling the
+giving hand's "has held it since picking it up" latch, which is what lets the pass be
+recognised across a detection dropout.
+
+Deliberately tight, because it has to separate two things that are only centimetres apart: a can resting on the pad (rest height exactly)
+from a can being handed over low. Measured on real demos the lowest a can gets DURING a pass is
+0.3878, i.e. 7.8 mm above its 0.380 resting height -- an operator bringing it right down to meet
+the other hand. 5 mm sits between the two with a little room on each side. Widen it and genuine
+low hand-overs start being read as put-downs."""
+
+_HANDOVER_MEMORY_ATTR = "_openarm_handover_memory"
+
+
+def _handover_memory(env) -> dict:
+    """Per-env buffers the hand-over stage machine carries between steps, created on first use."""
+    mem = getattr(env, _HANDOVER_MEMORY_ATTR, None)
+    if mem is None or mem["was_lifted"].shape[0] != env.num_envs:
+        mem = {
+            "was_lifted": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            "right_holding_since_pickup": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            "last_step": -1,
+        }
+        setattr(env, _HANDOVER_MEMORY_ATTR, mem)
+    return mem
+
+
 def reset_handover_stage(env, env_ids: torch.Tensor) -> None:
     """Clear the hand-over progress of the envs being reset. Installed as a "reset" event term.
 
@@ -422,6 +421,9 @@ def reset_handover_stage(env, env_ids: torch.Tensor) -> None:
     survives into the new episode -- which would end it instantly, on the operator's first press.
     """
     handover_stage(env)[env_ids] = HANDOVER_STAGE_WAITING
+    memory = _handover_memory(env)
+    memory["was_lifted"][env_ids] = False
+    memory["right_holding_since_pickup"][env_ids] = False
 
 
 def handover_success(
@@ -433,9 +435,8 @@ def handover_success(
     gripper_open_val: float = GRIPPER_OPEN_VAL,
     gripper_threshold: float = GRIPPER_THRESHOLD,
     diff_threshold: float = EEF_TO_CAN_THRESHOLD,
-    drop_tolerance: float = 0.02,
 ) -> torch.Tensor:
-    """(N,) bool: the whole hand-over has played out, ending with the can back down on a surface.
+    """(N,) bool: the hand-over has played out, ending with the can in the LEFT hand.
 
     The episode is the entire sequence, not any single instant, so this walks a per-env stage
     counter forward and only reports success at the end of it:
@@ -443,11 +444,18 @@ def handover_success(
     ========================================  ==========================================
     :data:`HANDOVER_STAGE_WAITING`            nothing yet
     :data:`HANDOVER_STAGE_RIGHT_HELD`         the RIGHT (giving) arm has grasped the can
-    :data:`HANDOVER_STAGE_PASSED_TO_LEFT`     the LEFT (receiving) arm has it, and had it
-                                              while the right arm was still holding on --
-                                              i.e. an actual pass, not a re-pick off the pad
-    :data:`HANDOVER_STAGE_DONE`               the left arm let go and the can came back down
+                                              and lifted it off the pad
+    :data:`HANDOVER_STAGE_PASSED_TO_LEFT`     the LEFT (receiving) arm has taken it, while
+                                              the right arm still had it (or had, just
+                                              before) -- an actual pass, not a re-pick
+    :data:`HANDOVER_STAGE_DONE`               the right arm has let go: the can is the
+                                              left arm's, and the task is complete
     ========================================  ==========================================
+
+    The demo ends there. The left arm carries the can back to a neutral pose still holding it; it
+    is NOT put back down, and nothing about where the can finishes gates success. An earlier
+    version required a final release-and-land, which rejected real demos outright -- with manual
+    saving the operator stops the episode while still holding the can.
 
     Stages only ever advance, so a momentary loss of contact mid-pass cannot walk the episode
     backwards, and the counter is reset per episode.
@@ -455,20 +463,87 @@ def handover_success(
     Why a sequence and not a snapshot: the can now spawns anywhere on the pad (see
     :func:`reset_object_free`), including directly under the left hand, so no instantaneous
     condition can distinguish a hand-over from a plain left-arm pick. Requiring the right arm to
-    have held it first, and to still be holding it at the moment the left arm takes it, is what
-    makes the demo a hand-over rather than "the left arm picked something up".
+    have held and lifted it first, and to still have it (or have just had it) when the left arm
+    takes over, is what makes the demo a hand-over rather than "the left arm picked something up".
 
     Args:
-        min_height: how high the can must get to count as carried rather than dragged. Applied at
-            the pass, which is the point of the task -- not at the end, where the can is by
-            definition back down.
-        drop_tolerance: how close (m) to its resting height the can must return before it counts
-            as having landed. Absolute height, so a can that rolls off the pad onto the floor
-            satisfies it too.
+        min_height: how high the can must get, WHILE THE RIGHT ARM CARRIES IT, to count as picked
+            up rather than dragged. Not applied at the moment of the pass -- a hand-over is
+            naturally made by raising the can and bringing it back down to the other hand.
     """
-    obj: RigidObject = env.scene[object_cfg.name]
+    return _handover_tick(
+        env,
+        min_height=min_height,
+        object_cfg=object_cfg,
+        robot_cfg=robot_cfg,
+        left_ee_frame_cfg=left_ee_frame_cfg,
+        gripper_open_val=gripper_open_val,
+        gripper_threshold=gripper_threshold,
+        diff_threshold=diff_threshold,
+    ) >= HANDOVER_STAGE_DONE
 
+
+def handover_passed_obs(
+    env,
+    min_height: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    gripper_open_val: float = GRIPPER_OPEN_VAL,
+    gripper_threshold: float = GRIPPER_THRESHOLD,
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+) -> torch.Tensor:
+    """(N, 1) float: the pass itself has happened -- the ``handover`` subtask term signal.
+
+    Reads the SAME stage machine :func:`handover_success` does, deliberately. The signal and the
+    success condition have to agree about what a hand-over is, and when they disagree the failure
+    is quiet and confusing: an earlier version marked this signal with a plain "both grippers
+    closed on the can in this very step" test while success used the staged one, so on real demos
+    success fired and the signal never did, and annotate_demos.py rejected the episodes with
+    "Did not detect completion for the subtask handover" -- for demos whose hand-over is plainly
+    visible. The two grasps are detected together for only 0-4 steps, and in 3 of 10 measured
+    episodes for zero steps, because an operator opens the giving hand as the receiving hand
+    closes.
+
+    Latching (it stays 1 once the pass has happened) matches the other subtask signals, which stay
+    true for as long as the condition holds.
+    """
+    stage = _handover_tick(
+        env,
+        min_height=min_height,
+        object_cfg=object_cfg,
+        robot_cfg=robot_cfg,
+        left_ee_frame_cfg=left_ee_frame_cfg,
+        gripper_open_val=gripper_open_val,
+        gripper_threshold=gripper_threshold,
+        diff_threshold=diff_threshold,
+    )
+    return (stage >= HANDOVER_STAGE_PASSED_TO_LEFT).unsqueeze(-1).float()
+
+
+def _handover_tick(
+    env,
+    min_height: float,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    left_ee_frame_cfg: SceneEntityCfg,
+    gripper_open_val: float,
+    gripper_threshold: float,
+    diff_threshold: float,
+) -> torch.Tensor:
+    """Advance and return the hand-over stage counter. At most one advance per environment step.
+
+    Both the success condition and the ``handover`` subtask signal call this, and both are
+    evaluated every step -- so without the guard the per-step bookkeeping (notably the put-down latch) would be applied twice per step.
+    """
+    memory = _handover_memory(env)
     stage = handover_stage(env)
+    step_id = int(getattr(env, "common_step_counter", -1))
+    if step_id != -1 and step_id == memory["last_step"]:
+        return stage  # already advanced this step by the other caller
+    memory["last_step"] = step_id
+
+    obj: RigidObject = env.scene[object_cfg.name]
 
     def _held_by(frame_name, fingers):
         return object_grasped_by(
@@ -485,24 +560,52 @@ def handover_success(
     right_holds = _held_by("right_ee_frame", RIGHT_FINGER_JOINTS)
     left_holds = _held_by(left_ee_frame_cfg.name, LEFT_FINGER_JOINTS)
 
-    # 0 -> 1: the giving hand has the can.
+    memory = _handover_memory(env)
+
+    # 0 -> 1: the giving hand has the can, and it gets off the pad while holding it. The lift is
+    # checked HERE, over the whole time the right arm holds the can, rather than at the moment of
+    # the pass: a human hands an object over by raising it and then bringing it back down to meet
+    # the other hand, so demanding height at the instant of the pass rejects the natural motion.
+    # Measured on real demos, the can peaks at 0.416-0.427 while the right arm carries it and is
+    # back down at 0.388-0.398 by the time both hands are on it.
+    lifted_now = obj.data.root_pos_w[:, 2] > min_height
+    memory["was_lifted"] |= right_holds & lifted_now
     stage[(stage == HANDOVER_STAGE_WAITING) & right_holds] = HANDOVER_STAGE_RIGHT_HELD
 
-    # 1 -> 2: both hands on it at once, up in the air. Demanding the overlap (rather than just
-    # "left holds it now") is what rules out the right arm putting the can down and the left arm
-    # picking it back up, which is not a hand-over.
-    lifted = obj.data.root_pos_w[:, 2] > min_height
-    passed = (stage == HANDOVER_STAGE_RIGHT_HELD) & right_holds & left_holds & lifted
+    # 1 -> 2: the receiving hand takes it while the giving hand still has it -- or has had it,
+    # continuously, since picking it up. That "or" is what makes this survive real demos: the two
+    # grasps are DETECTED together for only 0-4 steps, in 3 of 10 measured episodes for zero steps,
+    # and in demo_8 detection of the right grasp drops out for 19 consecutive steps while the arm
+    # is demonstrably still holding the can 4 cm above the pad. Requiring a detected overlap, or
+    # any fixed-length grace window, rejects hand-overs that plainly happen on video.
+    #
+    # The latch is cleared only by the can being PUT DOWN -- back near resting height with the
+    # right hand not on it. That is the real difference between a pass and the case this guards
+    # against ("right sets it down, left picks it up later"): a pass keeps the can in the air the
+    # whole way across. Height separates them; elapsed time does not.
+    put_down = ~right_holds & (obj.data.root_pos_w[:, 2] <= _object_rest_z(env) + HANDOVER_PUT_DOWN_MARGIN)
+    memory["right_holding_since_pickup"] |= right_holds
+    memory["right_holding_since_pickup"] &= ~put_down
+    passed = (
+        (stage == HANDOVER_STAGE_RIGHT_HELD)
+        & left_holds
+        & memory["right_holding_since_pickup"]
+        & memory["was_lifted"]
+    )
     stage[passed] = HANDOVER_STAGE_PASSED_TO_LEFT
 
-    # 2 -> 3: nobody is holding it and it has come back down. Checking both grippers, not just the
-    # left, keeps a "pass it back" ending from counting.
-    landed = obj.data.root_pos_w[:, 2] <= (_object_rest_z(env) + drop_tolerance)
-    released = ~left_holds & ~right_holds
-    dropped = (stage == HANDOVER_STAGE_PASSED_TO_LEFT) & released & landed
-    stage[dropped] = HANDOVER_STAGE_DONE
+    # 2 -> 3: the giving hand has let go, leaving the can with the receiving hand. THIS is the
+    # hand-over being complete, and it is where success fires.
+    #
+    # What the can does afterwards is deliberately not required. An earlier version demanded it be
+    # released by both hands and back down near its resting height, to match "and then it is put
+    # down" -- but that tail is often not in the recording at all: with manual saving the operator
+    # stops the episode while still holding the can, and 3 of 10 measured demos end with it at
+    # 0.408-0.413, mid-air. Gating success on it discards good hand-overs for want of a coda.
+    handed_over = (stage == HANDOVER_STAGE_PASSED_TO_LEFT) & ~right_holds
+    stage[handed_over] = HANDOVER_STAGE_DONE
 
-    return stage == HANDOVER_STAGE_DONE
+    return stage
 
 
 # ── Object spawn region -- the SAME for every mode ────────────────────────────
@@ -724,9 +827,10 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     subtask_configs = {
         LEFT_EEF: [
             _subtask("grasp_left", "Approach the presented can and take it"),
-            # Last subtask, so it runs to the end of the episode -- which now means carrying the
-            # can clear and then letting it drop, since that landing is what ends the demo.
-            _subtask(None, "Carry the can away, then release it and let it drop"),
+            # Last subtask, so it runs to the end of the episode: the receiving arm carries the
+            # can back to a neutral pose, still holding it. It is not put down -- the demo is over
+            # once the can is safely in this hand.
+            _subtask(None, "Carry the can back to a neutral pose, still holding it"),
         ],
         RIGHT_EEF: [
             _subtask("grasp_right", "Reach and grasp the can", interp=50, offset=(2, 5)),
@@ -899,7 +1003,11 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
             func=object_grasped_by_obs,
             params={"ee_frame_cfg": left_frame, "gripper_joint_names": LEFT_FINGER_JOINTS, **common()},
         )
-        subtask_terms.handover = ObsTerm(func=object_held_by_both_obs, params=dict(common()))
+        # Shares handover_success's stage machine rather than testing "both grippers closed right
+        # now" -- see handover_passed_obs for why that instantaneous test rejects real hand-overs.
+        subtask_terms.handover = ObsTerm(
+            func=handover_passed_obs, params={"min_height": lift_height, **common()}
+        )
         subtask_terms.grasp_right = ObsTerm(
             func=object_grasped_by_obs,
             params={"ee_frame_cfg": right_frame, "gripper_joint_names": RIGHT_FINGER_JOINTS, **common()},

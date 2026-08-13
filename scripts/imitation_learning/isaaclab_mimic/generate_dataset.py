@@ -39,6 +39,19 @@ parser.add_argument(
     help="Enable Pinocchio.",
 )
 parser.add_argument(
+    "--task_mode",
+    type=str,
+    default=None,
+    choices=["left", "right", "handover"],
+    help=(
+        "OpenArm pick-up tasks only: which task variant to generate. MUST match the --task_mode"
+        " the source demos were annotated with (annotate_demos.py), because the mode decides the"
+        " subtask structure and the per-arm subtask term signals generation matches against the"
+        " source dataset -- generating a handover dataset against the left-arm mode's signals"
+        " finds none of them. Omit to use whatever the task cfg already declares."
+    ),
+)
+parser.add_argument(
     "--use_skillgen",
     action="store_true",
     default=False,
@@ -115,6 +128,7 @@ def main():
         num_envs=num_envs,
         device=args_cli.device,
         generation_num_trials=args_cli.generation_num_trials,
+        task_mode=args_cli.task_mode,
     )
 
     # Optional domain randomization (cube/pad color+texture, pad position jitter, lighting,
