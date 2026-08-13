@@ -28,13 +28,7 @@ R	                    reset/discard
 Subscribe joint topic from dora, and control robot in isaac sim
 
 ```
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
-  --dataset_file logs/demos/pickup.hdf5 \
-  --enable_cameras \
-  --num_demos 1 \
-  --teleop_device vr_joint_ros2_native \
-  --ros2_domain_id 1
+/isaaclab.sh -p scripts/tools/record_demos_openarm.py   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0   --dataset_file logs/demos/pickup_pringle.hdf5 --enable_cameras --num_demos 10   --teleop_device vr_joint_ros2_native --ros2_domain_id 1   --task_mode handover --manual_save
 ```
 
 Dora publish code
@@ -52,7 +46,7 @@ dora run dataflow-vr-mujoco-ros2.yaml --uv
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/tools/replay_demos.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/pickup.hdf5 \
+    --dataset_file logs/demos/pickup_pringle.hdf5 \
     --enable_cameras
 ```
 
@@ -109,11 +103,7 @@ randomize_cube_2 = EventTerm(
 Record source demo (keyboard teleoperation)
 
 ```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/pickup.hdf5 \
-    --enable_cameras --num_demos 10 --teleop_device keyboard
+/isaaclab.sh -p scripts/tools/record_demos_openarm.py   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0   --dataset_file logs/demos/pickup_pringle.hdf5 --enable_cameras --num_demos 10   --teleop_device vr_joint_ros2_native --ros2_domain_id 1   --task_mode handover --manual_save
 ```
 
 Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
@@ -122,8 +112,9 @@ Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup.hdf5 \
-    --output_file logs/demos/pickup_annotated.hdf5 --auto --enable_cameras
+    --input_file logs/demos/pickup_pringle.hdf5 \
+    --output_file logs/demos/pickup_pringle_annotated.hdf5 \
+    --task_mode handover --auto --from_states --enable_cameras
 ```
 
 Generate augmented dataset
@@ -132,8 +123,9 @@ Generate augmented dataset
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_annotated.hdf5 \
+    --input_file logs/demos/pickup_pringle_annotated.hdf5 \
     --output_file logs/demos/pickup_generated.hdf5 \
+    --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras
 ```
 
@@ -152,8 +144,7 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 # Convert HDF5 to LeRobot format 
 
 ```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_source.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor     --task "Pick up the red cube."     --fps 30 --cameras front_cam wrist_cam body_cam
+python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 30 --cameras right_wrist_cam wrist_cam body_cam
 ```
 
 # Train in LeRobot format
@@ -238,10 +229,7 @@ python mirror_bridge.py --calibration calibration.json --udp-port 9999     --rig
 sim-to-real
 
 ```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_sim_real_check --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --max-joint-speed 10.0 --plot sim_vs_real_20260703.png
+ env -u PYTHONPATH -u LD_LIBRARY_PATH   ~/miniforge3/envs/lerobot-openarm-cf/bin/python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_VR_pringles --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --handshake-tolerance 1.0 --ramp-duration 10.0     --max-steps 3000 --plot sim_vs_real_20260812.png
 ```
 
 real-to-sim
