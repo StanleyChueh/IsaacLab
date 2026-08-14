@@ -28,7 +28,7 @@ R	                    reset/discard
 Subscribe joint topic from dora, and control robot in isaac sim
 
 ```
-/isaaclab.sh -p scripts/tools/record_demos_openarm.py   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0   --dataset_file logs/demos/pickup_pringle.hdf5 --enable_cameras --num_demos 10   --teleop_device vr_joint_ros2_native --ros2_domain_id 1   --task_mode handover --manual_save
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0   --dataset_file logs/demos/pickup_pringle.hdf5 --enable_cameras --num_demos 10   --teleop_device vr_joint_ros2_native --ros2_domain_id 1   --task_mode handover --manual_save
 ```
 
 Dora publish code
@@ -109,12 +109,13 @@ Record source demo (keyboard teleoperation)
 Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 
 ```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_pringle.hdf5 \
-    --output_file logs/demos/pickup_pringle_annotated.hdf5 \
-    --task_mode handover --auto --from_states --enable_cameras
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
+  --task_mode handover --auto --from_states \
+  --enable_cameras \
+  --input_file logs/demos/pickup_pringle_annotated.hdf5 \
+  --output_file logs/demos/pickup_pringle_annotated_v3.hdf5
+
 ```
 
 Generate augmented dataset
