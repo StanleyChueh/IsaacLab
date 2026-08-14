@@ -39,12 +39,29 @@ _ACTION_DIM = 14
 
 # 16D joint-space layout produced by record_demos_openarm.py's vr_joint_ros2* devices:
 #   [0:7] left arm | [7] left gripper | [8:15] right arm | [15] right gripper
-# Only the gripper columns are ever read from it here -- see actions_to_gripper_actions.
+# Nothing here decodes an eef pose out of it -- these are joint targets, not IK deltas. Only the
+# gripper columns carry directly usable information (see actions_to_gripper_actions); the arm
+# columns are recognised solely so action_to_target_eef_pose does not mis-slice them.
 _JOINT_ACTION_DIM = 16
 _JOINT_GRIPPER_IDX = {"left_eef": 7, "right_eef": 15}
+
+_TAKEN_STEP_ATTR = "_openarm_handover_taken_step"
+"""Attribute _hold_giving_hand_until_taken keeps its per-env latch step under."""
 _GRIPPER_OPEN_VAL = 0.044
 """Fully-open finger position (m) in the joint-space recordings, i.e. the value that maps to
 the +1 "open" command of the task's own BinaryJointPositionActionCfg."""
+
+_GIVING_EEF = "right_eef"
+"""Which arm hands the can over in ``handover`` mode. Fixed by the mode itself (openarm_task_modes'
+handover_success ends with the can in the LEFT hand), not something a demo can vary."""
+
+_HANDOVER_RELEASE_OVERLAP_STEPS = 5
+"""Steps the giving hand keeps holding after the receiving hand has taken the can.
+
+0.25 s at this task's 20 Hz control rate, matching the 0-4 step overlap the operator actually leaves
+in the recorded demos. Not raised further on purpose: both jaws close on a rigid can at kp=500, so a
+long two-handed hold is squeezing it between two position-controlled grippers, which PhysX resolves
+as growing internal force rather than as a firmer grip."""
 
 
 class OpenArmPickUpIKAbsMimicEnv(ManagerBasedRLMimicEnv):
@@ -110,13 +127,96 @@ class OpenArmPickUpIKAbsMimicEnv(ManagerBasedRLMimicEnv):
             if eef_name not in target_eef_pose_dict:
                 full[gripper_idx] = 1.0  # stay open, so an unused arm can't clamp onto anything
 
+        self._hold_giving_hand_until_taken(full, env_id)
         return full
 
-    def action_to_target_eef_pose(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Convert 14D env actions -> per-arm target EEF poses (N, 4, 4).
+    def _hold_giving_hand_until_taken(self, action: torch.Tensor, env_id: int) -> None:
+        """Clamp the giving hand shut, in place, until the receiving hand has really taken the can.
 
-        For a relative controller, target = current_pose (+) delta.
+        Two jobs, one load-bearing and one backstop, both for openarm_task_modes'
+        ``_handover_subtask_configs``:
+
+        * While the giving arm's release subtask WAITS on its sequential constraint (holding at its
+          first waypoint until the receiving hand has closed), the gripper command replayed at that
+          waypoint comes from the source demo -- and in half of the recorded demos the source jaws
+          are already open at that boundary. Without this clamp the hand would open the moment the
+          wait began. The constraint orders the ARM segments; only this orders the JAWS.
+        * Backstop against drift: generation replays segments by length, so tracking drift between
+          the arms can move the release relative to the take. This reads the actual scene, so no
+          amount of drift can produce a release before a take.
+
+        The condition is built from two subtask term signals the task mode already publishes, rather
+        than from a fresh distance/jaw test, so there is exactly one definition of "this hand is
+        holding the can" in play (an earlier hand-over bug came from two descriptions of one event
+        disagreeing):
+
+        * ``presented`` -- the giving hand has the can UP. Until then there is nothing to drop and
+          the gate stays out of the way entirely, so a trial where the right arm never picked the
+          can up is not left with a hand welded shut.
+        * ``handover`` -- the receiving hand has closed on the can while the giving hand still had
+          it. Latched by the stage machine, which matters: the raw per-step grasp detection flickers
+          badly right after contact (one of the ten demos drops out on 13 of the 31 frames after its
+          first detected grip, flipping 10 times), and an unlatched gate would let the giving hand
+          re-close mid-release.
+
+        After ``handover`` the hand is held for :data:`_HANDOVER_RELEASE_OVERLAP_STEPS` more steps.
+        Both signals are absent outside hand-over mode, which is what scopes this to it.
+
+        Deliberately NOT a reproduction of the demos: measured over the ten recorded hand-overs the
+        operator opens the giving hand 0-4 steps after closing the receiving one, and once 1 step
+        BEFORE. The overlap is a task invariant imposed on generation, not a property of the source.
         """
+        terms = self.obs_buf.get("subtask_terms") if isinstance(self.obs_buf, dict) else None
+        if not terms or "presented" not in terms or "handover" not in terms:
+            return
+        if float(terms["presented"][env_id]) <= 0.5:
+            return  # the giving hand has not lifted the can; nothing to protect
+
+        gripper_idx = _ARM_LAYOUT[_GIVING_EEF][1]
+        # Keyed by env_id and keyed on the step counter rather than on call count, so it survives
+        # this method being called any number of times per step, and self-clears on reset: the stage
+        # machine resets to 0 there, so `handover` reads 0 again and the entry is dropped.
+        first_taken_step = getattr(self, _TAKEN_STEP_ATTR, None)
+        if first_taken_step is None:
+            first_taken_step = {}
+            setattr(self, _TAKEN_STEP_ATTR, first_taken_step)
+
+        if float(terms["handover"][env_id]) <= 0.5:
+            first_taken_step.pop(env_id, None)
+            action[gripper_idx] = -1.0
+            return
+
+        step = int(getattr(self, "common_step_counter", 0))
+        if step - first_taken_step.setdefault(env_id, step) < _HANDOVER_RELEASE_OVERLAP_STEPS:
+            action[gripper_idx] = -1.0
+
+    def action_to_target_eef_pose(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Convert env actions -> per-arm target EEF poses (N, 4, 4).
+
+        For the 14D IK layout this is the relative controller's target = current_pose (+) delta.
+
+        The 16D joint-space layout has to be handled separately, for the same reason
+        actions_to_gripper_actions does: annotate_demos.py rebuilds the env's action space to match
+        the dataset (see openarm_joint_actions.match_action_space_to_dataset), so the action reaching
+        this method is a row of JOINT targets whenever the demos came from a --teleop_device
+        vr_joint_ros2* recording. Slicing it as if it were an IK delta reads joint1-3 as a delta
+        position and joint4-6 as a delta rotation -- which is what previously wrote a
+        `target_eef_pose` averaging 0.30 m away from the eef pose of the very same timestep into the
+        annotated dataset, i.e. the waypoints Mimic replays (generation_transform_first_robot_pose
+        takes essentially all of them from here) were garbage and every generated trial knocked the
+        object over within ~30 steps.
+
+        There is no eef delta to decode from joint targets, so the target reported is the pose the
+        arm actually reached. That lags the true commanded pose by one step, which is worth ~7 mm on
+        these demos (measured mean per-step eef motion; p95 ~2 cm) -- two orders of magnitude below
+        the error it replaces, and small relative to the delta the IK controller resolves per step.
+        """
+        if action.shape[-1] == _JOINT_ACTION_DIM:
+            return {
+                eef_name: self.get_robot_eef_pose(eef_name, env_ids=None).clone()
+                for eef_name in self._eef_names()
+            }
+
         target_poses = {}
         for eef_name in self._eef_names():
             delta_slice, _, _ = _ARM_LAYOUT[eef_name]

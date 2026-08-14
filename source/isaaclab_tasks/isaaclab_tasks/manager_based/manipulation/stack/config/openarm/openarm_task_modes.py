@@ -32,10 +32,10 @@ prop.
 
 Modes
 -----
-The can spawns anywhere on the reachable pad in EVERY mode -- the mode does not confine it to one
-half (see :func:`reset_object_free`). What the mode fixes is which arm may move and what counts as
-done, which is all Mimic needs; a narrower object distribution would only give it less to
-generalise from.
+What a mode fixes is which arm may move, what counts as done, and where the can may spawn. The
+spawn region is NOT "one half of the pad for one arm": it is the region the demos for that mode
+actually cover, which is a different thing and is why it is per-mode (see
+:data:`OBJECT_SPAWN_RANGES`).
 
 ``left`` / ``right``
     Single-arm pick-up (Mimic plan A: one arm leads, the other idles). ONLY that arm is
@@ -49,8 +49,8 @@ generalise from.
     lets go. The demo is DONE there -- the left arm simply carries the can back to a neutral pose
     holding it. It is not put down again, and nothing about where it ends up gates success. See
     :func:`handover_success`, which walks a stage counter through the sequence rather than testing
-    any single instant, because no instant distinguishes a hand-over from a plain left-arm pick now
-    that the can can spawn under either hand.
+    any single instant, because no instant distinguishes a hand-over from a plain left-arm pick when
+    the can spawns midway between the two hands, in reach of either.
 
 Subtask term signals published per mode -- these are what ``annotate_demos.py`` annotates and
 what a Mimic env cfg's ``subtask_term_signal`` entries must reference:
@@ -59,8 +59,28 @@ what a Mimic env cfg's ``subtask_term_signal`` entries must reference:
 ``left``      ``grasp``, ``lift``
 ``right``     ``grasp``, ``lift``          (same names, right arm -- so one single-arm
                                             Mimic cfg covers either side unchanged)
-``handover``  ``grasp_right``, ``handover``, ``grasp_left``   (giving arm first)
+``handover``  ``reach_right``, ``grasp_right``, ``presented``, ``reach_left``,
+              ``handover`` ~ ``grasp_left``, ``departed_right``
+                                           (that is also the order they fire in;
+                                            handover and grasp_left land 0-3 steps apart)
 ============  ===================================================================
+
+Only ``grasp_right`` and ``handover`` are milestones of the hand-over itself. The rest exist to cut
+each arm's episode into segments Mimic can transform correctly and constrain against:
+
+``reach_right``     ends the giving arm's approach, starts its close.
+``presented``       ends the receiving arm's wait AND the giving arm's initial lift. Without it the
+                    receiving arm's approach is one segment starting at step 0, which Mimic anchors
+                    on the can's pose ON THE PAD -- but that hand reaches for the can up in the
+                    giving hand, 3-26 cm away (median ~13 cm).
+``reach_left``      ends the receiving arm's approach, starts its close-and-take. Exists so the
+                    giving arm's release can be constrained against the take alone.
+``grasp_left``      ends the take.
+``departed_right``  ends the giving arm's release -- the pass has happened and that hand has pulled
+                    physically clear of the can. Exists so the receiving arm's carry-away can be
+                    constrained on the release being over, not on the whole retreat.
+
+See :func:`_handover_subtask_configs` for the full structure and its three sequential constraints.
 
 Every signal function here takes its arm-specific inputs (TCP frame, jaw joints, open value,
 threshold) as explicit params rather than reading a single global ``env.cfg.gripper_*`` set --
@@ -196,6 +216,75 @@ accept a hand floating 100 mm off to the side. :func:`object_grasped_by` therefo
 hand-to-can vector into its along-the-can and across-the-can parts and bounds them separately --
 a cylinder test rather than a sphere test."""
 
+DEPART_RADIAL_THRESHOLD = 0.25
+DEPART_AXIAL_THRESHOLD = 0.25
+"""m -- the cylinder the giving hand must be OUTSIDE of for ``departed_right`` to fire.
+
+Hysteresis: deliberately much larger than the grasp cylinder the hand entered
+(:data:`EEF_TO_CAN_THRESHOLD_HANDOVER` / :data:`GRASP_AXIAL_TOLERANCE`), because "no longer inside
+the grasp cylinder" is already true at the moment the pass is DETECTED and so cuts a zero-length
+subtask.
+
+The reason is the stage machine's detection lag, not the robot: stage PASSED depends on
+``right_holding_since_pickup``, a latch that survives the giving hand's grasp detection dropping
+out, so by the time the pass is declared the hand has often already drifted out of the grasp
+cylinder. Measured over the ten demos in logs/demos/pickup_pringle.hdf5, the gap from ``handover``
+to this signal by exit radius:
+
+    0.11 (grasp)  ->  min gap 0 steps   (demo_6 and demo_8 both exactly 0 -- episode rejected)
+    0.14 / 0.16   ->  min gap 0 steps   (demo_6 still 0: its hand is already >16 cm out)
+    0.18          ->  min gap 2 steps
+    0.25          ->  min gap 3 steps, and the release subtask still leaves >=12 steps of episode
+                      after it on every demo
+
+0.25 is the first value with real margin on every episode while still firing well before the end.
+It reads as "the hand has retreated a good way from the can", which is what the release subtask is
+supposed to contain anyway. Raising it further eats into the withdraw subtask for no benefit."""
+
+REACH_RADIAL_THRESHOLD = 0.09
+"""m -- the ``reach_right`` signal's radius. Paired with the normal :data:`GRASP_AXIAL_TOLERANCE`;
+it is the RADIAL bound alone that has to do the work here, and 0.09 is the only value that works.
+
+"The giving hand has arrived at the can" has to fire on approach and stay quiet while the arm sits
+at rest, and the can it reaches for stands on the pad, possibly close under the resting hand. The
+two grasp radii both fail, measured rather than assumed:
+
+* the single-arm grasp radius (0.07) NEVER fires: the grasp point of a hand closed on the can sits
+  0.037-0.079 radial from the can's axis across the ten demos, so the signal would not exist at all
+  on the episodes at the top of that range.
+* the hand-over grasp radius (0.11) fires on a transient in demo_9 -- a 6-step clip of the cylinder
+  corner, 23 steps before the real approach. 0.10 does the same in demo_7 (a SINGLE frame).
+
+Radial separates the two states cleanly where axial does not. Measured over the ten demos: radial
+is 0.132-0.187 at rest and 0.037-0.079 at the grasp -- disjoint with room. Axial is 0.082-0.117 at
+rest and 0.023-0.071 at the grasp -- OVERLAPPING, so no axial bound can discriminate; an earlier
+version used axial < 0.06 and it made ``reach_right`` a 2-frame transient in demo_6, whose hand
+approaches on a diagonal that crosses that bound while the radial is still shrinking.
+
+0.09 is bounded on both sides by geometry, not by these ten episodes:
+
+* it cannot fire at rest ANYWHERE in the spawn region. Sweeping the whole of
+  :data:`_HANDOVER_X_RANGE` x :data:`_HANDOVER_Y_RANGE` against the measured resting grasp point
+  (~0.328, -0.183) gives a worst-case radial of 0.171 -- and that worst case is a corner of the
+  box, not a typical spawn.
+* it always fires before the grasp: the largest grasp radial is 0.079.
+
+At 0.09 all ten demos give one contiguous run starting 8-24 steps before ``grasp_right``.
+
+The rest-side bound used to be the tight one, back when the sampled y range reached -0.0754: this
+box-to-point sweep put the worst case at 0.108 then (the original entry here recorded 0.097, from a
+sweep against the per-demo rest points rather than the single nominal one -- either way it was a
+margin of one to two centimetres). Re-centring the range on y=0 (see :data:`_HANDOVER_Y_RANGE`) moved
+the box edge nearest the giving hand 6.3 cm away from it, and since the sampled x range still spans
+the hand's own x=0.328 the worst case is now a pure y gap: 0.183 - 0.0120 = 0.171. The new sampled
+box is a strict subset of the old one, so this direction is safe by construction -- narrowing the
+spawn region can only push a resting hand further from the can, never closer.
+
+So the binding constraint is now the GRASP side alone: 0.09 has 0.011 of margin over the widest
+measured grasp radial (0.079) and ~0.08 to the worst-case rest. Re-measure this number if the arm's
+rest pose changes, or if the spawn region is ever WIDENED again -- narrowing needs no re-measurement,
+but a wider y immediately puts the rest-side bound back in play."""
+
 EEF_TCP_TO_GRASP_OFFSET = (0.0, 0.0, 0.1025)
 """m -- offset from the ``*_ee_tcp`` link's origin to the point midway between its jaws, in that
 link's LOCAL frame. Applied to both arms' FrameTransformers (see :func:`apply_task_mode`).
@@ -245,6 +334,23 @@ def object_grasped_by(
     keeps working while the can is tilted mid-hand-over or lying down.
     """
     robot: Articulation = env.scene[robot_cfg.name]
+    return torch.logical_and(
+        hand_on_object(env, ee_frame_cfg, object_cfg, diff_threshold, axial_threshold),
+        _gripper_is_closed(robot, gripper_joint_names, gripper_open_val, gripper_threshold),
+    )
+
+
+def hand_to_object_offsets(
+    env,
+    ee_frame_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """((N,), (N,)) the radial and axial distance from a hand to the object, in the OBJECT's frame.
+
+    The two quantities :func:`hand_on_object` thresholds, returned raw. Exposed so a caller can
+    report HOW FAR a grasp signal is from firing rather than only that it has not -- see
+    record_demos_openarm.py's hand-over progress diagnostic.
+    """
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     obj: RigidObject = env.scene[object_cfg.name]
 
@@ -252,15 +358,76 @@ def object_grasped_by(
     # can's length, (x, y) is across it.
     to_hand_w = ee_frame.data.target_pos_w[:, 0, :] - obj.data.root_pos_w
     to_hand_local = quat_apply_inverse(obj.data.root_quat_w, to_hand_w)
+    return torch.linalg.vector_norm(to_hand_local[:, :2], dim=1), torch.abs(to_hand_local[:, 2])
 
-    radial = torch.linalg.vector_norm(to_hand_local[:, :2], dim=1)
-    axial = torch.abs(to_hand_local[:, 2])
 
-    on_object = torch.logical_and(radial < diff_threshold, axial < axial_threshold)
-    return torch.logical_and(
-        on_object,
-        _gripper_is_closed(robot, gripper_joint_names, gripper_open_val, gripper_threshold),
-    )
+def gripper_jaw_positions(
+    env,
+    gripper_joint_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """(N, J) current position of each named jaw. What :func:`_gripper_is_closed` thresholds.
+
+    Exposed for the same reason as :func:`hand_to_object_offsets`: a hand-over that stalls because
+    one jaw of two never closed should say so.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    joint_ids, _ = robot.find_joints(gripper_joint_names)
+    return robot.data.joint_pos[:, joint_ids]
+
+
+def hand_on_object(
+    env,
+    ee_frame_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+    axial_threshold: float = GRASP_AXIAL_TOLERANCE,
+) -> torch.Tensor:
+    """(N,) bool: the hand behind *ee_frame_cfg* is ON the object, whatever its gripper is doing.
+
+    The positional half of :func:`object_grasped_by`, factored out because the hand-over needs the
+    two halves separately: "the receiving hand has arrived at the can" is what ends its approach
+    subtask (see :func:`object_reached_by_obs`), and that has to fire BEFORE the jaws close, not
+    with them.
+    """
+    radial, axial = hand_to_object_offsets(env, ee_frame_cfg, object_cfg)
+    return torch.logical_and(radial < diff_threshold, axial < axial_threshold)
+
+
+def object_reached_by_obs(
+    env,
+    ee_frame_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+    axial_threshold: float = GRASP_AXIAL_TOLERANCE,
+) -> torch.Tensor:
+    """(N, 1) float: the hand has arrived at the can -- the ``reach_left``/``reach_right`` signals.
+
+    Splits an arm's approach from its close-on-the-object, so the two can be separate subtasks
+    (see :func:`_handover_subtask_configs` for what each side's split buys).
+
+    Deliberately NOT latched, unlike ``presented``/``handover``: only the first 0->1 transition is
+    read (DataGenInfoPool cuts the boundary there), so latching would change nothing about the
+    segmentation, and leaving it raw keeps it the same kind of signal as ``grasp_left`` /
+    ``grasp_right``, which are also instantaneous.
+
+    Used directly only for ``reach_right``, with its own tighter radius
+    (:data:`REACH_RADIAL_THRESHOLD`): the can the giving hand reaches for stands on the pad,
+    possibly right under that hand's rest pose, and neither grasp radius both fires on arrival and
+    stays quiet at rest. See that constant for the measurements.
+
+    ``reach_left`` goes through :func:`receiver_reached_obs` instead -- the same cylinder test, but
+    gated on ``presented``. The receiving arm has the same rest-pose-proximity problem and cannot be
+    fixed by a radius: the can it reaches for has MOVED by then, so there is no fixed geometry to
+    tune against, only "has the pick-up happened yet".
+    """
+    return hand_on_object(
+        env,
+        ee_frame_cfg=ee_frame_cfg,
+        object_cfg=object_cfg,
+        diff_threshold=diff_threshold,
+        axial_threshold=axial_threshold,
+    ).unsqueeze(-1).float()
 
 
 def object_grasped_by_obs(
@@ -396,6 +563,23 @@ low hand-overs start being read as put-downs."""
 _HANDOVER_MEMORY_ATTR = "_openarm_handover_memory"
 
 
+def handover_latches(env) -> dict[str, torch.Tensor]:
+    """The two latches the hand-over's 1->2 transition needs besides the receiving hand's grasp.
+
+    ``was_lifted``                 the giving arm has held the can above the lift height.
+    ``right_holding_since_pickup`` it has not put the can back down since picking it up.
+
+    Read-only view, exposed for the same reason :func:`handover_stage` is: a hand-over that stalls
+    at stage 1 should say WHICH precondition is missing. Advancing them is :func:`_handover_tick`'s
+    job -- calling this does not tick the machine.
+    """
+    memory = _handover_memory(env)
+    return {
+        "was_lifted": memory["was_lifted"],
+        "right_holding_since_pickup": memory["right_holding_since_pickup"],
+    }
+
+
 def _handover_memory(env) -> dict:
     """Per-env buffers the hand-over stage machine carries between steps, created on first use."""
     mem = getattr(env, _HANDOVER_MEMORY_ATTR, None)
@@ -460,8 +644,8 @@ def handover_success(
     Stages only ever advance, so a momentary loss of contact mid-pass cannot walk the episode
     backwards, and the counter is reset per episode.
 
-    Why a sequence and not a snapshot: the can now spawns anywhere on the pad (see
-    :func:`reset_object_free`), including directly under the left hand, so no instantaneous
+    Why a sequence and not a snapshot: the can spawns on the midline between the two hands (see
+    :data:`_HANDOVER_Y_RANGE`), i.e. equally within either arm's reach, so no instantaneous
     condition can distinguish a hand-over from a plain left-arm pick. Requiring the right arm to
     have held and lifted it first, and to still have it (or have just had it) when the left arm
     takes over, is what makes the demo a hand-over rather than "the left arm picked something up".
@@ -519,6 +703,161 @@ def handover_passed_obs(
         diff_threshold=diff_threshold,
     )
     return (stage >= HANDOVER_STAGE_PASSED_TO_LEFT).unsqueeze(-1).float()
+
+
+def handover_presented_obs(
+    env,
+    min_height: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    gripper_open_val: float = GRIPPER_OPEN_VAL,
+    gripper_threshold: float = GRIPPER_THRESHOLD,
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+) -> torch.Tensor:
+    """(N, 1) float: the giving hand has the can UP -- the ``presented`` subtask term signal.
+
+    Boundary for BOTH arms (see :func:`_handover_subtask_configs`): it splits the receiving arm's
+    wait from its approach, so the approach segment Mimic transforms is anchored on the can where
+    it is actually reached for -- up in the right hand -- instead of on the pad where it started;
+    and it ends the giving arm's initial-lift subtask, giving the "left waits until the can is up"
+    constraint a precondition that does not depend on the left arm itself.
+
+    Reads the same stage machine as :func:`handover_success` and :func:`handover_passed_obs`, for
+    the same reason they share it: three descriptions of one hand-over that can disagree is three
+    ways for annotation to reject a demo that plainly happened. Concretely it is the machine's
+    "the right arm has held the can and raised it past *min_height*" latch, i.e. it fires strictly
+    after ``grasp_right`` and strictly before ``handover``/``grasp_left``.
+
+    Measured on the ten demos in logs/demos/pickup_pringle.hdf5 it lands 6-10 steps after
+    ``grasp_right`` and 21-55 steps before ``grasp_left``, so both segments it creates are
+    comfortably non-empty on every episode -- which matters because a subtask boundary that lands on
+    or past the next one makes DataGenInfoPool reject the episode outright.
+
+    Latches, like the other signals: it describes something that has happened, not something that is
+    currently true, so a momentary loss of grasp detection while the arm carries the can must not
+    un-fire it and re-split the segment.
+    """
+    _handover_tick(
+        env,
+        min_height=min_height,
+        object_cfg=object_cfg,
+        robot_cfg=robot_cfg,
+        left_ee_frame_cfg=left_ee_frame_cfg,
+        gripper_open_val=gripper_open_val,
+        gripper_threshold=gripper_threshold,
+        diff_threshold=diff_threshold,
+    )
+    # Read AFTER ticking: the tick is what sets this latch, and it is idempotent within a step, so
+    # calling it here costs nothing when handover_passed_obs/handover_success already ticked.
+    return _handover_memory(env)["was_lifted"].unsqueeze(-1).float()
+
+
+def receiver_reached_obs(
+    env,
+    min_height: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    gripper_open_val: float = GRIPPER_OPEN_VAL,
+    gripper_threshold: float = GRIPPER_THRESHOLD,
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+) -> torch.Tensor:
+    """(N, 1) float: the can is UP and the receiving hand has arrived at it -- ``reach_left``.
+
+    :func:`object_reached_by_obs` gated on ``presented``, and the gate is not cosmetic: without it
+    this signal is a bare proximity test, and the receiving arm's REST pose can sit within the
+    cylinder's tolerance of a can standing on the pad. Measured on demo_3 of
+    logs/demos/pickup_pringle.hdf5 the resting hand is 0.117-0.123 radial from the can -- straddling
+    the 0.11 grasp radius -- so a single frame of physics jitter dipped under it at step 45 while the
+    arm had not moved at all. That lone frame became the subtask boundary, landing 8 steps BEFORE
+    ``presented``, and DataGenInfoPool rejected the episode ("signal is not increasing"). The same
+    episode annotated an hour earlier had that frame land just above the threshold and passed, which
+    is what a coin-flip boundary looks like.
+
+    Tightening the radius, which is what fixes the equivalent problem on the giving arm (see
+    :data:`REACH_RADIAL_THRESHOLD`), cannot work here. That fix relies on a fixed geometry -- a
+    resting arm and a can standing on the pad -- so a radius can be placed between the two. The
+    receiving hand instead reaches for a can that has been picked up and carried to wherever the
+    giving arm presents it, so there is no rest-vs-approach distance to separate. (Axial is no help
+    on this side either: 0.073-0.085 at rest against 0.100 during the real approach -- the wrong way
+    round.)
+
+    Gating on ``presented`` removes the entire failure class instead of tuning around it. Rest-pose
+    proximity only happens while the can is still on the pad, and ``presented`` is exactly "the can
+    is off the pad in the giving hand" -- after which any cylinder hit by this arm is a real
+    approach. Measured across the ten demos it fires 7-28 steps after ``presented`` and 8-28 steps
+    before ``grasp_left``.
+    """
+    _handover_tick(
+        env,
+        min_height=min_height,
+        object_cfg=object_cfg,
+        robot_cfg=robot_cfg,
+        left_ee_frame_cfg=left_ee_frame_cfg,
+        gripper_open_val=gripper_open_val,
+        gripper_threshold=gripper_threshold,
+        diff_threshold=diff_threshold,
+    )
+    presented = _handover_memory(env)["was_lifted"]
+    arrived = hand_on_object(
+        env, ee_frame_cfg=left_ee_frame_cfg, object_cfg=object_cfg, diff_threshold=diff_threshold
+    )
+    return (presented & arrived).unsqueeze(-1).float()
+
+
+def departed_after_pass_obs(
+    env,
+    min_height: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    right_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("right_ee_frame"),
+    gripper_open_val: float = GRIPPER_OPEN_VAL,
+    gripper_threshold: float = GRIPPER_THRESHOLD,
+    diff_threshold: float = EEF_TO_CAN_THRESHOLD,
+    depart_radial_threshold: float = DEPART_RADIAL_THRESHOLD,
+    depart_axial_threshold: float = DEPART_AXIAL_THRESHOLD,
+) -> torch.Tensor:
+    """(N, 1) float: the pass has happened AND the giving hand has pulled clear of the can -- the
+    ``departed_right`` subtask term signal.
+
+    Ends the giving arm's release subtask, which is what lets the receiving arm's carry-away be
+    constrained on the release being over rather than on the giving arm's entire retreat (see
+    :func:`_handover_subtask_configs`).
+
+    Built from position, not from the jaws, on purpose. A jaw-open test cannot cut this boundary
+    robustly: in half of the ten recorded demos grasp DETECTION of the giving hand lapses at or
+    before the pass itself (demo_8's jaws are fully open 2 steps before ``handover`` fires), so a
+    jaw-based boundary lands on or before the previous one and DataGenInfoPool rejects the episode
+    with "signal is not increasing".
+
+    "Clear" is a deliberately BIGGER cylinder than the grasp one -- see
+    :data:`DEPART_RADIAL_THRESHOLD` for why the grasp cylinder is not usable here.
+
+    The ``stage >= PASSED`` mask is what stops the trivial early fire: "hand outside the cylinder"
+    is true from step 0 (the arm starts at rest, nowhere near the can), and without the mask the
+    signal would start at 1 and its first transition would be garbage. With it, the signal is 0
+    until the pass and rises exactly once, when the giving hand pulls clear.
+    """
+    stage = _handover_tick(
+        env,
+        min_height=min_height,
+        object_cfg=object_cfg,
+        robot_cfg=robot_cfg,
+        left_ee_frame_cfg=left_ee_frame_cfg,
+        gripper_open_val=gripper_open_val,
+        gripper_threshold=gripper_threshold,
+        diff_threshold=diff_threshold,
+    )
+    away = ~hand_on_object(
+        env,
+        ee_frame_cfg=right_ee_frame_cfg,
+        object_cfg=object_cfg,
+        diff_threshold=depart_radial_threshold,
+        axial_threshold=depart_axial_threshold,
+    )
+    return ((stage >= HANDOVER_STAGE_PASSED_TO_LEFT) & away).unsqueeze(-1).float()
 
 
 def _handover_tick(
@@ -608,23 +947,137 @@ def _handover_tick(
     return stage
 
 
-# ── Object spawn region -- the SAME for every mode ────────────────────────────
-# The can goes anywhere on the reachable pad, whichever mode is being recorded. Positive y is
-# the robot's LEFT-arm side. Coordinates here are absolute (env-local metres), not the offsets
-# off a default pose that PickUpEventCfg.randomize_cube_2 uses -- see :func:`reset_object_free`.
+# ── Object spawn region ───────────────────────────────────────────────────────
+# Positive y is the robot's LEFT-arm side. Coordinates here are absolute (env-local metres), not
+# the offsets off a default pose that PickUpEventCfg.randomize_cube_2 uses -- see
+# :func:`reset_object_free`.
 #
-# Modes deliberately do NOT restrict the can to "their" half. Which arm the demo is about is
-# already pinned by two other things -- only that arm can be driven (:data:`CONTROLLED_ARMS`) and
-# only that arm satisfies the success condition -- so a spawn-side restriction adds nothing except
-# a narrower object distribution for Mimic to generalise from.
+# Modes still do NOT restrict the can to "their" half: which arm the demo is about is already
+# pinned by only that arm being drivable (:data:`CONTROLLED_ARMS`) and only that arm satisfying the
+# success condition. What the per-mode ranges below encode is something else -- how far the demos
+# for that mode reach.
 _OBJECT_X_RANGE = (0.20, 0.46)
-"""m -- forward band. The near bound is the base task's (>=8 cm clearance from the robot origin,
-so the gripper cannot clip the base while reaching); the far bound keeps the can's far side ~2 cm
-inside the pad's x=0.51 edge."""
+"""m -- widest forward band the pad geometry allows. The near bound is the base task's (>=8 cm
+clearance from the robot origin, so the gripper cannot clip the base while reaching); the far bound
+keeps the can's far side ~2 cm inside the pad's x=0.51 edge.
+
+This is a bound on the PAD, not on any arm's reach or on any recorded demo -- see
+:data:`OBJECT_SPAWN_RANGES` before using it for a mode whose demos feed Mimic."""
 
 _OBJECT_Y_RANGE = (-0.27, 0.27)
 """m -- full pad width, both arms' halves AND the middle, keeping the base task's ~1.5 cm margin
-from the pad's y=+-0.285 half-width."""
+from the pad's y=+-0.285 half-width. Same caveat as :data:`_OBJECT_X_RANGE`."""
+
+_HANDOVER_SOURCE_X_RANGE = (0.2374, 0.3751)
+_HANDOVER_SOURCE_Y_RANGE = (-0.0592, 0.0120)
+"""m -- the region the recorded hand-over demos actually put the can in, measured from their reset
+poses rather than chosen. NOT what generation samples (that is :data:`_HANDOVER_X_RANGE` /
+:data:`_HANDOVER_Y_RANGE`, a subset) -- this is the record of what the source data covers, kept
+separately so the subset relationship below is checkable and so the measured fact survives any
+retuning of the sampled range.
+
+This is the INTERSECTION over every annotated demo set that is still in use, not any one of them.
+Read straight off ``initial_state/rigid_object/can/root_pose`` in each file:
+
+    logs/demos/pickup_pringle_annotated_v4.hdf5   x [0.224656, 0.418972]  y [-0.075389, 0.014304]
+    logs/demos/pickup_pringle_annotated_v5.hdf5   x [0.237397, 0.375137]  y [-0.059279, 0.012062]
+    intersection, ROUNDED INWARD (this constant)  x [0.2374,   0.3751  ]  y [-0.0592,   0.0120  ]
+
+Two ten-demo sets recorded by hand do NOT cover the same box, and v5's is the tighter one on all
+four sides. Taking the intersection is what makes the sampled range below safe whichever file is
+passed to ``generate_dataset.py --input_file``; taking either set alone silently extrapolates when
+the other is used. Re-measure and re-intersect when a demo set is added or retired -- an entry left
+here for a file no longer used only costs range, but a missing entry costs correctness.
+
+Rounded INWARD (ceil the lower bound, floor the upper) rather than to nearest, so the constant is a
+subset of the real data at full precision. Rounding to nearest puts the bound a fraction of a
+millimetre OUTSIDE the measured extreme, which is harmless physically but makes the subset assertion
+below a lie -- and that assertion is the only thing standing between a future edit and silent
+extrapolation.
+
+Why the source demos cluster this tightly rather than filling the pad: it is what the GIVING (right)
+arm can reach with a hand-over's posture. The right arm has to grasp the can low, raise it and
+present it across the body, which costs reach that a plain pick-up does not -- so the operator's
+demos land in a ~14 x 7 cm patch slightly right of centre.
+
+These are the measured bounds verbatim, with no margin added, so they can be re-derived from the
+datasets and so it stays obvious that they describe the source data, not a preference.
+
+To cover MORE of the pad the order is: widen the sampled range below, record a new demo set against
+the wider range, then set both this constant and the sampled one to what that set actually turned
+out to cover. Widening the sampled range WITHOUT recording is the failure this pair exists to
+prevent -- see :data:`_HANDOVER_X_RANGE` for the invariant that catches it."""
+
+_HANDOVER_X_RANGE = (0.2374, 0.3751)
+_HANDOVER_Y_RANGE = (-0.0120, 0.0120)
+"""m -- what hand-over generation actually samples: the source region above, with y re-centred on
+the midline between the two hands and shrunk to fit.
+
+Mimic can only re-anchor a source segment onto a new object pose, so the distance from a generated
+spawn to its source demo's spawn is the size of the rigid translation applied to every waypoint in
+that segment. Two consequences drive this range:
+
+* **It must stay INSIDE the source region.** A spawn outside it is extrapolation, not
+  interpolation. (For scale, the full-pad y range is +-0.27 against a source spread of
+  [-0.075, 0.014]: it asks Mimic to translate the whole grasp segment up to ~26 cm sideways from
+  anything it has seen, which lands the transformed waypoints outside the arm's reach.)
+* **Smaller is easier.** Every centimetre of spread is a centimetre of translation error the
+  bimanual constraints and the receiving arm's approach have to absorb. NVIDIA's own bimanual
+  hand-over (``Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0``) randomises its object by only
+  +-0.01 m in x and y, which is what lets that task get away with 3 subtask segments, one manual
+  annotation and no constraints at all.
+
+y is therefore centred on 0 -- the midline between the arms, which park mirror-symmetrically at
+y=+-0.153 (see :data:`_ARM_KEEP_OUT_BOXES`) -- so the can sits equidistant from both hands rather
+than 2.4 cm into the giving arm's side as the raw source centre (-0.0236) does. Centring costs
+width: the source's own upper bound is +0.0120, so the widest y interval that is both centred on 0
+and a subset of the source is exactly +-0.0120. That is where this number comes from -- it is a
+geometric consequence of "centred AND no extrapolation", not a tuned value, and it happens to land
+in the same 2-3 cm band NVIDIA uses.
+
+x is left at the source bounds unchanged. The same centring argument does not bite there: the source
+x interval is already centred on its own data, so re-centring would not move it, and there is no
+second requirement (nothing analogous to "between the hands") pulling it in. Forward/back spread also
+costs the hand-over less than sideways spread -- both arms reach forward alike, whereas a sideways
+offset pushes the can toward one arm and out of the other's comfortable reach.
+
+INVARIANT: this range must remain a subset of :data:`_HANDOVER_SOURCE_X_RANGE` /
+:data:`_HANDOVER_SOURCE_Y_RANGE` unless a new demo set is recorded first.
+
+Note that narrowing does NOT invalidate the existing annotated dataset: the source demos still
+bracket every pose that can now be sampled. Recording, though, goes through :func:`apply_task_mode`
+too (record_demos_openarm.py), so a new demo set recorded now would come out inside this narrow band
+-- which is fine as long as the two constants above are updated to match it, and wrong if they are
+left describing the old, wider set."""
+
+OBJECT_SPAWN_RANGES = {
+    # Single-arm modes keep the full-pad range: their own demos have not been re-measured the way
+    # the hand-over ones above were, so there is no source-derived range to put here yet. If Mimic
+    # generation for these modes also fails at spawns far from the source demos, measure their
+    # recordings' reset poses and narrow these the same way -- the reasoning in
+    # _HANDOVER_X_RANGE's docstring is not specific to hand-over.
+    TASK_MODE_LEFT: (_OBJECT_X_RANGE, _OBJECT_Y_RANGE),
+    TASK_MODE_RIGHT: (_OBJECT_X_RANGE, _OBJECT_Y_RANGE),
+    TASK_MODE_HANDOVER: (_HANDOVER_X_RANGE, _HANDOVER_Y_RANGE),
+}
+"""Where each mode may spawn the can, as (x_range, y_range) in env-local metres."""
+
+# The invariant from :data:`_HANDOVER_X_RANGE`, enforced rather than described: a sampled range that
+# escapes the source demos' coverage is extrapolation, and its symptom (Mimic translating whole
+# segments past the arm's reach) shows up as a low generation success rate rather than as an error,
+# so it is worth failing at import instead. Narrowing is always safe; widening needs a new demo set
+# and both constants updated together.
+assert (
+    _HANDOVER_SOURCE_X_RANGE[0] <= _HANDOVER_X_RANGE[0]
+    and _HANDOVER_X_RANGE[1] <= _HANDOVER_SOURCE_X_RANGE[1]
+    and _HANDOVER_SOURCE_Y_RANGE[0] <= _HANDOVER_Y_RANGE[0]
+    and _HANDOVER_Y_RANGE[1] <= _HANDOVER_SOURCE_Y_RANGE[1]
+), (
+    f"hand-over spawn range x={_HANDOVER_X_RANGE} y={_HANDOVER_Y_RANGE} is not a subset of what the "
+    f"source demos cover (x={_HANDOVER_SOURCE_X_RANGE} y={_HANDOVER_SOURCE_Y_RANGE}); record a new "
+    "demo set against the wider range and update both pairs of constants."
+)
+
 
 # ── Where the can must NOT spawn: on top of a parked arm ──────────────────────
 # Both arms park at y=+-0.153, z=0.478 -- only 0.198 m above the pad, i.e. level with the rim of a
@@ -639,6 +1092,12 @@ from the pad's y=+-0.285 half-width."""
 #
 # If the arms' rest pose is ever raised to clear a standing can (they would need ~7 cm), these
 # boxes can shrink or go away entirely -- they describe the rest pose, not the object.
+#
+# Kept for every mode even though the hand-over range (:data:`_HANDOVER_Y_RANGE`, |y| <= 0.0120)
+# comes nowhere near them: they guard the rest pose, so they must stay correct for whatever range a
+# mode is given, including a wider one restored later. The single-arm modes' full-pad range does
+# still reach them, which is what keeps the rejection sampling in :func:`reset_object_free` load
+# bearing.
 _ARM_KEEP_OUT_BOXES = (
     (0.19, 0.42, 0.085, 0.215),    # left arm's parked footprint  (x_min, x_max, y_min, y_max)
     (0.19, 0.42, -0.215, -0.085),  # right arm's, mirrored
@@ -678,9 +1137,11 @@ def reset_object_free(
 
     # Resample only the rejected ones, so every env keeps an independent uniform draw. The loop is
     # bounded because an unbounded one would hang forever on a mis-specified keep-out that covers
-    # the whole region; the legal area here is ~70% of the rectangle, so exhausting 100 rounds has
-    # probability ~1e-52 per env. Falling back to the last (possibly illegal) draw rather than
-    # raising keeps a pathological config from killing a recording session mid-run.
+    # the whole region; for the full-pad range the legal area is ~70% of the rectangle, so
+    # exhausting 100 rounds has probability ~1e-52 per env, and a range that misses the keep-out
+    # entirely (the hand-over one does) leaves on the first pass. Falling back to the last
+    # (possibly illegal) draw rather than raising keeps a pathological config from killing a
+    # recording session mid-run.
     for _ in range(100):
         rejected = torch.zeros(n, dtype=torch.bool, device=device)
         for x_min, x_max, y_min, y_max in keep_out_boxes:
@@ -721,7 +1182,17 @@ This gates CONTROL only. Both arms' joint positions/actions stay in the recorded
 way, because Mimic needs full-width action rows for both end-effectors regardless of which arm
 moved -- see the ``_idle_subtasks`` an idle arm still gets."""
 
-_SIGNAL_NAMES = ("grasp", "lift", "grasp_left", "grasp_right", "handover")
+_SIGNAL_NAMES = (
+    "grasp",
+    "lift",
+    "grasp_left",
+    "grasp_right",
+    "reach_left",
+    "reach_right",
+    "presented",
+    "handover",
+    "departed_right",
+)
 """Every signal any mode can publish -- cleared before a mode installs its own, so switching
 modes on one cfg can't leave a previous mode's signal behind for the annotator to wait on."""
 
@@ -796,24 +1267,95 @@ def _idle_subtasks() -> list:
 def _handover_subtask_configs() -> tuple[dict, list]:
     """The bimanual hand-over structure: (subtask_configs, task_constraint_configs).
 
-    right : grasp the can low -> present it -> let go and retreat   (the GIVING hand)
-    left  : approach and take it higher up -> carry it away         (the RECEIVING hand)
+    left  (RECEIVING): 0 stay clear | 1 approach | 2 close and take | 3 carry away
+    right (GIVING)   : 0 approach | 1 grasp | 2 lift | 3 raise to the pass point and hold
+                       | 4 release | 5 withdraw to rest
 
-    The two arms are tied together by one SEQUENTIAL constraint: the left arm's "take it"
-    subtask may not *finish* before the right arm's "present it" subtask has. It is allowed to
-    run right up to its last :data:`_HANDOVER_MIN_TIME_DIFF` steps first, so the approach still
-    overlaps the right arm's lift instead of starting only after it -- which is both faster and
-    what the human demo actually looks like.
+    Three SEQUENTIAL constraints (all ``min_time_diff=-1``: the constrained subtask does not start
+    at all until its precondition has finished):
+
+    #. ``(right, 2) -> (left, 1)``: the left arm does not set off until the can is UP.
+    #. ``(left, 2) -> (right, 4)``: the right hand does not begin releasing until the left hand has
+       closed on the can. Its precondition is the CLOSE subtask alone -- which is why the left
+       arm's approach and close are separate subtasks.
+    #. ``(right, 4) -> (left, 3)``: the left arm does not carry the can away until the right hand
+       is off it. Its precondition is the RELEASE subtask alone (ends at ``departed_right``, the
+       hand physically clear of the can) -- which is why release and withdraw are separate
+       subtasks: keying this on the withdraw instead would make the left arm idle through the
+       right arm's entire trip back to rest.
+
+    Constraint #2 makes generation deliberately more conservative than the demos: the operator
+    opens the giving hand 0-4 steps after closing the receiving one (demo_8: 1 step BEFORE), so
+    the enforced hold-until-taken is a task invariant imposed on generation, not a property of the
+    source data. The runtime gate (OpenArmPickUpIKAbsMimicEnv._hold_giving_hand_until_taken) is
+    load-bearing here: while (right, 4) waits at its first waypoint, the replayed gripper column
+    may already say "open" (in half the demos the jaws open at or before the pass), and the gate
+    is what keeps them physically closed until the take has actually happened.
+
+    Segment boundaries vs the constraints they serve
+    ------------------------------------------------
+    Two of the right arm's boundaries exist purely so a constraint can anchor on them, which is
+    why "lift" (2) and "raise-and-hold" (3) are separate subtasks even though they read as one
+    motion:
+
+    * ``presented`` (end of 2) fires when the can leaves the pad -- the earliest moment that does
+      NOT depend on the left arm. Constraint #1 must anchor there: anchoring it on any later
+      right-arm boundary (``handover`` fires when the LEFT hand takes the can) would have the left
+      arm waiting for an event that needs the left arm to move first -- a deadlock.
+    * ``handover`` (end of 3) is where the release content begins in the source. Constraint #2's
+      constrained subtask must START there so that, once released, the jaws open within a few
+      steps. Folding segment 3's content into the release subtask instead would have the right arm
+      freeze at the 2.5 cm-lift point (where ``presented`` fires) waiting for a left hand that is
+      reaching for a can the source says should be up at the pass point -- and, once taken, replay
+      20-40 steps of hold before opening, with both position-controlled grippers clamping the can
+      the whole time.
+
+    Segment 3 itself carries the raise-and-hold content between those two boundaries. It has no
+    constraint of its own and needs none: it plays out while the left arm runs its approach, which
+    is exactly the source demos' phasing.
+
+    Why the receiving arm's wait is its OWN subtask, and object-free
+    ----------------------------------------------------------------
+    An earlier version gave the left arm just two subtasks, the first running from step 0 all the
+    way to ``grasp_left`` with ``object_ref=CAN_NAME``. That single segment is ~90 steps on these
+    demos of which the first ~60 are the arm sitting still, and Mimic re-anchors a WHOLE segment on
+    the object pose at the segment's start, so it was wrong in two ways at once:
+
+    * the idle part was re-anchored too. The left arm's rest pose got rigidly translated by however
+      far the can had spawned from the source demo's can, which walked the idle arm into the
+      workspace from step 0 -- visible in the failed generations as the left hand arriving at the
+      can around step 25 and knocking it over.
+    * the approach was anchored to the can's pose ON THE PAD, because that is where the segment
+      starts. But the receiving hand does not reach for the can on the pad, it reaches for the can
+      held up in the giving hand, 3-26 cm away (median ~13 cm, measured across the ten demos).
+
+    Splitting at ``presented`` fixes both: the wait becomes ``object_ref=None`` so nothing
+    transforms it, and the approach segment now starts when the can is already up in the right
+    hand, so the pose it is anchored on is the presentation pose.
+
+    Constraint bookkeeping
+    ----------------------
+    (right, 4) is the constrained half of #2 AND the precondition of #3. DataGenerator routes
+    constraint records into one dict per role (latter / former / coordination), so one subtask can
+    hold both -- an earlier single shared dict silently dropped one of the two entries, which is
+    exactly the failure its per-role asserts now catch loudly. No deadlock in the chain: right-2
+    finishes on its own and releases left-1; left-2 finishes and releases right-4; right-4
+    finishes and releases left-3.
     """
     from isaaclab.envs.mimic_env_cfg import SubTaskConfig, SubTaskConstraintConfig, SubTaskConstraintType
 
-    def _subtask(term_signal, description, interp=20, offset=(0, 0)):
+    # term_signal deliberately untyped: SubTaskConfig annotates it as plain `str` while defaulting
+    # it to None, so an honest `str | None` here just moves the type error into the
+    # SubTaskConfig(...) call. Same loose style as _idle_subtasks.
+    def _subtask(term_signal, description, interp: int = 20, object_ref: str | None = CAN_NAME):
+        # 'nearest_neighbor_object' needs an object to measure against, so a segment with no
+        # object_ref falls back to 'random' -- same pairing as _idle_subtasks.
+        # subtask_term_offset_range is NOT a parameter here: _stagger owns it, see below.
         return SubTaskConfig(
-            object_ref=CAN_NAME,
+            object_ref=object_ref,  # type: ignore[arg-type]  (annotated `str` upstream, None is valid)
             subtask_term_signal=term_signal,
-            subtask_term_offset_range=offset,
-            selection_strategy="nearest_neighbor_object",
-            selection_strategy_kwargs={"nn_k": 10},
+            selection_strategy="nearest_neighbor_object" if object_ref is not None else "random",
+            selection_strategy_kwargs={"nn_k": 10} if object_ref is not None else {},
             action_noise=0.001,
             num_interpolation_steps=interp,
             num_fixed_steps=0,
@@ -821,37 +1363,92 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             description=description,
         )
 
+    def _stagger(subtasks: list) -> list:
+        """Give one arm's subtasks end offsets 0, 1, 2, ... so tied signals cannot collide.
+
+        DataGenInfoPool cuts each boundary at its signal's first 0->1 transition and rejects the
+        whole episode unless the boundaries strictly increase. Two of these signals firing on the
+        SAME simulation step is not a bug to be tuned away -- at 20 Hz these events are genuinely
+        within one step of each other, and which pairs tie varies per recording session. Measured
+        over two independent ten-demo sets, every pair below tied in at least one episode:
+
+            handover / departed_right   3 of 10 (the giving hand is already clear of the can by
+                                        the time the machine declares the pass -- no distance
+                                        threshold can separate them, it has physically gone)
+            presented / reach_left      1 of 10
+            grasp_right / presented     1 of 10
+
+        Since ``randomize_subtask_boundaries`` adds these offsets to the END index and takes each
+        subtask's START from the previous END, a staircase of 0, 1, 2, ... turns any tie into a
+        one-step segment instead of a zero-step one: length_i becomes
+        ``raw_end_i - raw_end_i-1 + 1``, which is >= 1 for any NON-DECREASING signal sequence.
+        Inversions are still fatal, and are what the signal definitions themselves guard against
+        (see receiver_reached_obs); this only has to survive ties.
+
+        The last subtask keeps (0, 0): its end is the episode length, and an offset would index
+        past the recorded actions.
+
+        The cost is that no subtask boundary is randomised any more -- an earlier version gave
+        ``grasp_right`` a (2, 4) random end offset for generation diversity, which is not
+        compatible with a fixed staircase and is not worth re-deriving a per-subtask safe range for
+        while ties are still the binding constraint.
+        """
+        for index, subtask in enumerate(subtasks[:-1]):
+            subtask.subtask_term_offset_range = (index, index)
+        subtasks[-1].subtask_term_offset_range = (0, 0)
+        return subtasks
+
     # Insertion order stays left-then-right to match the single-arm modes, so the eef ordering a
     # Mimic env sees never depends on the mode -- only the CONTENT differs, the left arm now
     # being the receiving hand.
     subtask_configs = {
-        LEFT_EEF: [
-            _subtask("grasp_left", "Approach the presented can and take it"),
+        LEFT_EEF: _stagger([
+            # Nothing to interpolate towards: an untransformed segment starts at the same rest pose
+            # the arm is already sitting in, so this keeps the short idle interpolation.
+            _subtask(
+                "presented",
+                "Stay clear while the right arm picks the can up",
+                interp=5,
+                object_ref=None,
+            ),
+            _subtask("reach_left", "Approach the presented can"),
+            # Continues straight out of the approach, so there is barely anything to interpolate.
+            _subtask("grasp_left", "Close on the can and take it", interp=5),
             # Last subtask, so it runs to the end of the episode: the receiving arm carries the
             # can back to a neutral pose, still holding it. It is not put down -- the demo is over
             # once the can is safely in this hand.
-            _subtask(None, "Carry the can back to a neutral pose, still holding it"),
-        ],
-        RIGHT_EEF: [
-            _subtask("grasp_right", "Reach and grasp the can", interp=50, offset=(2, 5)),
-            _subtask("handover", "Lift the can and present it to the left hand"),
-            _subtask(None, "Release the can and retreat"),
-        ],
+            _subtask(None, "Carry the can back to a neutral pose, still holding it", interp=15),
+        ]),
+        RIGHT_EEF: _stagger([
+            _subtask("reach_right", "Approach the can", interp=50),
+            _subtask("grasp_right", "Close on the can", interp=5),
+            _subtask("presented", "Lift the can off the pad", interp=10),
+            _subtask("handover", "Raise the can to the pass point and hold it there", interp=5),
+            _subtask("departed_right", "Open the hand and pull clear of the can", interp=5),
+            _subtask(None, "Withdraw to a neutral pose", interp=10, object_ref=None),
+        ]),
     }
     constraints = [
+        # 1: the left arm does not set off until the right arm has the can off the pad.
         SubTaskConstraintConfig(
-            eef_subtask_constraint_tuple=[(RIGHT_EEF, 1), (LEFT_EEF, 0)],
+            eef_subtask_constraint_tuple=[(RIGHT_EEF, 2), (LEFT_EEF, 1)],
             constraint_type=SubTaskConstraintType.SEQUENTIAL,
-            sequential_min_time_diff=_HANDOVER_MIN_TIME_DIFF,
-        )
+            sequential_min_time_diff=-1,
+        ),
+        # 2: the right hand does not begin releasing until the left hand has closed on the can.
+        SubTaskConstraintConfig(
+            eef_subtask_constraint_tuple=[(LEFT_EEF, 2), (RIGHT_EEF, 4)],
+            constraint_type=SubTaskConstraintType.SEQUENTIAL,
+            sequential_min_time_diff=-1,
+        ),
+        # 3: the left arm does not carry the can away until the right hand is clear of it.
+        SubTaskConstraintConfig(
+            eef_subtask_constraint_tuple=[(RIGHT_EEF, 4), (LEFT_EEF, 3)],
+            constraint_type=SubTaskConstraintType.SEQUENTIAL,
+            sequential_min_time_diff=-1,
+        ),
     ]
     return subtask_configs, constraints
-
-
-_HANDOVER_MIN_TIME_DIFF = 20
-"""Steps of the left arm's take-it subtask that are held back until the right arm has finished
-presenting. Everything before that runs concurrently. -1 would serialise the two arms
-completely (left waits, motionless, for the whole right-arm pick)."""
 
 
 # ── The one entry point ───────────────────────────────────────────────────────
@@ -1003,10 +1600,40 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
             func=object_grasped_by_obs,
             params={"ee_frame_cfg": left_frame, "gripper_joint_names": LEFT_FINGER_JOINTS, **common()},
         )
+        # Splits the receiving arm's wait from its approach, so the approach is anchored on the can
+        # in the giving hand instead of on the pad -- see handover_presented_obs.
+        subtask_terms.presented = ObsTerm(
+            func=handover_presented_obs, params={"min_height": lift_height, **common()}
+        )
+        # Splits that approach from the close-and-take, which is what the giving arm's release is
+        # constrained against -- see _handover_subtask_configs. Gated on 'presented' rather than
+        # being a bare proximity test: the receiving arm's REST pose straddles the grasp radius of
+        # a can standing on the pad -- see receiver_reached_obs.
+        subtask_terms.reach_left = ObsTerm(
+            func=receiver_reached_obs, params={"min_height": lift_height, **common()}
+        )
+        # The giving arm's own approach/close split. Deliberately NOT the handover radius from
+        # common(): that one fires on a transient while the arm is still at rest near a can
+        # standing on the pad -- see REACH_RADIAL_THRESHOLD for the measurements. The axial bound
+        # stays the normal one; it cannot discriminate here either way.
+        subtask_terms.reach_right = ObsTerm(
+            func=object_reached_by_obs,
+            params={
+                "ee_frame_cfg": right_frame,
+                "object_cfg": object_cfg(),
+                "diff_threshold": REACH_RADIAL_THRESHOLD,
+            },
+        )
         # Shares handover_success's stage machine rather than testing "both grippers closed right
         # now" -- see handover_passed_obs for why that instantaneous test rejects real hand-overs.
         subtask_terms.handover = ObsTerm(
             func=handover_passed_obs, params={"min_height": lift_height, **common()}
+        )
+        # Ends the giving arm's release: the pass has happened and the right hand has physically
+        # pulled clear of the can -- see departed_after_pass_obs for why this is positional.
+        subtask_terms.departed_right = ObsTerm(
+            func=departed_after_pass_obs,
+            params={"min_height": lift_height, "right_ee_frame_cfg": right_frame, **common()},
         )
         subtask_terms.grasp_right = ObsTerm(
             func=object_grasped_by_obs,
@@ -1023,13 +1650,16 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
     # The base task's own randomisation term is dropped in every mode: the object it targeted
     # (cube_2) no longer exists once the can has replaced it above.
     #
-    # Identical in every mode -- the can goes anywhere on the pad regardless of which arm the demo
-    # is about. See _OBJECT_X_RANGE / _ARM_KEEP_OUT_BOXES.
+    # The range is per-mode and passed explicitly rather than left to reset_object_free's defaults,
+    # because it has to be the region that mode's SOURCE DEMOS cover -- Mimic re-anchors a source
+    # segment onto the new object pose, so a spawn outside that region is extrapolation. See
+    # OBJECT_SPAWN_RANGES / _HANDOVER_X_RANGE.
+    object_x_range, object_y_range = OBJECT_SPAWN_RANGES[mode]
     env_cfg.events.randomize_cube_2 = None
     env_cfg.events.randomize_object = EventTerm(
         func=reset_object_free,
         mode="reset",
-        params={"asset_cfg": object_cfg()},
+        params={"asset_cfg": object_cfg(), "x_range": object_x_range, "y_range": object_y_range},
     )
 
     # ── Mimic subtask structure ──────────────────────────────────────────────

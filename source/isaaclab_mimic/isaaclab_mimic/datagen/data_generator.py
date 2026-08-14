@@ -360,6 +360,8 @@ class DataGenerator:
                 randomized (start, end) indices for every subtask.
             runtime_subtask_constraints_dict: In/out dictionary carrying runtime fields
                 for constraints (e.g., selected source ID, delta transform, synchronous steps).
+                Only COORDINATION entries are ever consulted here, and since the caller routes
+                constraint records into one dict per role, this receives the coordination dict.
             selected_src_demo_inds: Per-EEF mapping for the currently selected source demo index
                 (may be reused across arms if configured).
 
@@ -658,10 +660,33 @@ class DataGenerator:
         await env_reset_queue.join()
         new_initial_state = self.env.scene.get_state(is_relative=True)
 
-        # create runtime subtask constraint rules from subtask constraint configs
-        runtime_subtask_constraints_dict = {}
+        # Create runtime subtask constraint rules from subtask constraint configs, routed into one
+        # dict per constraint ROLE rather than one shared dict. The roles are read at disjoint
+        # sites -- _SEQUENTIAL_LATTER only where waypoints are picked (the wait), _SEQUENTIAL_FORMER
+        # only where a finished subtask is handled (releasing the wait), COORDINATION at both plus
+        # trajectory generation -- so a subtask may legitimately hold one entry of EACH role, e.g.
+        # be the constrained (latter) half of one sequential constraint and the precondition
+        # (former) of the next. A single shared dict silently dropped one of the two roles on
+        # `.update()` (the "only one constraint per subtask allowed" assert inside
+        # generate_runtime_subtask_constraints checks each config's own fresh dict, so it could
+        # never fire); the asserts below make the genuinely unsupported case -- the SAME role
+        # attached twice to one subtask -- fail loudly instead.
+        sequential_latter_constraints = {}
+        sequential_former_constraints = {}
+        coordination_constraints = {}
         for subtask_constraint in self.env_cfg.task_constraint_configs:
-            runtime_subtask_constraints_dict.update(subtask_constraint.generate_runtime_subtask_constraints())
+            for constraint_key, constraint_rec in subtask_constraint.generate_runtime_subtask_constraints().items():
+                if constraint_rec["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
+                    target_dict = sequential_latter_constraints
+                elif constraint_rec["type"] == SubTaskConstraintType._SEQUENTIAL_FORMER:
+                    target_dict = sequential_former_constraints
+                else:
+                    target_dict = coordination_constraints
+                assert constraint_key not in target_dict, (
+                    f"subtask {constraint_key} appears in the same role in two constraints -- only one"
+                    " constraint per (subtask, role) is supported"
+                )
+                target_dict[constraint_key] = constraint_rec
 
         # save generated data in these variables
         generated_states = []
@@ -719,7 +744,8 @@ class DataGenerator:
                                 eef_name,
                                 current_eef_subtask_indices[eef_name],
                                 randomized_subtask_boundaries,
-                                runtime_subtask_constraints_dict,
+                                # That method only ever consults COORDINATION entries.
+                                coordination_constraints,
                                 current_eef_selected_src_demo_indices,  # updated in the method
                             )
                             # With skillgen, use a motion planner to transition between subtasks.
@@ -811,54 +837,56 @@ class DataGenerator:
             # Determine the next waypoint for each eef based on the current subtask constraints
             eef_waypoint_dict = {}
             for eef_name in sorted(self.env_cfg.subtask_configs.keys()):
-                # Handle constraints
+                # Handle constraints. Role dicts are consulted independently -- a subtask can carry
+                # a _SEQUENTIAL_LATTER entry here AND a _SEQUENTIAL_FORMER entry in the
+                # subtask-done block below, which the old single shared dict could not represent.
                 step_ind = current_eef_subtask_step_indices[eef_name]
                 subtask_ind = current_eef_subtask_indices[eef_name]
-                if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-                    task_constraint = runtime_subtask_constraints_dict[(eef_name, subtask_ind)]
-                    if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
-                        min_time_diff = task_constraint["min_time_diff"]
-                        if not task_constraint["fulfilled"]:
-                            if (
-                                min_time_diff == -1
-                                or step_ind >= len(current_eef_subtask_trajectories[eef_name]) - min_time_diff
-                            ):
-                                if step_ind > 0:
-                                    # Wait at the same step
-                                    step_ind -= 1
-                                    current_eef_subtask_step_indices[eef_name] = step_ind
-
-                    elif task_constraint["type"] == SubTaskConstraintType.COORDINATION:
-                        synchronous_steps = task_constraint["synchronous_steps"]
-                        concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
-                        concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
-                        concurrent_task_fulfilled = runtime_subtask_constraints_dict[
-                            (concurrent_task_spec_key, concurrent_subtask_ind)
-                        ]["fulfilled"]
-
+                if (eef_name, subtask_ind) in sequential_latter_constraints:
+                    task_constraint = sequential_latter_constraints[(eef_name, subtask_ind)]
+                    min_time_diff = task_constraint["min_time_diff"]
+                    if not task_constraint["fulfilled"]:
                         if (
-                            task_constraint["coordination_synchronize_start"]
-                            and current_eef_subtask_indices[concurrent_task_spec_key] < concurrent_subtask_ind
+                            min_time_diff == -1
+                            or step_ind >= len(current_eef_subtask_trajectories[eef_name]) - min_time_diff
                         ):
-                            # The concurrent eef is not yet at the concurrent subtask, so wait at the first action
-                            # This also makes sure that the concurrent task starts at the same time as this task
-                            step_ind = 0
-                            current_eef_subtask_step_indices[eef_name] = 0
-                        else:
-                            if (
-                                not concurrent_task_fulfilled
-                                and step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps
-                            ):
-                                # Trigger concurrent task
-                                runtime_subtask_constraints_dict[(concurrent_task_spec_key, concurrent_subtask_ind)][
-                                    "fulfilled"
-                                ] = True
+                            if step_ind > 0:
+                                # Wait at the same step
+                                step_ind -= 1
+                                current_eef_subtask_step_indices[eef_name] = step_ind
 
-                            if not task_constraint["fulfilled"]:
-                                if step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps:
-                                    if step_ind > 0:
-                                        step_ind -= 1
-                                        current_eef_subtask_step_indices[eef_name] = step_ind  # wait here
+                if (eef_name, subtask_ind) in coordination_constraints:
+                    task_constraint = coordination_constraints[(eef_name, subtask_ind)]
+                    synchronous_steps = task_constraint["synchronous_steps"]
+                    concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
+                    concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
+                    concurrent_task_fulfilled = coordination_constraints[
+                        (concurrent_task_spec_key, concurrent_subtask_ind)
+                    ]["fulfilled"]
+
+                    if (
+                        task_constraint["coordination_synchronize_start"]
+                        and current_eef_subtask_indices[concurrent_task_spec_key] < concurrent_subtask_ind
+                    ):
+                        # The concurrent eef is not yet at the concurrent subtask, so wait at the first action
+                        # This also makes sure that the concurrent task starts at the same time as this task
+                        step_ind = 0
+                        current_eef_subtask_step_indices[eef_name] = 0
+                    else:
+                        if (
+                            not concurrent_task_fulfilled
+                            and step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps
+                        ):
+                            # Trigger concurrent task
+                            coordination_constraints[(concurrent_task_spec_key, concurrent_subtask_ind)][
+                                "fulfilled"
+                            ] = True
+
+                        if not task_constraint["fulfilled"]:
+                            if step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps:
+                                if step_ind > 0:
+                                    step_ind -= 1
+                                    current_eef_subtask_step_indices[eef_name] = step_ind  # wait here
 
                 waypoint = current_eef_subtask_trajectories[eef_name][step_ind]
 
@@ -937,27 +965,25 @@ class DataGenerator:
                 if current_eef_subtask_step_indices[eef_name] == len(
                     current_eef_subtask_trajectories[eef_name]
                 ):  # Subtask done
-                    if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-                        task_constraint = runtime_subtask_constraints_dict[(eef_name, subtask_ind)]
-                        if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_FORMER:
-                            constrained_task_spec_key = task_constraint["constrained_task_spec_key"]
-                            constrained_subtask_ind = task_constraint["constrained_subtask_ind"]
-                            runtime_subtask_constraints_dict[(constrained_task_spec_key, constrained_subtask_ind)][
-                                "fulfilled"
-                            ] = True
-                        elif task_constraint["type"] == SubTaskConstraintType.COORDINATION:
-                            concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
-                            concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
-                            # Concurrent_task_spec_idx = task_spec_keys.index(concurrent_task_spec_key)
-                            task_constraint["finished"] = True
-                            # Check if concurrent task has been finished
-                            assert (
-                                runtime_subtask_constraints_dict[(concurrent_task_spec_key, concurrent_subtask_ind)][
-                                    "finished"
-                                ]
-                                or current_eef_subtask_step_indices[concurrent_task_spec_key]
-                                >= len(current_eef_subtask_trajectories[concurrent_task_spec_key]) - 1
-                            )
+                    if (eef_name, subtask_ind) in sequential_former_constraints:
+                        task_constraint = sequential_former_constraints[(eef_name, subtask_ind)]
+                        constrained_task_spec_key = task_constraint["constrained_task_spec_key"]
+                        constrained_subtask_ind = task_constraint["constrained_subtask_ind"]
+                        sequential_latter_constraints[(constrained_task_spec_key, constrained_subtask_ind)][
+                            "fulfilled"
+                        ] = True
+                    if (eef_name, subtask_ind) in coordination_constraints:
+                        task_constraint = coordination_constraints[(eef_name, subtask_ind)]
+                        concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
+                        concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
+                        # Concurrent_task_spec_idx = task_spec_keys.index(concurrent_task_spec_key)
+                        task_constraint["finished"] = True
+                        # Check if concurrent task has been finished
+                        assert (
+                            coordination_constraints[(concurrent_task_spec_key, concurrent_subtask_ind)]["finished"]
+                            or current_eef_subtask_step_indices[concurrent_task_spec_key]
+                            >= len(current_eef_subtask_trajectories[concurrent_task_spec_key]) - 1
+                        )
 
                     if pause_subtask:
                         input(

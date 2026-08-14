@@ -40,7 +40,7 @@ OPENARM_BI_CFG = ArticulationCfg(
             max_depenetration_velocity=5.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
+            enabled_self_collisions=True,
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=0,
         ),
@@ -62,8 +62,8 @@ OPENARM_BI_CFG = ArticulationCfg(
             "openarm_right_joint5": 0.0,
             "openarm_right_joint6": 0.0,
             "openarm_right_joint7": 0.0,
-            "openarm_left_finger_joint.*": 0.0,
-            "openarm_right_finger_joint.*": 0.0,
+            "openarm_left_finger_joint.*": 0.044,
+            "openarm_right_finger_joint.*": 0.044,
         },
     ),
     # spec sheet for reference
@@ -121,10 +121,10 @@ OPENARM_BI_CFG = ArticulationCfg(
                 "openarm_left_finger_joint.*",
                 "openarm_right_finger_joint.*",
             ],
-            velocity_limit_sim=0.2,
+            velocity_limit_sim=2.0,
             effort_limit_sim=333.33,
-            stiffness=2e3,
-            damping=1e2,
+            stiffness=3000,
+            damping=30,
         ),
     },
     soft_joint_pos_limit_factor=1.0,
@@ -188,8 +188,8 @@ OPENARM_BI_HIGH_PD_CFG = OPENARM_BI_CFG.copy()
 OPENARM_BI_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
 OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 2000
 OPENARM_BI_HIGH_PD_CFG.actuators["openarm_arm"].damping = 10.0
-OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 80
-OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 10
+OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 500.0
+OPENARM_BI_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 10.0
 """Configuration of OpenArm Bimanual robot with stiffer PD control.
 
 This configuration is useful for task-space control using differential IK.

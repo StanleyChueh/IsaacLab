@@ -611,10 +611,25 @@
         <mesh filename="package://v1_camera_isaac/mesh/arm/visual/cam.dae" scale="0.001 -0.001 0.001"/>
       </geometry>
     </visual>
-    <collision name="openarm_left_camera_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <!-- mounting plate at the wrist -->
+    <collision name="openarm_left_camera_plate_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="-0.0011 0.0 -0.0003"/>
       <geometry>
-        <box size="0.03 0.08 0.03"/>
+        <box size="0.069 0.0945 0.0105"/>
+      </geometry>
+    </collision>
+    <!-- thin support post between the plate and the camera -->
+    <collision name="openarm_left_camera_post_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="0.0722 0.0 0.0105"/>
+      <geometry>
+        <box size="0.0101 0.0238 0.0336"/>
+      </geometry>
+    </collision>
+    <!-- camera housing -->
+    <collision name="openarm_left_camera_housing_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="0.0657 0.0 0.03"/>
+      <geometry>
+        <box size="0.0288 0.0912 0.0336"/>
       </geometry>
     </collision>
   </link>
@@ -630,10 +645,25 @@
         <mesh filename="package://v1_camera_isaac/mesh/arm/visual/cam.dae" scale="0.001 0.001 0.001"/>
       </geometry>
     </visual>
-    <collision name="openarm_right_camera_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <!-- mounting plate at the wrist -->
+    <collision name="openarm_right_camera_plate_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="-0.0011 0.0 -0.0003"/>
       <geometry>
-        <box size="0.03 0.08 0.03"/>
+        <box size="0.069 0.0945 0.0105"/>
+      </geometry>
+    </collision>
+    <!-- thin support post between the plate and the camera -->
+    <collision name="openarm_right_camera_post_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="0.0722 0.0 0.0105"/>
+      <geometry>
+        <box size="0.0101 0.0238 0.0336"/>
+      </geometry>
+    </collision>
+    <!-- camera housing -->
+    <collision name="openarm_right_camera_housing_collision">
+      <origin rpy="0.0 0.0 0.0" xyz="0.0657 0.0 0.03"/>
+      <geometry>
+        <box size="0.0288 0.0912 0.0336"/>
       </geometry>
     </collision>
   </link>

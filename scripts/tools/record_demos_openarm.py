@@ -42,7 +42,8 @@ Every column is the ABSOLUTE joint target decoded from the ROS2 message that ste
 command actually applied, not the pose that resulted from it (see
 ROS2NativeJointTeleop.build_dual_action):
   [0:7]   left arm joint positions (rad)
-  [7:8]   left gripper joint1 position (m, 0.0 closed .. 0.044 open)
+  [7:8]   left gripper joint1 position (m), quantised to 0.0 closed / 0.044 open by
+          snap_gripper_command -- never an intermediate trigger position
   [8:15]  right arm joint positions
   [15:16] right gripper joint1 position
 
@@ -92,9 +93,10 @@ parser.add_argument(
         " about, which arm(s) you may drive, and therefore what ends it. Any mode replaces the"
         " task's default cube_2 with a can (see openarm_task_modes.py). 'left'/'right':"
         " single-arm pick-up -- ONLY that arm is teleoperable (the other is held at its rest"
-        " pose), the can spawns only on that arm's half of the pad, and the demo auto-ends once"
+        " pose), the can spawns anywhere on the pad, and the demo auto-ends once"
         " THAT arm is holding it in the air. 'handover': both arms are teleoperable, the can"
-        " spawns on the RIGHT half, the right arm picks it up and passes it to the left, and the"
+        " spawns in a narrow band on the midline between the two hands (y within +-1.2 cm of 0),"
+        " the right arm picks it up and passes it to the left, and the"
         " demo auto-ends once the LEFT arm is holding it in the air with the right gripper open."
         " Every mode records BOTH arms' joints either way -- the gating is on control, not on"
         " what lands in the dataset. Omit to keep the task cfg's own settings (cube_2 anywhere on"
@@ -762,6 +764,62 @@ RIGHT_GRIPPER_JOINT_NAME = "openarm_right_finger_joint1"
 LEFT_GRIPPER_FOLLOWER_JOINT_NAME = "openarm_left_finger_joint2"
 RIGHT_GRIPPER_FOLLOWER_JOINT_NAME = "openarm_right_finger_joint2"
 
+# ── Gripper command quantisation (vr_joint_ros2_native only) ──────────────────
+# The value dora publishes for a finger joint is the VR trigger's ANALOG travel
+# (ik.py's _map_trigger_to_gripper: trigger 0 -> 0.044 m open, 1 -> 0.0 m closed).
+# Everything downstream of this script treats the gripper as a two-state command
+# instead: the task's own BinaryJointPositionActionCfg, Mimic's +-1 convention
+# (openarm_pickup_ik_abs_mimic_env.actions_to_gripper_actions), and
+# JointMirrorBroadcaster's open/close target. An operator who squeezes the trigger
+# all the way (as ours does) already produces a clean 0.0/0.044 column apart from
+# the one or two frames each transition passes through -- but a squeeze held short
+# of the end stop records a half-closed target that replay_demos.py faithfully
+# reproduces as a gripper that visibly never shuts, and that Mimic maps to a
+# non-canonical value (0.0425 -> +0.93) instead of a clean +-1.
+#
+# Snapping to the two endpoints happens on the way IN, at every point that reads a
+# gripper value out of the decoded ROS2 message -- both the term that ACTUATES the
+# joint (ROS2JointCommandAction.apply_actions) and the one that LOGS it
+# (ROS2NativeJointTeleop.build_dual_action), through this one function so the two
+# cannot disagree. Snapping only the logged value would write an action the robot
+# was never given, contradicting the recorded (measured) states.
+#
+# Hysteresis rather than a single midpoint threshold: a trigger held near the
+# midpoint would otherwise flip the fingers fully open/closed from step to step.
+#
+# Same two endpoints as VRDualArmTeleop.GRIPPER_OPEN_VAL/GRIPPER_CLOSED_VAL (which
+# document where the raw values come from) and JointMirrorBroadcaster's -- keep in sync.
+GRIPPER_OPEN_VAL = 0.044
+GRIPPER_CLOSED_VAL = 0.0
+GRIPPER_SNAP_CLOSE_BELOW = 0.35 * GRIPPER_OPEN_VAL
+GRIPPER_SNAP_OPEN_ABOVE = 0.65 * GRIPPER_OPEN_VAL
+
+# Last snapped value per gripper joint name, i.e. the hysteresis state. Module-level
+# because the two call sites live in different objects and run at different rates
+# (apply_actions every physics substep, build_dual_action once per env step) but must
+# share one state machine. Keyed by the LEADER joint name, so a follower jaw resolved
+# from its leader lands on the same state.
+_GRIPPER_SNAP_STATE: dict[str, float] = {}
+
+GRIPPER_JOINT_NAMES = (LEFT_GRIPPER_JOINT_NAME, RIGHT_GRIPPER_JOINT_NAME)
+
+
+def snap_gripper_command(joint_name: str, raw: float) -> float:
+    """Quantise one raw gripper command (m) to fully open / fully closed.
+
+    Returns the previous state for a value inside the hysteresis band, defaulting to
+    open -- the safe state for an unarmed episode, since a gripper that starts closed
+    can clamp onto whatever it is lowered around.
+    """
+    if raw <= GRIPPER_SNAP_CLOSE_BELOW:
+        state = GRIPPER_CLOSED_VAL
+    elif raw >= GRIPPER_SNAP_OPEN_ABOVE:
+        state = GRIPPER_OPEN_VAL
+    else:
+        state = _GRIPPER_SNAP_STATE.get(joint_name, GRIPPER_OPEN_VAL)
+    _GRIPPER_SNAP_STATE[joint_name] = state
+    return state
+
 
 def swap_to_joint_position_actions(env_cfg) -> None:
     """Reassign env_cfg.actions.arm_action/right_arm_action from the task's default IK
@@ -886,7 +944,12 @@ class ROS2JointCommandAction(ActionTerm):
         target = self._default_joint_pos.clone()
         for i, joint_name in enumerate(self._joint_names):
             if joint_name in by_name:
-                target[:, i] = by_name[joint_name]
+                # A gripper is driven to one of its two endpoints, never to the trigger's
+                # analog position -- see snap_gripper_command.
+                if joint_name in GRIPPER_JOINT_NAMES:
+                    target[:, i] = snap_gripper_command(joint_name, float(by_name[joint_name]))
+                else:
+                    target[:, i] = by_name[joint_name]
         self._asset.set_joint_position_target(target, joint_ids=self._joint_ids)
 
         # Follower joints (the grippers' *_finger_joint2). The dora/ROS2 side never
@@ -898,7 +961,13 @@ class ROS2JointCommandAction(ActionTerm):
             f_target = self._follower_default_pos.clone()
             for i, source in enumerate(self._follower_sources):
                 if source in by_name:
-                    f_target[:, i] = by_name[source]
+                    # Same snap as the leader (and keyed by the leader's name), or the two
+                    # jaws would be commanded to different positions.
+                    f_target[:, i] = (
+                        snap_gripper_command(source, float(by_name[source]))
+                        if source in GRIPPER_JOINT_NAMES
+                        else by_name[source]
+                    )
             self._asset.set_joint_position_target(f_target, joint_ids=self._follower_ids)
 
 
@@ -1392,6 +1461,12 @@ class ROS2NativeJointTeleop:
         into grip force. Replaying the stalled measured value commands zero error, hence
         zero squeeze, and the cube slips out of a gripper that never visibly closes.
 
+        The gripper columns are additionally quantised to fully open / fully closed by
+        snap_gripper_command -- the same call ROS2JointCommandAction.apply_actions makes
+        on the same shared state before driving the joint, so what is logged stays what
+        was applied. Without it a half-squeezed trigger recorded a half-closed target
+        (see that function's comment).
+
         Any joint the decoded message doesn't carry -- and every step before the first
         message arrives -- falls back to the measured position, which is the closest
         thing to "what it was told to do" available at that point. In practice recording
@@ -1418,11 +1493,17 @@ class ROS2NativeJointTeleop:
                 if joint_name in by_name:
                     full[RIGHT_JOINT_SLICE.start + offset] = float(by_name[joint_name])
             # Only each gripper's joint1 is ever published (joint2 is the follower that
-            # ROS2JointCommandAction copies it onto -- see its apply_actions()).
+            # ROS2JointCommandAction copies it onto -- see its apply_actions()). Quantised
+            # by the same shared state machine that term applies, so the logged action is
+            # the endpoint the joint was actually driven to -- see snap_gripper_command.
             if LEFT_GRIPPER_JOINT_NAME in by_name:
-                full[LEFT_JOINT_GRP_IDX] = float(by_name[LEFT_GRIPPER_JOINT_NAME])
+                full[LEFT_JOINT_GRP_IDX] = snap_gripper_command(
+                    LEFT_GRIPPER_JOINT_NAME, float(by_name[LEFT_GRIPPER_JOINT_NAME])
+                )
             if RIGHT_GRIPPER_JOINT_NAME in by_name:
-                full[RIGHT_JOINT_GRP_IDX] = float(by_name[RIGHT_GRIPPER_JOINT_NAME])
+                full[RIGHT_JOINT_GRP_IDX] = snap_gripper_command(
+                    RIGHT_GRIPPER_JOINT_NAME, float(by_name[RIGHT_GRIPPER_JOINT_NAME])
+                )
 
         # An arm locked out by --task_mode is held at its rest pose by ROS2JointCommandAction,
         # which never reads the message above. Log THAT, not the command the operator's headset
@@ -1504,6 +1585,13 @@ class JointMirrorBroadcaster:
         the real gripper to keep squeezing further. Mirroring the fixed open/close *target*
         instead lets the real hardware's own compliant pads decide how far they actually close,
         independent of whatever sim's specific rigid object happened to stop the fingers at.
+
+        The `*_gripper_state` argument carries a +-1 binary command in the IK/keyboard modes but
+        a position in metres in vr_joint_ros2_native (build_dual_action returns the gripper
+        column it logged). The `> 0` test below reads both correctly only because that column is
+        quantised to exactly 0.0 / 0.044 -- see snap_gripper_command. Feeding it an unquantised
+        trigger position would classify every value but an exact 0.0 as "open", i.e. the real
+        gripper would never be told to close.
         """
         joint_pos = self._robot.data.joint_pos[0, self._indices].tolist()
         joints = dict(zip(self._names, joint_pos))
@@ -1961,10 +2049,74 @@ def main():
     _HANDOVER_STAGE_LABELS = {
         0: "waiting for the RIGHT arm to grasp the can",
         1: "right arm has it -- waiting for the LEFT arm to take it while the right still holds",
-        2: "passed to the left arm -- waiting for release and the can to land",
+        # NOT "and the can to land": handover_success dropped that requirement, because with manual
+        # saving the operator routinely stops the episode still holding the can. Releasing is all
+        # 2 -> 3 needs.
+        2: "passed to the left arm -- waiting for the RIGHT arm to let go",
         3: "complete",
     }
+    _HANDOVER_STALL_REPORT_PERIOD = 40
+    """Steps between diagnostics while a stage does not advance -- ~2 s at this task's 20 Hz control
+    rate. Every step would be 20 near-identical lines a second; a stage CHANGE prints immediately
+    regardless, so nothing is delayed by this."""
+
     handover_stage_seen: dict[str, int | None] = {"value": None}
+    handover_stall_steps: dict[str, int] = {"value": 0}
+
+    def _handover_conditions_line(stage: int) -> str:
+        """Per-condition readout of what the stage machine is still waiting for.
+
+        Every VERDICT here comes from the same functions the machine itself uses -- the booleans
+        are openarm_task_modes.object_grasped_by / handover_latches, invoked with the success
+        term's own params. Only the raw numbers alongside them are read separately, and those are
+        exactly the quantities those functions threshold (hand_to_object_offsets,
+        gripper_jaw_positions). A diagnostic that computed its own verdict could disagree with the
+        machine, which is worse than no diagnostic at all.
+        """
+        from isaaclab.managers import SceneEntityCfg
+
+        if success_term is None:
+            return ""
+        params = success_term.params
+        object_cfg = params["object_cfg"]
+        diff_threshold = params["diff_threshold"]
+
+        def _arm(frame_name: str, fingers: list[str]) -> str:
+            radial, axial = openarm_task_modes.hand_to_object_offsets(
+                env, SceneEntityCfg(frame_name), object_cfg
+            )
+            jaws = openarm_task_modes.gripper_jaw_positions(env, fingers)[0]
+            holds = bool(
+                openarm_task_modes.object_grasped_by(
+                    env,
+                    ee_frame_cfg=SceneEntityCfg(frame_name),
+                    gripper_joint_names=fingers,
+                    object_cfg=object_cfg,
+                    diff_threshold=diff_threshold,
+                )[0]
+            )
+            closed_below = openarm_task_modes.GRIPPER_OPEN_VAL - openarm_task_modes.GRIPPER_THRESHOLD
+            return (
+                f"holds={str(holds):5} radial={float(radial[0]):.3f}/{diff_threshold:.2f}"
+                f" axial={float(axial[0]):.3f}/{openarm_task_modes.GRASP_AXIAL_TOLERANCE:.2f}"
+                f" jaws={'/'.join(f'{float(j):.3f}' for j in jaws)}<{closed_below:.3f}"
+            )
+
+        can_z = float(env.scene[object_cfg.name].data.root_pos_w[0, 2])
+        lines = []
+        if stage == 0:
+            lines.append(f"  right {_arm('right_ee_frame', openarm_task_modes.RIGHT_FINGER_JOINTS)}")
+        elif stage == 1:
+            latches = openarm_task_modes.handover_latches(env)
+            lines.append(f"  left  {_arm('ee_frame', openarm_task_modes.LEFT_FINGER_JOINTS)}")
+            lines.append(
+                f"  was_lifted={bool(latches['was_lifted'][0])} (can_z={can_z:.3f} needs"
+                f" >{params['min_height']:.3f} WHILE the right hand holds it)"
+                f"  right_holding_since_pickup={bool(latches['right_holding_since_pickup'][0])}"
+            )
+        elif stage == 2:
+            lines.append(f"  right {_arm('right_ee_frame', openarm_task_modes.RIGHT_FINGER_JOINTS)} -> must go False")
+        return "\n".join(lines)
 
     def _report_handover_stage():
         if args_cli.task_mode != "handover":
@@ -1975,7 +2127,23 @@ def main():
             return
         if stage != handover_stage_seen["value"]:
             handover_stage_seen["value"] = stage
+            handover_stall_steps["value"] = 0
             print(f"[HANDOVER {stage}/3] {_HANDOVER_STAGE_LABELS.get(stage, '?')}")
+        handover_stall_steps["value"] += 1
+
+        # Nothing left to wait for once complete, and no point reporting a stage the same step it
+        # was entered -- the conditions that block it have not had a chance to change yet.
+        if stage >= 3:
+            return
+        if handover_stall_steps["value"] < _HANDOVER_STALL_REPORT_PERIOD:
+            return
+        handover_stall_steps["value"] = 0
+        try:
+            detail = _handover_conditions_line(stage)
+        except Exception as exc:  # a diagnostic must never take the recording session down
+            detail = f"  (condition readout unavailable: {exc})"
+        if detail:
+            print(f"[HANDOVER {stage}/3] still waiting:\n{detail}")
 
     def on_button_x():
         """button_x handler -- a toggle: first press starts the episode, second press saves it.

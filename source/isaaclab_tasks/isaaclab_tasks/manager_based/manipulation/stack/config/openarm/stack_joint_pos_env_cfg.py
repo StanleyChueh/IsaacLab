@@ -57,8 +57,8 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
             "openarm_right_joint5": 0.0,
             "openarm_right_joint6": 0.0,
             "openarm_right_joint7": 0.0,
-            "openarm_left_finger_joint.*": 0.0,
-            "openarm_right_finger_joint.*": 0.0,
+            "openarm_left_finger_joint.*": 0.044,
+            "openarm_right_finger_joint.*": 0.044,
         }
 
         # Arm: kp/kv taken from the real OpenArm MuJoCo actuator XML (position actuators,
@@ -93,8 +93,8 @@ class OpenarmCubeStackEnvCfg(StackEnvCfg):
         # finger-cube contact force stays small and doesn't generate a wrist-twisting reaction
         # torque; the implicit actuator clips final torque to effort_limit_sim regardless of
         # kp/kv, so raising the gains here doesn't reopen that issue.
-        self.scene.robot.actuators["openarm_gripper"].stiffness = 200.0
-        self.scene.robot.actuators["openarm_gripper"].damping = 20.0
+        self.scene.robot.actuators["openarm_gripper"].stiffness = 500.0
+        self.scene.robot.actuators["openarm_gripper"].damping = 10.0
         self.scene.robot.actuators["openarm_gripper"].effort_limit_sim = 8.0
         # Lower the robot body's PhysX depenetration velocity so that contact
         # corrections between fingers and cube are gentle impulses, not spikes.
