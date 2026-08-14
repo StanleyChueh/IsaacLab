@@ -230,7 +230,7 @@ python mirror_bridge.py --calibration calibration.json --udp-port 9999     --rig
 sim-to-real
 
 ```
- env -u PYTHONPATH -u LD_LIBRARY_PATH   ~/miniforge3/envs/lerobot-openarm-cf/bin/python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_VR_pringles --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --handshake-tolerance 1.0 --ramp-duration 10.0     --max-steps 3000 --plot sim_vs_real_20260812.png
+ env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V6 --episode 1   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
 ```
 
 real-to-sim
