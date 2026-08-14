@@ -122,6 +122,24 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--return_to_rest_secs",
+    type=float,
+    default=1.5,
+    help=(
+        "How long the closing return-to-rest motion takes, in seconds. On the second Quest button"
+        " X press the robot is driven back to the task's rest pose along a straight line in joint"
+        " space and the episode is exported only once it arrives -- so the retreat is RECORDED as"
+        " part of the demo instead of happening off-camera during the reset. The grippers are held"
+        " at whatever they were commanded to, so a held object is carried back rather than dropped."
+        " The profile eases in and out (see ReturnToRestTrajectory), so this buys a shorter tail on"
+        " every episode without the joints being asked to start and stop at full speed -- lower it"
+        " further if the retreat still drags, raise it if a carried object slips or swings."
+        " Set to 0 to export immediately on the second press (the old behavior). Only applies to"
+        " the joint-space Quest-button devices (vr_joint_ros2 / vr_joint_ros2_native); the N key"
+        " always exports immediately, whatever this is set to."
+    ),
+)
+parser.add_argument(
     "--teleop_device",
     type=str,
     default="keyboard",
@@ -490,6 +508,24 @@ meant the robot moved -- and could knock the can over -- during setup, before an
 to hold that motion. NOTE the trade this makes: because the robot no longer follows the headset
 before X, whatever pose the operator's real arms are in at the moment X is pressed is applied in
 one step. Align to the rest pose before arming, or the episode opens with a jump.
+"""
+
+# ─── Return-to-rest override: the episode's own closing motion ────────────────
+RETURN_TO_REST = {"targets": None}
+"""Joint position targets that override the live teleop command, or None when not returning.
+
+Set by :class:`ReturnToRestTrajectory` for the closing phase of an episode: after the operator's
+second button-X press the robot is driven back to the task's rest pose along a straight line in
+joint space, and only then is the episode exported. Those steps go through ``env.step()`` like any
+other, so the retreat is part of the recorded demo rather than something that happens to the robot
+between episodes (a dataset whose demos all end mid-reach teaches a policy that never retreats).
+
+Shape is the robot's full ``(num_envs, num_joints)`` target vector, so each action term can slice
+out the joints it owns. Same dict-not-bare-global reason as MOTION_GATE: it is read from inside
+ROS2JointCommandAction.apply_actions().
+
+Only the ROS2 native path needs this side channel -- for every other device the returned action
+vector IS the command, so ReturnToRestTrajectory.advance()'s return value is enough on its own.
 """
 
 # ─── Action space layout ──────────────────────────────────────────────────────
@@ -918,6 +954,19 @@ class ROS2JointCommandAction(ActionTerm):
 
     def apply_actions(self):
         import omni.graph.core as og
+
+        # The episode's closing return-to-rest ramp outranks everything below, including `locked`:
+        # the trajectory is computed over the WHOLE robot (a locked arm's segment is simply the
+        # constant rest pose), so honouring it here needs no per-arm special case. The operator's
+        # headset keeps publishing throughout -- this is what stops it being listened to.
+        override = RETURN_TO_REST["targets"]
+        if override is not None:
+            self._asset.set_joint_position_target(override[:, self._joint_ids], joint_ids=self._joint_ids)
+            if self._follower_ids:
+                self._asset.set_joint_position_target(
+                    override[:, self._follower_ids], joint_ids=self._follower_ids
+                )
+            return
 
         # Two independent reasons to ignore the ROS2 command and pin these joints to their rest
         # pose: the arm is locked out for the whole run by --task_mode (see CONTROLLED_ARMS), or
@@ -1740,6 +1789,148 @@ def run_ramp_to_rest_test(env, duration: float = 4.0, rate_hz: float = 50.0, sto
         print("[RAMP TEST] Done -- arm should now be at the default rest pose.")
 
 
+class ReturnToRestTrajectory:
+    """The closing motion of a recorded episode: a straight-line joint-space ramp from wherever the
+    arms are back to the task's rest pose, executed one control step at a time THROUGH the main
+    loop's ``env.step()`` so every step of it lands in the episode.
+
+    Same straight line through joint space as ``run_ramp_to_rest_test`` (and, on hardware,
+    reset_to_rest_pose.py's ``ramp_to()``) -- ``cmd = start + alpha * (rest - start)`` -- but with
+    two differences that matter. That one drives PhysX directly with ``env.step()`` bypassed, which
+    is exactly why it records nothing; here the ramp only *produces* an action vector and the main
+    loop steps the env with it. And its ``alpha`` is linear in time, where this one is smoothstepped
+    (see :meth:`advance`) so the retreat can be short without starting and stopping abruptly.
+
+    Only meaningful for the two joint-layout devices (see requires_manual_arm), and the two encode
+    that 16D vector differently, hence ``is_native``:
+
+    * ``vr_joint_ros2`` -- JointPositionActionCfg with ``use_default_offset=True``, so the arm
+      columns are ``(target - rest) / JOINT_ACTION_SCALE`` and the gripper column is the binary
+      +-1.0 command.
+    * ``vr_joint_ros2_native`` -- absolute joint targets and an absolute gripper position, matching
+      ROS2NativeJointTeleop.build_dual_action. That device ignores the action vector for control
+      (see ROS2JointCommandAction), so :attr:`RETURN_TO_REST` is populated alongside it as the
+      channel that actually moves the robot; the vector is still what gets recorded, and the two
+      are built from the same numbers so they cannot disagree.
+
+    The grippers do NOT ramp, and are the one part of the robot the rest pose is NOT applied to:
+    both are held at exactly the command they were last given, all the way to the rest pose. Their
+    rest value is fully open, so ramping them alongside the arms would make every episode end by
+    dropping the object the demo just spent itself picking up.
+
+    Holding the *command* is also what keeps the object gripped, not just un-released. A closed
+    gripper's jaws stall on the object's surface well short of where they were told to go (e.g.
+    0.0325 m measured against a ~0 m command), and it is precisely that command/measured gap the
+    implicit actuator turns into squeeze force -- see ROS2NativeJointTeleop.build_dual_action, which
+    records commands rather than measurements for the same reason. Re-issuing the held command
+    unchanged every step reproduces that gap exactly, so grip force during the return is the same
+    force that was holding the object when the operator pressed X. Latching the *measured* position
+    instead would command zero error, i.e. zero squeeze, and the object would slide out of a hand
+    that never visibly opened.
+    """
+
+    def __init__(self, robot, sim_device: str, duration: float, rate_hz: float, is_native: bool):
+        self._robot = robot
+        self._device = sim_device
+        self._is_native = is_native
+        self._steps = max(1, int(round(duration * rate_hz)))
+        # Same find_joints() calls, in the same order, that ROS2NativeJointTeleop/
+        # swap_to_joint_position_actions resolve the 16D layout's columns with -- index by the
+        # resolved ids, never by assuming the regex enumerates joint1..joint7 in order.
+        self._left_ids, _ = robot.find_joints(LEFT_ARM_JOINT_REGEX)
+        self._right_ids, _ = robot.find_joints(RIGHT_ARM_JOINT_REGEX)
+        self._left_grp_ids, _ = robot.find_joints(
+            [LEFT_GRIPPER_JOINT_NAME, LEFT_GRIPPER_FOLLOWER_JOINT_NAME]
+        )
+        self._right_grp_ids, _ = robot.find_joints(
+            [RIGHT_GRIPPER_JOINT_NAME, RIGHT_GRIPPER_FOLLOWER_JOINT_NAME]
+        )
+        self.active = False
+        self.left_gripper_cmd = 0.0
+        self.right_gripper_cmd = 0.0
+        self._grippers_latched = False
+        self._step = 0
+        self._left_start = None
+        self._right_start = None
+
+    def start(self) -> None:
+        """Latch the ramp's start pose (the arms' CURRENT measured positions) and begin.
+
+        The grippers are deliberately NOT latched here: this runs from the button callback, which
+        fires from inside the teleop device's own build_dual_action() before that method has
+        computed this step's gripper commands -- so anything read now is one step stale. The first
+        :meth:`advance` call latches them instead, from the values the main loop has by then
+        received. One step is usually nothing, but "usually" is not what should stand between a
+        grasped object and the floor.
+        """
+        self._step = 0
+        self._left_start = self._robot.data.joint_pos[0, self._left_ids].clone()
+        self._right_start = self._robot.data.joint_pos[0, self._right_ids].clone()
+        self._grippers_latched = False
+        self.active = True
+
+    def stop(self) -> None:
+        """End the ramp and hand control back to the teleop device."""
+        self.active = False
+        RETURN_TO_REST["targets"] = None
+
+    def advance(self, left_gripper_cmd: float, right_gripper_cmd: float) -> tuple[torch.Tensor, bool]:
+        """Produce this control step's action vector.
+
+        Args:
+            left_gripper_cmd: The gripper command the teleop device produced for this step, in
+                whatever encoding this device uses (absolute position for the native path, binary
+                +-1.0 otherwise). Latched on the FIRST call -- so the hold value is the live
+                command from the step the operator pressed X, not a stale one (see :meth:`start`)
+                -- and ignored on every call after that, which is what makes it a hold.
+            right_gripper_cmd: As above, for the right gripper.
+
+        Returns:
+            ``(action_16d, finished)``. ``finished`` is True on the step that reaches the rest
+            pose -- the caller should still step the env with this action (so the final,
+            at-rest sample is in the episode) before saving.
+        """
+        if not self._grippers_latched:
+            self.left_gripper_cmd = left_gripper_cmd
+            self.right_gripper_cmd = right_gripper_cmd
+            self._grippers_latched = True
+        self._step += 1
+        # Smoothstep rather than the linear `s` run_ramp_to_rest_test uses: it leaves and arrives at
+        # zero joint velocity, which is what makes a SHORT return usable. A linear ramp reaches its
+        # full speed on step one and drops to zero on the last, and at these durations that pair of
+        # velocity steps is what shakes a carried object loose -- so the same peak effort buys a
+        # noticeably quicker retreat here. Peak rate is 1.5x the average, i.e. --return_to_rest_secs
+        # 1.5 moves no faster at its quickest than a linear 1.0 s ramp would throughout.
+        s = min(1.0, self._step / self._steps)
+        alpha = s * s * (3.0 - 2.0 * s)
+        default = self._robot.data.default_joint_pos
+        left_rest = default[0, self._left_ids]
+        right_rest = default[0, self._right_ids]
+        left_target = self._left_start + alpha * (left_rest - self._left_start)
+        right_target = self._right_start + alpha * (right_rest - self._right_start)
+
+        if self._is_native:
+            full_target = default.clone()
+            full_target[:, self._left_ids] = left_target
+            full_target[:, self._right_ids] = right_target
+            # Both jaws (leader and its follower) get the one held command -- see class docstring.
+            full_target[:, self._left_grp_ids] = self.left_gripper_cmd
+            full_target[:, self._right_grp_ids] = self.right_gripper_cmd
+            RETURN_TO_REST["targets"] = full_target
+
+        full = torch.zeros(TOTAL_ACTION_DIM_JOINT, dtype=torch.float32, device=self._device)
+        if self._is_native:
+            full[LEFT_JOINT_SLICE] = left_target
+            full[RIGHT_JOINT_SLICE] = right_target
+        else:
+            full[LEFT_JOINT_SLICE] = (left_target - left_rest) / JOINT_ACTION_SCALE
+            full[RIGHT_JOINT_SLICE] = (right_target - right_rest) / JOINT_ACTION_SCALE
+        full[LEFT_JOINT_GRP_IDX] = self.left_gripper_cmd
+        full[RIGHT_JOINT_GRP_IDX] = self.right_gripper_cmd
+
+        return full, self._step >= self._steps
+
+
 def build_single_arm_action(
     teleop_7d: torch.Tensor,
     gripper_state: float,
@@ -2032,6 +2223,19 @@ def main():
     # recorded until start_recording() (button X) fires.
     recording_armed = not requires_manual_arm
     MOTION_GATE["enabled"] = recording_armed
+    # The episode's closing motion (second button X) -- None when disabled or not applicable, in
+    # which case that press exports immediately, as it always used to.
+    return_to_rest = (
+        ReturnToRestTrajectory(
+            robot=env.scene["robot"],
+            sim_device=sim_device,
+            duration=args_cli.return_to_rest_secs,
+            rate_hz=args_cli.step_hz,
+            is_native=use_vr_joint_teleop_native,
+        )
+        if requires_manual_arm and args_cli.return_to_rest_secs > 0
+        else None
+    )
 
     def reset_episode():
         nonlocal should_reset
@@ -2146,17 +2350,31 @@ def main():
             print(f"[HANDOVER {stage}/3] still waiting:\n{detail}")
 
     def on_button_x():
-        """button_x handler -- a toggle: first press starts the episode, second press saves it.
+        """button_x handler -- a toggle: first press starts the episode, second press ends it.
 
         Manual saving exists because the hand-over's auto-success condition has to recognise a
         whole multi-step sequence (see handover_success) and any one of its steps going
         unrecognised leaves the operator with an episode that will not end. A button the operator
         controls does not depend on the sequence being detected at all.
+
+        "Ends it" is not the same as "saves it": unless --return_to_rest_secs 0 disables it, the
+        second press hands the robot to ReturnToRestTrajectory, and the export happens when THAT
+        finishes (see the main loop). Further presses while it is on its way home are ignored --
+        the ramp is short, and re-triggering it from a half-returned pose would only truncate the
+        motion the press was asking for in the first place.
         """
-        if recording_armed:
-            save_episode()
-        else:
+        if return_to_rest is not None and return_to_rest.active:
+            return
+        if not recording_armed:
             start_recording()
+        elif return_to_rest is not None:
+            return_to_rest.start()
+            print(
+                f"Returning to rest pose over {args_cli.return_to_rest_secs:.1f}s"
+                " -- grippers stay as they are; the episode is saved on arrival."
+            )
+        else:
+            save_episode()
 
     def start_recording():
         """button_x handler (vr_joint_ros2 / vr_joint_ros2_native only, see
@@ -2253,15 +2471,20 @@ def main():
         print("  ↑/↓        — pitch ±  |  ←/→ — yaw ±  |  [/] — roll ±")
     if requires_manual_arm:
         print("  X (Quest)  — press ONCE to release the robot and start recording; press AGAIN to")
-        print("               save the episode. Until the first press the robot stays at its rest")
+        print("               end the episode. Until the first press the robot stays at its rest")
         print("               pose and ignores your controllers, and nothing is saved. Line your")
         print("               arms up with the rest pose before the first press -- the robot takes")
         print("               your current pose in one step.")
+        if return_to_rest is not None:
+            print("               On the second press the robot drives itself back to the rest pose")
+            print(f"               over {args_cli.return_to_rest_secs:.1f}s (grippers held as-is) and the episode is")
+            print("               saved on arrival -- that return motion IS part of the demo. Let")
+            print("               go of your controllers; they are ignored until it finishes.")
         print("  Y (Quest)  — discard & reset episode (re-freezes the robot until X)")
         if args_cli.manual_save:
             print("  (--manual_save: the task's success condition will NOT end an episode; only")
             print("   button X or the N key will.)")
-    print("  N          — save episode as success")
+    print("  N          — save episode as success (immediately, with no return-to-rest)")
     print("  R          — discard & reset episode")
     print("  T          — ramp current pose to rest (matches reset_to_rest_pose.py) and watch")
     print("               the viewport for a pad collision -- doesn't record, doesn't reset")
@@ -2309,6 +2532,24 @@ def main():
                     gripper_state=left_gripper_state,
                     device=sim_device,
                 )
+            # The closing return-to-rest ramp overrides whatever the operator's controllers just
+            # asked for -- but only AFTER build_dual_action() has been called above, because that
+            # is also what polls the Quest buttons: skipping it for the duration of the ramp would
+            # miss the release of the very X press that started it, and the next press would then
+            # not read as a rising edge at all.
+            rtr_active = False
+            rtr_done = False
+            if return_to_rest is not None and return_to_rest.active:
+                rtr_active = True
+                # The gripper commands go IN so the first call can latch this step's live values
+                # (the button callback fired too early to read them -- see start()), and come back
+                # out below as the held ones every call after.
+                full_action, rtr_done = return_to_rest.advance(left_gripper_state, right_gripper_state)
+                # Keep the mirror broadcaster and the post-reset state in step with what is
+                # actually being commanded, rather than with the headset it is ignoring.
+                left_gripper_state = return_to_rest.left_gripper_cmd
+                right_gripper_state = return_to_rest.right_gripper_cmd
+
             # Enforce the arm gating. Both cases below are skipped for vr_joint_ros2_native, where
             # the action vector isn't what drives the robot -- that path is gated inside
             # ROS2JointCommandAction instead (--task_mode via cfg.locked, button X via
@@ -2343,16 +2584,27 @@ def main():
                         if force_norm > 1e-4:
                             print(f"[contact] openarm_right_left_finger vs cube_2 force: {force_norm:.3f} N")
 
+            # The ramp's last step has now been recorded, so the episode is complete -- export it.
+            # Deliberately after env.step(): saving on the step that merely *computes* the final
+            # target would cut the arrival itself out of every demo.
+            if rtr_done and return_to_rest is not None:
+                return_to_rest.stop()
+                print("Back at rest pose.")
+                save_episode()
+
             # Success check -- gated on recording_armed so a not-yet-armed episode
             # (requires_manual_arm modes, before X is pressed) can never auto-export.
             #
-            # Still EVALUATED under --manual_save, just never acted on: the evaluation is what
-            # drives the hand-over stage machine, and the progress print below is the only way to
-            # see which step of the sequence a stuck episode never reached.
+            # Still EVALUATED under --manual_save and during the return-to-rest ramp, just never
+            # acted on in either case: this call is what ticks the hand-over stage machine forward
+            # (see handover_success), and the progress print below is the only way to see which
+            # step of the sequence a stuck episode never reached. Not acting during the ramp is the
+            # point -- that episode is already committed to being exported on arrival, and an
+            # auto-export mid-ramp would truncate the very retreat it is recording.
             if success_term is not None and recording_armed:
                 succeeded = bool(success_term.func(env, **success_term.params)[0])
                 _report_handover_stage()
-                if succeeded and not args_cli.manual_save:
+                if succeeded and not args_cli.manual_save and not rtr_active:
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
                         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
@@ -2379,6 +2631,10 @@ def main():
             # Handle reset
             if should_reset:
                 print("Resetting environment...")
+                # Covers the discard path too (button Y / R mid-ramp): the override must be gone
+                # before env.reset(), or the next episode would open with the teleop still ignored.
+                if return_to_rest is not None:
+                    return_to_rest.stop()
                 env.sim.reset()
                 env.recorder_manager.reset()
                 env.reset()
