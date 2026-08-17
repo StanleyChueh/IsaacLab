@@ -59,6 +59,14 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --enable_cameras
 ```
 
+# Remove episode
+
+```
+./isaaclab.sh -p scripts/tools/remove_demos_hdf5.py \
+    --dataset_file logs/demos/pickup_pringles_VR_V7.hdf5 --episodes 3 7 \
+    --output logs/demos/pickup_pringles_VR_V7_fixed.hdf5
+```
+
 # Environment Setup
 
 If you want to change environment in IsaacSim, please refer to the following setting
