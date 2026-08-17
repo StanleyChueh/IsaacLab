@@ -911,7 +911,13 @@ class DataGenerator:
                 generated_states.extend(exec_results["states"])
                 generated_obs.extend(exec_results["observations"])
                 generated_actions.extend(exec_results["actions"])
-                generated_success = generated_success or exec_results["success"]
+                # Either the whole episode's success is the OR over its steps, or it is whatever
+                # the last step says -- see DataGenConfig.generation_success_at_final_state for
+                # which reading suits which task.
+                if self.env_cfg.datagen_config.generation_success_at_final_state:
+                    generated_success = exec_results["success"]
+                else:
+                    generated_success = generated_success or exec_results["success"]
 
             # Get the navigation state
             if self.env_cfg.datagen_config.use_navigation_controller:

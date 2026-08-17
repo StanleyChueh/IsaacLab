@@ -36,6 +36,21 @@ class DataGenConfig:
     Keeping failed demonstrations is useful for visualizing and debugging low success rates.
     """
 
+    generation_success_at_final_state: bool = False
+    """Whether an episode's success is the success term evaluated at its FINAL state.
+
+    If False (default), an episode counts as successful when the success term was true at ANY step
+    of it -- the success flags of every step are OR-ed together. That is the right reading for a
+    task whose success condition, once true, stays true (a stacked cube stays stacked), and it is
+    forgiving of a condition that flickers.
+
+    If True, only the last step is consulted. Use this when the success condition can be UNDONE by
+    what the robot does next, and undoing it should not be exported as a success -- a grasp that is
+    released, an object that is dropped after being lifted. Under the OR reading those episodes are
+    permanently labelled successful by the one frame where the condition held, and the frames that
+    give the lie to it are in the exported demo, teaching the policy the failure.
+    """
+
     max_num_failures: int = 50
     """Maximum number of failures allowed before stopping generation."""
 

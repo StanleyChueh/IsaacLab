@@ -62,10 +62,27 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Enable optional domain randomization (cube/pad color+texture, pad position jitter,"
-        " scene lighting, front-camera pose) while generating the dataset. Off by default."
-        " Only takes effect for tasks whose event cfg defines a matching randomized variant"
-        " (currently: the OpenArm pick-up-red-cube task family)."
+        "Enable optional domain randomization while generating the dataset. Off by default. What"
+        " gets randomized is chosen by --domain_randomization_profile. Only takes effect for tasks"
+        " whose event cfg defines a matching randomized variant (currently: the OpenArm"
+        " pick-up-red-cube task family)."
+    ),
+)
+parser.add_argument(
+    "--domain_randomization_profile",
+    type=str,
+    default="full",
+    choices=["full", "visual"],
+    help=(
+        "How strong the randomization from --enable_domain_randomization is (ignored without it)."
+        " 'full' (default, the original behavior) randomizes cube/pad color across the whole RGB"
+        " cube, pad position, lighting intensity over a 24x range INCLUDING a background skybox"
+        " swap, and all four camera poses. 'visual' is the mild appearance-only profile: lighting"
+        " intensity/brightness around nominal with NO background change, surface roughness, colour"
+        " SATURATION and brightness around each asset's authored colour (hue untouched, so the red"
+        " cube stays red), and camera angle on all four cameras -- pad position and the skybox are"
+        " left alone. Use 'visual' when 'full' produces images too far from the real setup to"
+        " train against."
     ),
 )
 # append AppLauncher cli args
@@ -131,20 +148,27 @@ def main():
         task_mode=args_cli.task_mode,
     )
 
-    # Optional domain randomization (cube/pad color+texture, pad position jitter, lighting,
-    # front-camera pose) -- opt-in via --enable_domain_randomization, off by default.
+    # Optional domain randomization -- opt-in via --enable_domain_randomization, off by default,
+    # with --domain_randomization_profile choosing how strong it is.
     if args_cli.enable_domain_randomization:
         from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.pickup_ik_abs_env_cfg import (
-            PickUpDomainRandomizationEventCfg,
             PickUpEventCfg,
+            attach_domain_randomization,
         )
 
         if isinstance(env_cfg.events, PickUpEventCfg):
-            env_cfg.events = PickUpDomainRandomizationEventCfg()
-            print(
-                "[DR] Domain randomization enabled: cube/pad color+texture, pad position jitter,"
-                " scene lighting, front-camera pose."
-            )
+            # Attaches to the existing events cfg rather than replacing it -- the task mode has
+            # already patched that object, and a fresh instance would throw those patches away
+            # (see attach_domain_randomization's docstring for what exactly breaks).
+            profile = args_cli.domain_randomization_profile
+            attached = attach_domain_randomization(env_cfg, profile)
+            print(f"[DR] Domain randomization enabled (profile '{profile}'): {', '.join(attached)}")
+            if profile == "visual":
+                print(
+                    "[DR] Lighting varies WITHOUT a background/skybox swap; object and pad vary in"
+                    " saturation/brightness/roughness with hue unchanged; camera angle varies on"
+                    " all four cameras; pad position is not jittered."
+                )
         else:
             print(
                 f"[DR] --enable_domain_randomization was set, but task '{env_name}' has no matching"

@@ -30,7 +30,7 @@ action represents), then this:
         --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \\
         --num_rollouts 5 \\
         --horizon 300 \\
-        --cameras front_cam,body_cam,wrist_cam
+        --cameras right_wrist_cam,wrist_cam,body_cam
 
 State (8D): openarm_left_joint1..7 + openarm_left_finger_joint1, extracted via LJ_IDX below --
 the physics Articulation's joint order is INTERLEAVED dual-arm (even indices 0,2,4,...,12 = left
@@ -68,10 +68,13 @@ parser.add_argument("--horizon",     type=int, default=300,  help="Max steps per
 parser.add_argument("--port",        type=int, default=5556, help="Policy server TCP port")
 parser.add_argument("--seed",        type=int, default=42)
 parser.add_argument(
-    "--cameras", type=str, default="front_cam,body_cam,wrist_cam",
+    "--cameras", type=str, default="right_wrist_cam,wrist_cam,body_cam",
     help=(
         "Comma-separated env camera names, IN POLICY SLOT ORDER (1st -> camera1, 2nd -> camera2, "
-        "...). MUST match the --rename_map used for lerobot-train on this exact checkpoint. "
+        "...). The default is the OpenArm pick-up task's three cameras in the order"
+        " convert_hdf5_to_lerobot.py is documented to convert them (see README). front_cam used"
+        " to lead this list but the task no longer builds that sensor at all. "
+        "MUST match the --rename_map used for lerobot-train on this exact checkpoint. "
         "Sending the wrong env camera into a policy slot is silent (no error, no crash)."
     ),
 )

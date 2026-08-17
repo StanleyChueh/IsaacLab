@@ -144,17 +144,40 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 # Convert HDF5 to LeRobot format 
 
 ```
-python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 30 --cameras right_wrist_cam wrist_cam body_cam
+python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_V7     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 20 --cameras right_wrist_cam wrist_cam body_cam
+```
+
+20 fps is the env's actual control rate — `sim.dt = 0.01` with `decimation = 5`
+gives one recorded step every 0.05 s (see `stack_env_cfg.py`). It is also the
+script's default, so passing a different `--fps` only mislabels the timestamps.
+
+The task no longer builds `front_cam` (see `self.scene.front_cam = None` in
+`pickup_ik_abs_env_cfg.py`), so only these three views exist. Keep this order —
+it is the policy slot order used by `--rename_map` at train time and by
+`--cameras` at eval time.
+
+# Push dataset to the Hub
+
+`lerobot-train` resolves `--dataset.repo_id` through the Hub, so the converted
+dataset has to be uploaded first. The script also tags the repo with the
+`codebase_version` from `meta/info.json` (`v3.0`) — without that tag the upload
+looks fine but `lerobot-train` dies with `RevisionNotFoundError: Your dataset
+must be tagged with a codebase version`. Edit `repo_id` in the script to match
+the `--output` directory name above, then:
+
+```
+conda activate lerobot
+python scripts/push_to_hub.py
 ```
 
 # Train in LeRobot format
 
 ```
 cd ~/CSL/lerobot/ && conda activate lerobot
- lerobot-train   --policy.path=lerobot/smolvla_base   --dataset.repo_id=ethanCSL/openarm_visuomotor   --batch_size=16   --steps=40000   --output_dir=outputs/train/openarm_visuomotor   --job_name=my_smolvla_training   --policy.device=cuda   --policy.repo_id=ethanCSL/openarm_visuomotor  --wandb.enable=false   --rename_map='{
-    "observation.images.front_cam": "observation.images.camera1",
-    "observation.images.body_cam":   "observation.images.camera2",
-    "observation.images.wrist_cam":  "observation.images.camera3"
+ lerobot-train   --policy.path=lerobot/smolvla_base   --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V7   --batch_size=16   --steps=40000   --output_dir=outputs/train/openarm_visuomotor   --job_name=my_smolvla_training   --policy.device=cuda   --policy.repo_id=ethanCSL/openarm_visuomotor  --wandb.enable=false   --rename_map='{
+    "observation.images.right_wrist_cam": "observation.images.camera1",
+    "observation.images.wrist_cam":       "observation.images.camera2",
+    "observation.images.body_cam":        "observation.images.camera3"
   }'   --dataset.video_backend=pyav
 ```
 
@@ -177,8 +200,13 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
     --num_rollouts 5 --horizon 300 --enable_cameras \
-    --cameras body_cam,wrist_cam
+    --cameras right_wrist_cam,wrist_cam,body_cam
 ```
+
+`--cameras` must list the env cameras in the same slot order as the
+`--rename_map` this checkpoint was trained with (1st → camera1, 2nd → camera2,
+…). A mismatch is silent — no error, just a policy fed the wrong view, which
+usually shows up as degenerate behaviour like only ever raising the arm.
 
 # Run in Real-world
 

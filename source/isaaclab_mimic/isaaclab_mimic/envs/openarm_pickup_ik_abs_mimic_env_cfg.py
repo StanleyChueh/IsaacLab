@@ -40,6 +40,14 @@ class OpenArmPickUpIKAbsMimicEnvCfg(OpenarmPickUpRedCubeEnvCfg, MimicEnvCfg):
         self.datagen_config.generation_guarantee = True
         self.datagen_config.generation_keep_failed = True
         self.datagen_config.generation_num_trials = 10
+        # Judge the episode by how it ENDS, not by whether the success condition was ever
+        # momentarily true. Every mode here succeeds by holding the can -- and a hold is exactly
+        # the kind of condition the default OR-over-steps reading gets wrong, because the robot can
+        # undo it and routinely does: measured on logs/demos/pickup_generated_V6.hdf5, all 20
+        # episodes were exported as successful while 12 of them end with the can lying on the pad
+        # or off the table. Those frames are IN the exported demo, so the OR reading does not just
+        # mislabel the episode, it teaches the policy to let go.
+        self.datagen_config.generation_success_at_final_state = True
         # KEY: False = both subtasks come from ONE source demo → no seam discontinuity.
         # True would pick a different source demo for each subtask, creating a hard
         # EEF-pose jump at the boundary that is the main cause of jerkiness.

@@ -208,37 +208,25 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
     )
 
     # ── Cameras ────────────────────────────────────────────────────────────
-    # front_cam is env-anchored (fixed relative to the env origin, not the robot) -- jitter
-    # its world position and where it's aimed. wrist/right_wrist/body cams are mounted on
-    # moving robot links, so they use randomize_mounted_camera_pose (mount-offset jitter
-    # relative to their parent link) instead -- see that function's docstring for why a
-    # world-frame jitter like front_cam's would be wrong for them.
-    randomize_camera_pose = EventTerm(
-        func=openarm_domain_randomization.randomize_fixed_camera_pose,
-        mode="reset",
-        params={
-            # Eye and look-at target jitter independently, so their worst-case combination (both
-            # pushed to opposite extremes) matters more than either range alone -- e.g. the old
-            # (0.15, 0.08) pair could swing the aim ~20 deg off nominal, enough to lose the
-            # robot/workspace out of frame (front_cam's half-FOV is ~24 deg). Halved below to
-            # keep the worst case comfortably inside the frame while still varying the viewpoint.
-            "pos_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08), "z": (-0.05, 0.05)},
-            "look_at_offset": (0.45, 0.0, 0.15),
-            "look_at_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.03, 0.03)},
-            "asset_cfg": SceneEntityCfg("front_cam"),
-        },
-    )
+    # front_cam's world-pose jitter (randomize_fixed_camera_pose) is switched off along with the
+    # camera itself -- OpenarmPickUpRedCubeEnvCfg.__post_init__ sets `self.scene.front_cam = None`,
+    # so SceneEntityCfg("front_cam") would have nothing to resolve against at reset. `None` is the
+    # idiom EventManager._prepare_terms understands for "skip this term entirely".
+    randomize_camera_pose = None
 
+    # wrist/right_wrist/body cams are mounted on moving robot links, so they use
+    # randomize_mounted_camera_pose (mount-offset jitter relative to their parent link) rather
+    # than a world-frame jitter -- see that function's docstring for why.
+    #
     # Kept moderate (not maxed out like color/lighting above): these mounts sit close to the
     # gripper and are the views the grasp itself depends on, so over-jittering risks losing the
-    # cube/gripper out of frame the same way front_cam did before it got dialed back.
+    # cube/gripper out of frame.
     randomize_wrist_cam_pose = EventTerm(
         func=openarm_domain_randomization.randomize_mounted_camera_pose,
         mode="reset",
         params={
             "pos_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
-            "parent_body_name": "openarm_left_ee_tcp",
             "asset_cfg": SceneEntityCfg("wrist_cam"),
         },
     )
@@ -249,7 +237,6 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         params={
             "pos_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
-            "parent_body_name": "openarm_right_ee_tcp",
             "asset_cfg": SceneEntityCfg("right_wrist_cam"),
         },
     )
@@ -260,7 +247,6 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         params={
             "pos_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
-            "parent_body_name": "openarm_body_link",
             "asset_cfg": SceneEntityCfg("body_cam"),
         },
     )
@@ -273,6 +259,161 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
     # this event cfg on top of the two (cube/pad) that already caused a real, observed failure.
 
 
+@configclass
+class PickUpVisualDomainRandomizationEventCfg(PickUpDomainRandomizationEventCfg):
+    """A deliberately mild, appearance-only alternative to `PickUpDomainRandomizationEventCfg`.
+
+    Selected by generate_dataset.py's `--domain_randomization_profile visual`. Covers exactly four
+    axes -- lighting, surface finish, colour saturation, and camera angle on all three mounted
+    cameras -- and nothing else. What it leaves alone is as much the point as what it varies:
+
+    * **No skybox swap.** The full profile replaces the dome light's HDR environment map with one
+      of thirteen unrelated scenes (a parking lot, a hospital room, a photo studio), which changes
+      the entire background AND the ambient colour cast the whole scene is lit by. Here the light
+      only brightens and dims; the background it sits in stays put.
+    * **No hue randomization.** The full profile samples each asset's diffuse colour as an
+      absolute RGB triple over almost the whole cube, so cube_2 comes out green or blue as often
+      as red. This profile perturbs SATURATION and brightness around the authored colour and
+      leaves hue fixed (see `randomize_visual_saturation`), so a red cube stays a red cube -- a
+      policy trained on this data can still use colour to find the object, which in a task named
+      "PickUp-RedCube" is a cue worth keeping rather than training away.
+    * **No pad position jitter.** That moves the geometry the demo was generated against, not its
+      appearance, and appearance is all this profile is for.
+
+    Ranges are set to roughly +-50% of nominal for lighting (3000 intensity, 0.75 grey -- see
+    `stack_env_cfg.py`) and +-30% for saturation, versus the full profile's 0.17x-4x intensity and
+    effectively unbounded colour. Camera jitter is carried over from the full profile unchanged:
+    those ranges were already dialled back once to keep the workspace in frame (see the comments
+    on `randomize_camera_pose` above), and camera angle is a variation this profile explicitly
+    wants.
+    """
+
+    randomize_light = EventTerm(
+        func=openarm_domain_randomization.randomize_scene_lighting,
+        mode="reset",
+        params={
+            # Nominal is 3000 / 0.75 grey. Wide enough that a policy cannot assume one exposure,
+            # narrow enough that the workspace is never blown out or nearly black -- the two
+            # extremes of the full profile's (500, 12000), where the cube is genuinely hard to see.
+            "intensity_range": (1800.0, 4800.0),
+            "color_range": (0.6, 0.9),
+            # Omitted on purpose -- this is the background swap. Leaving it None makes
+            # randomize_scene_lighting skip the texture write entirely.
+            "skybox_textures": None,
+            "asset_cfg": SceneEntityCfg("light"),
+        },
+    )
+
+    randomize_cube_2_color = EventTerm(
+        func=openarm_domain_randomization.randomize_visual_saturation,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("cube_2"),
+            "saturation_range": (0.7, 1.3),
+            "value_range": (0.85, 1.15),
+            # Roughness is the only "texture" knob a flat UsdPreviewSurface offers (there is no
+            # image map on these assets to swap -- see the NOTE in the full profile above). Kept
+            # off the extremes: a 0.0 mirror finish turns the pad into a specular highlight that
+            # tracks the camera, which is a much larger appearance change than a matte/satin shift.
+            "roughness_range": (0.25, 0.75),
+        },
+    )
+
+    randomize_pad_color = EventTerm(
+        func=openarm_domain_randomization.randomize_visual_saturation,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("workspace_pad"),
+            "saturation_range": (0.7, 1.3),
+            "value_range": (0.85, 1.15),
+            "roughness_range": (0.25, 0.75),
+        },
+    )
+
+    # Geometry, not appearance -- switched off. `None` is how EventManager._prepare_terms is told
+    # to skip an inherited term entirely (it `continue`s on any term whose cfg is None), which is
+    # the same idiom the task cfgs elsewhere in this tree use to drop a manager they don't want.
+    randomize_pad_position = None
+
+    # The three mounted-camera angle terms are inherited from the parent unchanged and
+    # deliberately not restated here -- their mount-offset jitter is already the moderate range
+    # this profile wants. (front_cam and its jitter term are off entirely; see the parent.)
+
+
+def _manipulated_object_name(env_cfg) -> str:
+    """The scene entity the task actually manipulates, which is NOT always `cube_2`.
+
+    `apply_task_mode` (openarm_task_modes.py) replaces cube_2 with the can in every mode --
+    `env_cfg.scene.cube_2 = None`, `env_cfg.scene.can = RigidObjectCfg(...)` -- and the Mimic cfg
+    calls it unconditionally from its own `__post_init__`, so by the time domain randomization is
+    attached there is usually no cube_2 left to randomize. Rather than guess, read the answer off
+    the spawn term that same function installs (`randomize_object`, whose `asset_cfg` names the
+    object it moves each reset); fall back to cube_2 only when no mode was ever applied.
+    """
+    spawn_term = getattr(env_cfg.events, "randomize_object", None)
+    name = spawn_term.params["asset_cfg"].name if spawn_term is not None else "cube_2"
+    if getattr(env_cfg.scene, name, None) is None:
+        raise ValueError(
+            f"Cannot attach domain randomization: the task's manipulated object '{name}' is not in"
+            f" the scene cfg. Available: {sorted(k for k, v in vars(env_cfg.scene).items() if v is not None)}"
+        )
+    return name
+
+
+DOMAIN_RANDOMIZATION_PROFILES = {
+    "full": PickUpDomainRandomizationEventCfg,
+    "visual": PickUpVisualDomainRandomizationEventCfg,
+}
+"""Selectable randomization strengths -- see generate_dataset.py's --domain_randomization_profile."""
+
+
+def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
+    """Add *profile*'s randomization terms to `env_cfg.events` IN PLACE, and return their names.
+
+    Deliberately NOT `env_cfg.events = PickUpDomainRandomizationEventCfg()`. That was the original
+    approach and it silently discarded every event term `apply_task_mode` had already installed on
+    the cfg, because a fresh cfg instance carries the class defaults rather than the patched ones.
+    Three things were lost, in increasing order of subtlety:
+
+    1. `randomize_cube_2 = None` reverted to the inherited term, which calls
+       `reset_root_state_uniform` on a cube_2 the task mode had deleted from the scene -- an
+       immediate `KeyError: "Scene entity with key 'cube_2' not found"` on the very first
+       `env.reset()`.
+    2. `randomize_object` (the can's per-reset spawn pose) disappeared, so had the crash not
+       happened first, every generated episode would have started with the can at one fixed pose.
+    3. In handover mode, `reset_handover_stage` disappeared -- the stage machine is stateful, and
+       without its reset term it would have carried one episode's progress into the next.
+
+    Attaching only the terms the DR cfg ADDS (its fields minus `PickUpEventCfg`'s) leaves all of
+    that untouched. Terms aimed at cube_2 are retargeted onto whatever object the task really has
+    (see :func:`_manipulated_object_name`) for the same reason: the appearance terms were written
+    against the pre-task-mode scene.
+    """
+    if profile not in DOMAIN_RANDOMIZATION_PROFILES:
+        raise ValueError(
+            f"Unknown domain randomization profile '{profile}'."
+            f" Expected one of {sorted(DOMAIN_RANDOMIZATION_PROFILES)}."
+        )
+
+    base_term_names = set(vars(PickUpEventCfg()))
+    dr_cfg = DOMAIN_RANDOMIZATION_PROFILES[profile]()
+    object_name = _manipulated_object_name(env_cfg)
+
+    attached = []
+    for term_name, term in vars(dr_cfg).items():
+        if term_name in base_term_names:
+            continue  # a base term -- whatever apply_task_mode left there is the correct version
+        if term is not None:
+            asset_cfg = term.params.get("asset_cfg")
+            if asset_cfg is not None and asset_cfg.name == "cube_2":
+                term.params["asset_cfg"] = SceneEntityCfg(object_name)
+            attached.append(term_name)
+        # None is attached too, not skipped: that is how a profile switches OFF a term it inherits
+        # from another profile (EventManager._prepare_terms skips any term whose cfg is None).
+        setattr(env_cfg.events, term_name, term)
+    return attached
+
+
 # ── Observations ──────────────────────────────────────────────────────────────
 
 @configclass
@@ -281,10 +422,9 @@ class PickUpObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        front_cam = ObsTerm(
-            func=mdp_core.image,
-            params={"sensor_cfg": SceneEntityCfg("front_cam"), "data_type": "rgb", "normalize": False},
-        )
+        # front_cam is switched off for this task -- see OpenarmPickUpRedCubeEnvCfg.__post_init__,
+        # where `self.scene.front_cam = None` removes the sensor itself. The three mounted cams
+        # below are the ones the grasp actually depends on.
         wrist_cam = ObsTerm(
             func=mdp_core.image,
             params={"sensor_cfg": SceneEntityCfg("wrist_cam"), "data_type": "rgb", "normalize": False},
@@ -374,6 +514,20 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         self.scene.cube_1 = None
         self.scene.cube_3 = None
 
+        # ── Drop front_cam ───────────────────────────────────────────────────
+        # The parent visuomotor cfg builds four non-tiled CameraCfg sensors at 640x480, and a
+        # non-tiled Camera is one independent RTX render product PER ENV -- so the camera count
+        # multiplies with --num_envs and is what runs a 16 GB card out of VRAM during dataset
+        # generation. front_cam is the one that pays for itself least here: it is a fixed
+        # table-side view, while the grasp/hand-over this task is about is decided by the two
+        # wrist cams and body_cam. Dropping it removes one render product per env.
+        #
+        # Removing the sensor is not enough on its own -- `image_obs_list` below and the
+        # PolicyCfg obs term and the DR jitter term all name it, and each would fail to resolve
+        # against a scene that no longer has it. All three are handled (see PickUpObservationsCfg
+        # and PickUpDomainRandomizationEventCfg.randomize_camera_pose).
+        self.scene.front_cam = None
+
         # ── Observations ─────────────────────────────────────────────────────
         self.observations.policy = PickUpObservationsCfg.PolicyCfg()
         self.observations.subtask_terms = PickUpObservationsCfg.SubtaskCfg()
@@ -459,4 +613,4 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
             close_command_expr={"openarm_right_finger_joint1": 0.0, "openarm_right_finger_joint2": 0.0},
         )
         
-        self.image_obs_list = ["front_cam", "wrist_cam", "right_wrist_cam", "body_cam"]
+        self.image_obs_list = ["wrist_cam", "right_wrist_cam", "body_cam"]

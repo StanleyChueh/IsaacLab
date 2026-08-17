@@ -18,9 +18,10 @@ the action format is a RELATIVE delta pose per arm (same pattern as Franka IK-Re
 Both arms are exposed as Mimic end-effectors ("left_eef" / "right_eef"). Which of them
 actually does the work -- and with what subtask sequence -- is decided by the task mode
 applied to the cfg (see openarm_task_modes.apply_task_mode): in the single-arm modes one arm
-gets the grasp/lift sequence and the other gets a single idle subtask; in handover mode both
-carry real sequences tied together by a SEQUENTIAL constraint. This class stays mode-agnostic
-and simply serves whatever end-effector keys the cfg declares.
+gets the grasp/lift sequence and the other gets a single idle subtask; in handover mode the
+giving arm gets two subtasks, the receiving arm one, and there are no constraints -- the two
+arms stay in step because they replay one source demo. This class stays mode-agnostic and
+simply serves whatever end-effector keys the cfg declares.
 """
 
 from collections.abc import Sequence
@@ -133,21 +134,23 @@ class OpenArmPickUpIKAbsMimicEnv(ManagerBasedRLMimicEnv):
     def _hold_giving_hand_until_taken(self, action: torch.Tensor, env_id: int) -> None:
         """Clamp the giving hand shut, in place, until the receiving hand has really taken the can.
 
-        Two jobs, one load-bearing and one backstop, both for openarm_task_modes'
-        ``_handover_subtask_configs``:
+        THE only thing ordering the two hands, and the reason openarm_task_modes'
+        ``_handover_subtask_configs`` can get away with no task constraints at all. Generation
+        replays each segment by LENGTH, so nothing else stops the giving hand's replayed "open"
+        command from arriving before the receiving hand has actually closed -- and the can going to
+        the floor instead of to the other hand is the dominant failure of generated hand-overs
+        (40 of the 69 failures in logs/demos/pickup_pringle_V7_generated_failed.hdf5), not a corner
+        case. This reads the actual scene, so no amount of timing drift between the arms can produce
+        a release before a take.
 
-        * While the giving arm's release subtask WAITS on its sequential constraint (holding at its
-          first waypoint until the receiving hand has closed), the gripper command replayed at that
-          waypoint comes from the source demo -- and in half of the recorded demos the source jaws
-          are already open at that boundary. Without this clamp the hand would open the moment the
-          wait began. The constraint orders the ARM segments; only this orders the JAWS.
-        * Backstop against drift: generation replays segments by length, so tracking drift between
-          the arms can move the release relative to the take. This reads the actual scene, so no
-          amount of drift can produce a release before a take.
+        It used to have a second, narrower job: holding the jaws while the giving arm's release
+        subtask waited on a SEQUENTIAL constraint, since in half the recorded demos the source jaws
+        are already open at that boundary. Those constraints are gone, and with them the segment
+        that waited -- but the jaw problem they exposed is unchanged, which is why the clamp stays.
 
-        The condition is built from two subtask term signals the task mode already publishes, rather
-        than from a fresh distance/jaw test, so there is exactly one definition of "this hand is
-        holding the can" in play (an earlier hand-over bug came from two descriptions of one event
+        The condition is built from two observations the task mode already publishes, rather than
+        from a fresh distance/jaw test, so there is exactly one definition of "this hand is holding
+        the can" in play (an earlier hand-over bug came from two descriptions of one event
         disagreeing):
 
         * ``presented`` -- the giving hand has the can UP. Until then there is nothing to drop and
@@ -269,6 +272,46 @@ class OpenArmPickUpIKAbsMimicEnv(ManagerBasedRLMimicEnv):
             eef_name: actions[:, _ARM_LAYOUT[eef_name][1] : _ARM_LAYOUT[eef_name][1] + 1]
             for eef_name in self._eef_names()
         }
+
+    def get_object_poses(self, env_ids: Sequence[int] | None = None):
+        """Object poses for Mimic, with the can's ORIENTATION discarded (identity rotation).
+
+        Mimic re-anchors a source segment by ``T_now @ inv(T_source)`` on the object's full 4x4
+        pose, so whatever rotation separates the source object from the current one is applied to
+        every target EEF pose in the segment. For this task that rotation is noise, and large
+        noise:
+
+        * the can is a round cylinder standing upright, and :func:`reset_object_free` forces its
+          spawn orientation to a constant -- so between two episodes the object genuinely differs
+          only in WHERE it stands. The rotation term is not describing task variation at all.
+        * once a hand picks it up, its orientation is a consequence of how it is being held. It
+          tilts, and it turns about its own (symmetric) axis. Measured at the mid-air subtask
+          boundaries across the ten source demos in logs/demos/pickup_pringle_annotated_V6.hdf5,
+          two demos' can orientations differ by a median 15-23 deg and by up to 59 deg -- and the
+          hand-over's later segments are anchored exactly there ('presented', 'reach_left',
+          'grasp_left', 'departed_right'). Anchored on the pad instead, where the can is upright
+          by construction, the same spread is 6.6 deg.
+
+        So picking a different source demo -- which ``selection_strategy`` does every episode --
+        rotates the entire remaining trajectory by a random ~20 deg about a can-shaped frame
+        hanging in mid-air. That is what puts the arm in poses no demo ever visited, and it is what
+        aims the receiving arm's carry-away into the table: measured over
+        logs/demos/pickup_generated_V6.hdf5 the left TCP dips to 0.318 m against a pad top of
+        0.280 m, where no source demo goes below 0.385 m.
+
+        Dropping the rotation makes the transform a pure translation, which is the whole of the
+        variation this task actually has.
+
+        Note:
+            Source datasets annotated BEFORE this override recorded the full rotation, and mixing
+            the two is worse than either: the delta becomes ``inv(R_source)``, a systematic
+            rotation, instead of cancelling. Re-run annotate_demos.py on the source demos after
+            changing this.
+        """
+        object_poses = super().get_object_poses(env_ids=env_ids)
+        for name, pose in object_poses.items():
+            pose[..., :3, :3] = torch.eye(3, device=pose.device, dtype=pose.dtype)
+        return object_poses
 
     def get_subtask_term_signals(self, env_ids: Sequence[int] | None = None) -> dict[str, torch.Tensor]:
         """Return every subtask termination signal the task mode published.

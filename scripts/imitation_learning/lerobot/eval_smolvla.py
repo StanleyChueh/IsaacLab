@@ -48,10 +48,15 @@ parser.add_argument("--horizon",     type=int, default=300,  help="Max steps per
 parser.add_argument("--port",        type=int, default=5556, help="Policy server TCP port")
 parser.add_argument("--seed",        type=int, default=42)
 parser.add_argument(
-    "--cameras", type=str, default="front_cam,body_cam,wrist_cam",
+    "--cameras", type=str, default="right_wrist_cam,wrist_cam,body_cam",
     help=(
         "Comma-separated env camera names, IN POLICY SLOT ORDER (1st -> camera1, 2nd -> camera2, "
-        "...). MUST match the --rename_map used for lerobot-train on this exact checkpoint --"
+        "...). The default is the OpenArm pick-up task's three cameras in the order"
+        " convert_hdf5_to_lerobot.py is documented to convert them (see README). front_cam used"
+        " to lead this list but the task no longer builds that sensor at all -- naming a camera"
+        " the env does not have costs you the WHOLE slot (its cameraN key is simply absent from"
+        " what is sent, see _get_cameras), it does not shift the others up. "
+        "MUST match the --rename_map used for lerobot-train on this exact checkpoint --"
         " e.g. a 2-camera run trained with"
         " --rename_map='{\"observation.images.body_cam\":\"observation.images.camera1\","
         "\"observation.images.wrist_cam\":\"observation.images.camera2\"}' needs"

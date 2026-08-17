@@ -7,7 +7,13 @@ Run with the lerobot conda env:
       --hdf5 logs/demos/pickup.hdf5 \\
       --output ~/datasets/openarm \\
       --task "Pick up the red cube." \\
-      --fps 30 --cameras front_cam wrist_cam body_cam
+      --fps 30 --cameras right_wrist_cam wrist_cam body_cam
+
+--cameras names are matched against what the HDF5 actually contains and any that are missing
+are dropped with a warning (see `active_cameras`), so an over-long list is harmless here --
+unlike eval_smolvla*.py's --cameras, where the position in the list IS the policy slot. The
+OpenArm pick-up task used to record a fourth view, front_cam; it no longer builds that sensor,
+so datasets generated after that change have only the three above.
 
 Scalable streaming pipeline — RAM usage is O(one episode), not O(all episodes).
 Handles 1000+ episodes without OOM.

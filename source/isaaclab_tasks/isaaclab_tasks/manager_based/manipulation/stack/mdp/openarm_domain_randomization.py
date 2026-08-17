@@ -12,6 +12,7 @@ and generation runs are unaffected unless a caller explicitly asks for randomiza
 
 from __future__ import annotations
 
+import colorsys
 import random
 from typing import TYPE_CHECKING
 
@@ -150,6 +151,176 @@ def randomize_visual_color(
             shader_prim.GetAttribute("inputs:roughness").Set(random.uniform(*roughness_range))
 
 
+_DIFFUSE_COLOR_ATTRS = ("inputs:diffuseColor", "inputs:diffuse_color_constant", "inputs:diffuse_tint")
+"""Diffuse-colour attribute names, most specific first.
+
+`UsdPreviewSurface` (what a `PreviewSurfaceCfg` override creates) calls it `inputs:diffuseColor`;
+the OmniPBR/MDL shaders inside a prop's own USD file call it `inputs:diffuse_color_constant`, with
+`inputs:diffuse_tint` as a multiplier on top. Tint is last because it defaults to white, and white
+has zero saturation -- scaling the saturation of white leaves it white, so it is only worth writing
+when nothing better exists."""
+
+_ROUGHNESS_ATTRS = ("inputs:roughness", "inputs:reflection_roughness_constant")
+"""Same idea for surface finish: UsdPreviewSurface name first, OmniPBR/MDL name second."""
+
+_NO_MATERIAL_WARNED_ATTR = "_openarm_dr_no_material_warned"
+
+
+def _asset_prim_path(asset, env_id: int) -> str:
+    """The concrete (non-regex) prim path of *asset* in env *env_id* -- see
+    :func:`_resolve_preview_surface_shaders` for why `asset.cfg.prim_path` needs substituting."""
+    if hasattr(asset, "cfg"):
+        return asset.cfg.prim_path.replace("env_.*", f"env_{env_id}")
+    return asset.prim_paths[env_id]
+
+
+def _resolve_material_shaders(asset, env_ids: torch.Tensor) -> list[list]:
+    """Every Shader prim worth randomizing for each env id -- a superset of
+    :func:`_resolve_preview_surface_shaders`, which only ever finds a `PreviewSurfaceCfg` override.
+
+    That narrower resolver silently returns nothing for any asset spawned straight from a USD file
+    without a `visual_material` override, because `spawn_from_usd` only creates the `material` prim
+    when `cfg.visual_material is not None` (`from_files.py`). The can that `apply_task_mode`
+    substitutes for cube_2 is exactly such an asset -- so an appearance term pointed at it did
+    nothing at all, every reset, without a word. That is the worst possible failure for a
+    randomization term: the dataset looks randomized and isn't.
+
+    So: use the override's shader when there is one (it is the material actually bound, and the one
+    whose authored colour the task cfg chose), and otherwise fall back to whatever shaders the
+    prop's own USD brought with it.
+    """
+    from pxr import Usd
+
+    stage = get_current_stage()
+    resolved = []
+    for env_id in env_ids.tolist():
+        root = _asset_prim_path(asset, env_id)
+        # Both override locations spawn_preview_surface can bind at -- see
+        # _resolve_preview_surface_shaders' docstring for why they differ per spawn function.
+        override = next(
+            (
+                prim
+                for prim in (
+                    stage.GetPrimAtPath(f"{root}/material/Shader"),
+                    stage.GetPrimAtPath(f"{root}/geometry/material/Shader"),
+                )
+                if prim.IsValid()
+            ),
+            None,
+        )
+        if override is not None:
+            resolved.append([override])
+            continue
+        root_prim = stage.GetPrimAtPath(root)
+        resolved.append(
+            [p for p in Usd.PrimRange(root_prim) if p.GetTypeName() == "Shader"]
+            if root_prim.IsValid()
+            else []
+        )
+    return resolved
+
+
+def _first_present_attr(shader_prim, names: tuple[str, ...]):
+    """The first of *names* this shader actually has, or None -- shaders differ by type, so the
+    caller cannot assume any single attribute name exists."""
+    for name in names:
+        if shader_prim.HasAttribute(name):
+            return shader_prim.GetAttribute(name)
+    return None
+
+
+_BASE_COLOR_CACHE_ATTR = "_openarm_dr_base_diffuse_colors"
+
+
+def _base_diffuse_color(env, color_attr) -> tuple[float, float, float]:
+    """The shader's ORIGINAL diffuse color, latched the first time it is asked for.
+
+    :func:`randomize_visual_saturation` perturbs relative to the nominal color, so it has to read
+    that nominal value from somewhere. Reading the shader live every reset would instead perturb
+    the *previous* episode's already-perturbed color, and repeated multiplication by a mean-1.0
+    factor is a random walk -- saturation would drift toward 0 or 1 over a long generation run and
+    the "+-20%" the cfg asks for would stop meaning anything by trial 50.
+
+    Cached on the env object (keyed by the shader's prim path, which is unique per asset AND per
+    env) rather than in a class instance, for the reason in this module's header: these terms must
+    stay plain functions.
+    """
+    cache = getattr(env, _BASE_COLOR_CACHE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(env, _BASE_COLOR_CACHE_ATTR, cache)
+    key = str(color_attr.GetPath())
+    if key not in cache:
+        value = color_attr.Get()
+        cache[key] = (1.0, 1.0, 1.0) if value is None else (float(value[0]), float(value[1]), float(value[2]))
+    return cache[key]
+
+
+def randomize_visual_saturation(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    saturation_range: tuple[float, float] = (0.7, 1.3),
+    value_range: tuple[float, float] = (0.85, 1.15),
+    hue_range: tuple[float, float] = (0.0, 0.0),
+    roughness_range: tuple[float, float] | None = None,
+):
+    """Perturb an asset's appearance AROUND its authored color, in HSV, independently per env id.
+
+    The difference from :func:`randomize_visual_color` is what stays fixed. That one samples an
+    absolute RGB triple, so the red cube comes out green, blue or brown -- a hue randomization,
+    which is the strongest visual perturbation available and destroys any color cue a policy could
+    legitimately use to find the object it was told to pick up. This one multiplies saturation and
+    value by factors around 1.0 and leaves hue alone by default, so the cube stays recognisably
+    red while its vividness and brightness vary: the lighting/camera-response variation a real
+    camera actually produces, rather than a different object.
+
+    ``saturation_range``/``value_range`` are MULTIPLIERS on the base color's S and V (so
+    ``(1.0, 1.0)`` disables that axis); ``hue_range`` is an ADDITIVE shift in fractions of the
+    colour wheel, wrapping at 1.0, and defaults to no shift at all. ``roughness_range`` is the
+    absolute surface-finish range, same as :func:`randomize_visual_color` -- the closest thing to
+    "texture" this material has, since these assets carry a flat ``UsdPreviewSurface`` with no
+    image map to swap (see the NOTE in PickUpDomainRandomizationEventCfg for why true texture
+    swapping is not wired up here).
+    """
+    asset = env.scene[asset_cfg.name]
+    written = 0
+    for shader_prims in _resolve_material_shaders(asset, env_ids):
+        for shader_prim in shader_prims:
+            color_attr = _first_present_attr(shader_prim, _DIFFUSE_COLOR_ATTRS)
+            if color_attr is None:
+                continue
+
+            h, s, v = colorsys.rgb_to_hsv(*_base_diffuse_color(env, color_attr))
+            h = (h + random.uniform(*hue_range)) % 1.0
+            s = min(1.0, max(0.0, s * random.uniform(*saturation_range)))
+            v = min(1.0, max(0.0, v * random.uniform(*value_range)))
+            color_attr.Set(colorsys.hsv_to_rgb(h, s, v))
+            written += 1
+
+            if roughness_range is not None:
+                roughness_attr = _first_present_attr(shader_prim, _ROUGHNESS_ATTRS)
+                if roughness_attr is not None:
+                    roughness_attr.Set(random.uniform(*roughness_range))
+
+    # A randomization term that quietly does nothing produces a dataset that looks randomized and
+    # is not -- which is only discoverable by training on it and wondering why. Say so instead,
+    # once per asset, so a missing material shows up in the generation log rather than in a model.
+    if written == 0:
+        warned = getattr(env, _NO_MATERIAL_WARNED_ATTR, None)
+        if warned is None:
+            warned = set()
+            setattr(env, _NO_MATERIAL_WARNED_ATTR, warned)
+        if asset_cfg.name not in warned:
+            warned.add(asset_cfg.name)
+            print(
+                f"[DR][WARNING] '{asset_cfg.name}' has no shader with any of {_DIFFUSE_COLOR_ATTRS};"
+                " its colour/saturation is NOT being randomized. Lighting and camera randomization"
+                " are unaffected. Give the asset a PreviewSurfaceCfg visual_material if you need"
+                " its appearance varied."
+            )
+
+
 def randomize_fixed_camera_pose(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -193,8 +364,8 @@ def randomize_mounted_camera_pose(
     env_ids: torch.Tensor,
     pos_range: dict[str, tuple[float, float]],
     rot_range: dict[str, tuple[float, float]],
-    parent_body_name: str,
     asset_cfg: SceneEntityCfg,
+    parent_body_name: str | None = None,
 ):
     """Jitter a robot-mounted camera's effective mount offset (position + small rotation)
     relative to its parent link, e.g. `wrist_cam`/`right_wrist_cam`/`body_cam`.
@@ -222,6 +393,22 @@ def randomize_mounted_camera_pose(
     """
     camera = env.scene[asset_cfg.name]
     robot = env.scene["robot"]
+
+    # Derived from the camera's own prim path by default, never hardcoded. A mounted camera lives
+    # at ".../Robot/<parent link>/<camera name>", so the link is always the second-to-last
+    # component -- and that is the ONE place it cannot go stale. Hardcoding it did go stale: this
+    # term carried "openarm_body_link", which is the dual-arm cfg's chest link, while the cfg the
+    # pick-up task actually inherits mounts body_cam on "openarm_body_link0" (and the CamMount
+    # variant uses "chest_link" again). The result was a ValueError from find_bodies on the first
+    # reset of any randomized run. Pass parent_body_name explicitly only to override this.
+    if parent_body_name is None:
+        parent_body_name = camera.cfg.prim_path.rstrip("/").split("/")[-2]
+    if parent_body_name not in robot.body_names:
+        raise ValueError(
+            f"Camera '{asset_cfg.name}' appears to be mounted on body '{parent_body_name}'"
+            f" (derived from prim_path '{camera.cfg.prim_path}'), which is not a body of the robot."
+            f" Available bodies: {robot.body_names}"
+        )
     body_ids, _ = robot.find_bodies(parent_body_name)
     body_id = body_ids[0]
 

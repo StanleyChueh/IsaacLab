@@ -70,7 +70,22 @@ processed:vr_joint_ros2 udp
   --teleop_device vr_joint_ros2_native \
   --ros2_domain_id 1
 
-""" 
+Resuming a session:
+
+  An existing --dataset_file is never silently overwritten; the run refuses to start instead. Add
+  --resume to keep what is in it and append until it holds --num_demos in total, or --overwrite to
+  start again from empty. So a session that was stopped at 12 of 20 demos is finished with the SAME
+  command plus --resume:
+
+  ./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/pickup_pringles_VR_V7.hdf5 \
+    --enable_cameras --num_demos 20 --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 --task_mode handover --manual_save --resume
+
+  To drop bad demos first (and renumber the survivors, which --resume then continues after), see
+  scripts/tools/remove_demos_hdf5.py.
+"""
 
 """Launch Isaac Sim Simulator first."""
 
@@ -131,8 +146,9 @@ parser.add_argument(
         " space and the episode is exported only once it arrives -- so the retreat is RECORDED as"
         " part of the demo instead of happening off-camera during the reset. The grippers are held"
         " at whatever they were commanded to, so a held object is carried back rather than dropped."
-        " The profile eases in and out (see ReturnToRestTrajectory), so this buys a shorter tail on"
-        " every episode without the joints being asked to start and stop at full speed -- lower it"
+        " The trajectory picks up from the pose and speed the arms were last commanded at and eases"
+        " to a stop (see ReturnToRestTrajectory), so this buys a shorter tail on every episode"
+        " without the joints being asked to jump or to stop dead -- lower it"
         " further if the retreat still drags, raise it if a carried object slips or swings."
         " Set to 0 to export immediately on the second press (the old behavior). Only applies to"
         " the joint-space Quest-button devices (vr_joint_ros2 / vr_joint_ros2_native); the N key"
@@ -258,7 +274,30 @@ parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
 )
 parser.add_argument("--step_hz", type=int, default=30, help="Environment stepping rate in Hz.")
-parser.add_argument("--num_demos", type=int, default=0, help="Number of demonstrations to record (0 = infinite).")
+parser.add_argument(
+    "--num_demos",
+    type=int,
+    default=0,
+    help=(
+        "Number of demonstrations the dataset should end up holding (0 = record until stopped)."
+        " With --resume this is the TOTAL, counting the demos already in the file, so the same"
+        " --num_demos can be used to finish an interrupted session."
+    ),
+)
+parser.add_argument(
+    "--resume",
+    action="store_true",
+    help=(
+        "Continue an interrupted recording session: keep the episodes already in --dataset_file and"
+        " append new ones after them, stopping once the file holds --num_demos in total. Without"
+        " this flag an existing dataset file is not overwritten -- the run refuses to start."
+    ),
+)
+parser.add_argument(
+    "--overwrite",
+    action="store_true",
+    help="Discard an existing --dataset_file and record from scratch. Mutually exclusive with --resume.",
+)
 parser.add_argument(
     "--num_success_steps",
     type=int,
@@ -309,6 +348,130 @@ parser.add_argument(
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+
+# ─── Existing-dataset pre-flight (--resume / --overwrite) ─────────────────────
+# Deliberately before AppLauncher: everything below only reads the output file and the parsed
+# arguments, and getting "that file already holds 12 demos" back in a second beats getting it after
+# a minute of Isaac Sim startup. Nothing here writes; the file is not opened for writing until the
+# RecorderManager is built, long after this has had its say.
+import json as _json  # noqa: E402 -- see above; the post-launch import block re-imports these
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+
+def next_demo_index(data_group) -> int:
+    """The index a new episode should be written under, given the ones already in the file.
+
+    One past the HIGHEST existing index rather than the episode count, so appending is safe even
+    for a dataset whose numbering has gaps -- writing demo_{count} into such a file would collide
+    with an episode already there and abort the export.
+    """
+    indices = [
+        int(name[len("demo_") :])
+        for name in data_group
+        if name.startswith("demo_") and name[len("demo_") :].isdigit()
+    ]
+    return max(indices) + 1 if indices else 0
+
+
+def inspect_dataset(file_path: str) -> dict:
+    """Read back what an existing dataset holds, without opening it for writing."""
+    import h5py
+
+    with h5py.File(file_path, "r") as handle:
+        if "data" not in handle:
+            raise ValueError("file has no 'data' group -- it is not an IsaacLab dataset")
+        data_group = handle["data"]
+        env_args = _json.loads(data_group.attrs.get("env_args", "{}"))
+        return {
+            "count": len(data_group),
+            "next_index": next_demo_index(data_group),
+            "env_name": env_args.get("env_name"),
+        }
+
+
+def preflight_dataset(args) -> tuple[str, int]:
+    """Decide what to do about an existing ``--dataset_file``, or exit explaining why we won't.
+
+    Returns the path the recorder will write and how many episodes are already in it (0 unless
+    resuming). Exits the process rather than returning an error, because every outcome here that
+    is not "carry on" means the run must not start at all.
+    """
+    output_dir = _os.path.dirname(args.dataset_file)
+    stem = _os.path.splitext(_os.path.basename(args.dataset_file))[0]
+    # Reassembled the way the recorder's file handler does it (directory + stem + .hdf5) rather
+    # than taken from --dataset_file, so a path given without the extension is still checked
+    # against the file that will actually be written.
+    dataset_path = _os.path.join(output_dir if output_dir else ".", f"{stem}.hdf5")
+
+    def fail(message: str):
+        print(f"ERROR: {message}")
+        _sys.exit(1)
+
+    if args.resume and args.overwrite:
+        fail("--resume and --overwrite do the opposite of each other; pass at most one.")
+
+    existing = None
+    if _os.path.isfile(dataset_path):
+        try:
+            existing = inspect_dataset(dataset_path)
+        except Exception as error:
+            fail(
+                f"could not read the existing dataset at {dataset_path}: {error}. If it is a"
+                " leftover from a crashed run and holds nothing worth keeping, delete it or pass"
+                " --overwrite."
+            )
+
+    if existing is None:
+        if args.resume:
+            print(f"[RESUME] {dataset_path} does not exist yet -- starting a fresh recording.")
+        return dataset_path, 0
+
+    if not (args.resume or args.overwrite):
+        # Refusing rather than warning: the recorder opens its output for writing from scratch, so
+        # starting this run would destroy every demo in that file -- irreversibly, and before the
+        # operator has recorded anything to show for it.
+        fail(
+            f"{dataset_path} already exists and holds {existing['count']} episode(s), which"
+            " recording into it would DELETE. Pass --resume to keep them and record the rest into"
+            " the same file, --overwrite to start again from empty, or point --dataset_file"
+            " somewhere else."
+        )
+
+    if args.overwrite:
+        print(f"[OVERWRITE] Discarding the {existing['count']} episode(s) already in {dataset_path}.")
+        return dataset_path, 0
+
+    task_name = args.task.split(":")[-1]
+    if existing["env_name"] and existing["env_name"] != task_name:
+        fail(
+            f"{dataset_path} was recorded for task '{existing['env_name']}', but this run is"
+            f" '{task_name}'. Resuming would mix two tasks in one dataset. Use a different"
+            " --dataset_file."
+        )
+
+    resume_offset = existing["count"]
+    if args.num_demos > 0 and resume_offset >= args.num_demos:
+        print(
+            f"[RESUME] {dataset_path} already holds {resume_offset} episode(s), which meets"
+            f" --num_demos {args.num_demos}. Nothing to record."
+        )
+        _sys.exit(0)
+
+    remaining = args.num_demos - resume_offset if args.num_demos > 0 else None
+    print(
+        f"[RESUME] {dataset_path} holds {resume_offset} episode(s); appending from"
+        f" demo_{existing['next_index']}."
+        + (f" {remaining} more to reach --num_demos {args.num_demos}." if remaining else "")
+    )
+    # The file records nothing about --task_mode, so this is the one half of "same settings as last
+    # time" that cannot be checked automatically.
+    print("[RESUME] Check yourself that --task_mode matches the session being resumed.")
+    return dataset_path, resume_offset
+
+
+DATASET_PATH, RESUME_OFFSET = preflight_dataset(args_cli)
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -475,8 +638,71 @@ except ImportError:
             pass
 
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
+from isaaclab.utils.datasets import HDF5DatasetFileHandler
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Resuming an interrupted recording session (--resume) ─────────────────────
+# The pre-flight half of --resume (next_demo_index, inspect_dataset, preflight_dataset) lives
+# further up, before AppLauncher, so a refusal costs a second rather than a sim startup. This half
+# is what lets the recorder write into a dataset that already exists.
+class ResumeExistingDatasetMixin(HDF5DatasetFileHandler):
+    """Makes a dataset file handler APPEND to an existing file instead of truncating it.
+
+    RecorderManager only ever calls ``create()`` on its handler, and create means h5py mode ``"w"``
+    -- it wipes whatever was at that path. Right for a fresh session, and exactly wrong for
+    ``--resume``, which exists because the file already holds demos worth keeping. Nothing else
+    about the handler changes (same file layout, same episode contents); only the "file already
+    exists" case differs: it is opened rather than replaced, and numbering continues after the
+    highest demo already in it.
+
+    A mixin rather than a subclass of one specific handler so it composes with whichever handler
+    the recorder cfg carries -- see :func:`make_resumable`.
+    """
+
+    def create(self, file_path: str, env_name: str | None = None):
+        import h5py
+
+        if not file_path.endswith(".hdf5"):
+            file_path += ".hdf5"
+        if not _os.path.isfile(file_path):
+            # "" rather than None for a missing name, which is what the base class turns None into
+            # anyway -- it just declares the parameter as str.
+            super().create(file_path, env_name=env_name if env_name is not None else "")
+            return
+        if self._hdf5_file_stream is not None:
+            raise RuntimeError("HDF5 dataset file stream is already in use")
+
+        # A handler that writes on a background thread (the async variant of this handler starts
+        # one in its own create()) needs that thread up before anything can be queued, and starting
+        # it is the only setup any of these handlers' create() does beyond opening the file. No-op
+        # for the plain synchronous handler, which has no worker.
+        worker_main = getattr(self, "_worker_main", None)
+        if worker_main is not None and getattr(self, "_worker", None) is None:
+            worker = threading.Thread(target=worker_main, name="hdf5-episode-writer", daemon=True)
+            worker.start()
+            setattr(self, "_worker", worker)  # noqa: B010 -- not an attribute of the base class
+
+        self._hdf5_file_stream = h5py.File(file_path, "a")
+        self._hdf5_data_group = self._hdf5_file_stream["data"]
+        self._demo_count = next_demo_index(self._hdf5_data_group)
+        # Seed the in-memory env_args from the file's, because add_env_args UPDATES this dict and
+        # rewrites the whole attribute from it. Starting empty would drop any key the resumed run
+        # does not happen to set again.
+        self._env_args = json.loads(self._hdf5_data_group.attrs.get("env_args", "{}"))
+        if env_name is not None:
+            self.add_env_args({"env_name": env_name})
+
+
+def make_resumable(handler_class: type) -> type:
+    """The given dataset file handler, with appending bolted on (see ResumeExistingDatasetMixin).
+
+    Derived from whatever class the recorder cfg is carrying rather than hard-coded, so this keeps
+    working if the export path is later switched to a different handler (e.g. the async one).
+    """
+    return type(f"Resumable{handler_class.__name__}", (ResumeExistingDatasetMixin, handler_class), {})
+
 
 # ─── Tasks whose real target object is the can ────────────────────────────────
 # These tasks' own cfgs still describe the ORIGINAL cube (cube_2) -- apply_task_mode() is what
@@ -1790,16 +2016,20 @@ def run_ramp_to_rest_test(env, duration: float = 4.0, rate_hz: float = 50.0, sto
 
 
 class ReturnToRestTrajectory:
-    """The closing motion of a recorded episode: a straight-line joint-space ramp from wherever the
-    arms are back to the task's rest pose, executed one control step at a time THROUGH the main
-    loop's ``env.step()`` so every step of it lands in the episode.
+    """The closing motion of a recorded episode: a joint-space trajectory from wherever the arms
+    were last commanded to back to the task's rest pose, executed one control step at a time THROUGH
+    the main loop's ``env.step()`` so every step of it lands in the episode.
 
-    Same straight line through joint space as ``run_ramp_to_rest_test`` (and, on hardware,
+    The same straight line through joint space as ``run_ramp_to_rest_test`` (and, on hardware,
     reset_to_rest_pose.py's ``ramp_to()``) -- ``cmd = start + alpha * (rest - start)`` -- but with
-    two differences that matter. That one drives PhysX directly with ``env.step()`` bypassed, which
+    three differences that matter. That one drives PhysX directly with ``env.step()`` bypassed, which
     is exactly why it records nothing; here the ramp only *produces* an action vector and the main
-    loop steps the env with it. And its ``alpha`` is linear in time, where this one is smoothstepped
-    (see :meth:`advance`) so the retreat can be short without starting and stopping abruptly.
+    loop steps the env with it. Its ``alpha`` is linear in time, where this one is a quintic
+    minimum-jerk profile (see :meth:`advance`) so the retreat can be short without arriving abruptly.
+    And its start state is the arms' *measured* pose at rest, where this one starts from the pose and
+    velocity the arms were last **commanded** to and were actually moving at (see :meth:`start`) --
+    which is what makes the handover from live teleop to this trajectory seamless from any pose the
+    operator happens to stop in, mid-motion or not.
 
     Only meaningful for the two joint-layout devices (see requires_manual_arm), and the two encode
     that 16D vector differently, hence ``is_native``:
@@ -1829,11 +2059,30 @@ class ReturnToRestTrajectory:
     that never visibly opened.
     """
 
+    #: Cap on how far the latched start pose is allowed to sit from the measured pose, in rad. The
+    #: start comes from the last *commanded* target (see :meth:`start`), and under the implicit
+    #: actuator that command only ever leads the measurement by a fraction of a radian. A larger gap
+    #: than this means the command buffer is not describing this robot -- the realistic case being
+    #: that no action term has written these joints since the articulation was created, leaving
+    #: ``joint_pos_target`` at its zero-fill -- so clamp toward the measurement rather than ramp from
+    #: a pose the arm has never been in.
+    MAX_COMMAND_LAG = 0.5
+
+    #: Cap on the departure velocity the profile is allowed to carry, expressed as the distance it
+    #: would cover at that velocity over the ramp's whole duration (rad). The velocity term peaks at
+    #: ~0.2x this much of extra excursion beyond the direct path, so 0.75 rad buys the smooth
+    #: deceleration while bounding any overshoot at roughly 0.15 rad (~9 deg) per joint.
+    MAX_START_LEAD = 0.75
+
     def __init__(self, robot, sim_device: str, duration: float, rate_hz: float, is_native: bool):
         self._robot = robot
         self._device = sim_device
         self._is_native = is_native
         self._steps = max(1, int(round(duration * rate_hz)))
+        # The duration actually flown, which is the step count rounded above rather than the
+        # requested `duration` -- the velocity term is scaled by it and has to agree with the `s`
+        # advance() computes, or the profile would depart at a velocity slightly off the arm's.
+        self._duration = self._steps / rate_hz
         # Same find_joints() calls, in the same order, that ROS2NativeJointTeleop/
         # swap_to_joint_position_actions resolve the 16D layout's columns with -- index by the
         # resolved ids, never by assuming the regex enumerates joint1..joint7 in order.
@@ -1850,24 +2099,66 @@ class ReturnToRestTrajectory:
         self.right_gripper_cmd = 0.0
         self._grippers_latched = False
         self._step = 0
-        self._left_start = None
-        self._right_start = None
+        # Placeholders only -- start() overwrites all four, and `active` is what gates advance().
+        self._left_start = torch.zeros(len(self._left_ids), device=sim_device)
+        self._right_start = torch.zeros(len(self._right_ids), device=sim_device)
+        self._left_lead = torch.zeros_like(self._left_start)
+        self._right_lead = torch.zeros_like(self._right_start)
 
     def start(self) -> None:
-        """Latch the ramp's start pose (the arms' CURRENT measured positions) and begin.
+        """Latch the trajectory's start state -- the arms' last COMMANDED joint targets and the
+        velocity they are actually travelling at -- and begin.
+
+        The start pose is read from ``robot.data.joint_pos_target``, NOT ``robot.data.joint_pos``,
+        because this trajectory *commands* positions rather than measuring them. Under the implicit
+        actuator the measured pose always sits a steady-state error behind the command -- the very
+        same command/measurement gap this class leans on to keep grip force up (see the class
+        docstring), only spread over seven arm joints holding themselves and a payload against
+        gravity, which is where it is largest. Starting from the measurement therefore steps the
+        command *backwards* by that entire error on the trajectory's first sample, and a step input
+        into a stiff PD loop is a jolt: the arm snaps, and only then follows the rest of the profile
+        smoothly. Starting from the last command makes the handover from teleop to trajectory
+        continuous in position, so there is nothing to snap. That it also makes the *recorded* action
+        sequence continuous matters just as much: a jump baked into the same place in every demo is a
+        jump the policy learns to reproduce.
+
+        Velocities are latched for the same reason one derivative up. The operator's hands are often
+        still moving when they press X, and a profile that departs at zero velocity is a demand for
+        an instantaneous stop -- so :meth:`advance` departs at this velocity and bleeds it off
+        instead. Between the two, the trajectory is smooth out of any pose *and* any motion the
+        episode happens to end in.
 
         The grippers are deliberately NOT latched here: this runs from the button callback, which
         fires from inside the teleop device's own build_dual_action() before that method has
         computed this step's gripper commands -- so anything read now is one step stale. The first
         :meth:`advance` call latches them instead, from the values the main loop has by then
         received. One step is usually nothing, but "usually" is not what should stand between a
-        grasped object and the floor.
+        grasped object and the floor. The arm state above has no such problem: no ``env.step()``
+        runs between here and that first :meth:`advance`, so the commanded targets read now are the
+        ones the simulation is still converging to.
         """
         self._step = 0
-        self._left_start = self._robot.data.joint_pos[0, self._left_ids].clone()
-        self._right_start = self._robot.data.joint_pos[0, self._right_ids].clone()
+        self._left_start, self._left_lead = self._latch_arm_start(self._left_ids)
+        self._right_start, self._right_lead = self._latch_arm_start(self._right_ids)
         self._grippers_latched = False
         self.active = True
+
+    def _latch_arm_start(self, joint_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """One arm's start pose and departure lead -- see :meth:`start` for why these come from the
+        commanded targets and the measured velocities.
+
+        Returns:
+            ``(start_pos, lead)``. ``lead`` is the start velocity pre-multiplied by the ramp's
+            duration, i.e. already in the units :meth:`advance`'s normalised-time basis wants, and
+            clamped to :attr:`MAX_START_LEAD`.
+        """
+        measured = self._robot.data.joint_pos[0, joint_ids]
+        commanded = self._robot.data.joint_pos_target[0, joint_ids]
+        start = torch.clamp(commanded, measured - self.MAX_COMMAND_LAG, measured + self.MAX_COMMAND_LAG)
+        lead = (self._robot.data.joint_vel[0, joint_ids] * self._duration).clamp(
+            -self.MAX_START_LEAD, self.MAX_START_LEAD
+        )
+        return start.clone(), lead.clone()
 
     def stop(self) -> None:
         """End the ramp and hand control back to the teleop device."""
@@ -1895,19 +2186,34 @@ class ReturnToRestTrajectory:
             self.right_gripper_cmd = right_gripper_cmd
             self._grippers_latched = True
         self._step += 1
-        # Smoothstep rather than the linear `s` run_ramp_to_rest_test uses: it leaves and arrives at
-        # zero joint velocity, which is what makes a SHORT return usable. A linear ramp reaches its
-        # full speed on step one and drops to zero on the last, and at these durations that pair of
-        # velocity steps is what shakes a carried object loose -- so the same peak effort buys a
-        # noticeably quicker retreat here. Peak rate is 1.5x the average, i.e. --return_to_rest_secs
-        # 1.5 moves no faster at its quickest than a linear 1.0 s ramp would throughout.
+        # A quintic minimum-jerk profile rather than the linear `s` run_ramp_to_rest_test uses: it
+        # arrives at zero joint velocity AND zero acceleration, which is what makes a SHORT return
+        # usable. A linear ramp reaches its full speed on step one and drops to zero on the last, and
+        # at these durations that pair of velocity steps is what shakes a carried object loose -- so
+        # the same peak effort buys a noticeably quicker retreat here. Peak rate is 1.875x the
+        # average, i.e. --return_to_rest_secs 1.5 moves no faster at its quickest than a linear 0.8 s
+        # ramp would throughout.
+        #
+        # Two bases, summed, because the boundary conditions at the two ends are not symmetric:
+        #
+        # * `pos_basis` (10s^3 - 15s^4 + 6s^5) carries the actual travel, 0 -> 1, flat in both
+        #   velocity and acceleration at each end.
+        # * `vel_basis` (s - 6s^3 + 8s^4 - 3s^5) starts at zero with unit slope and decays to zero
+        #   value, slope and curvature by s = 1. Scaled by the latched lead, it is what lets the
+        #   trajectory *depart at the speed the arm is already moving* and bleed that motion off,
+        #   instead of demanding it stop dead on the first sample. This is the half the older
+        #   smoothstep could not express: smoothstep eases in from zero velocity, which reads as
+        #   smooth only if the arm was already stationary when the operator pressed X.
+        #
+        # Both are exact at the endpoints, so s = 1 still lands on the rest pose to the bit.
         s = min(1.0, self._step / self._steps)
-        alpha = s * s * (3.0 - 2.0 * s)
+        pos_basis = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
+        vel_basis = s * (1.0 - s * s * (6.0 - 8.0 * s + 3.0 * s * s))
         default = self._robot.data.default_joint_pos
         left_rest = default[0, self._left_ids]
         right_rest = default[0, self._right_ids]
-        left_target = self._left_start + alpha * (left_rest - self._left_start)
-        right_target = self._right_start + alpha * (right_rest - self._right_start)
+        left_target = self._left_start + pos_basis * (left_rest - self._left_start) + vel_basis * self._left_lead
+        right_target = self._right_start + pos_basis * (right_rest - self._right_start) + vel_basis * self._right_lead
 
         if self._is_native:
             full_target = default.clone()
@@ -2029,6 +2335,9 @@ def main():
         os.makedirs(output_dir)
         print(f"Created output directory: {output_dir}")
 
+    # Settled before Isaac Sim was even launched -- see preflight_dataset().
+    dataset_path, resume_offset = DATASET_PATH, RESUME_OFFSET
+
     # ── Env config ────────────────────────────────────────────────────────────
     try:
         env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
@@ -2093,6 +2402,12 @@ def main():
     env_cfg.recorders.dataset_export_dir_path = output_dir if output_dir else "."
     env_cfg.recorders.dataset_filename = output_file_name
     env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    if args_cli.resume:
+        # Same handler the export path would otherwise use, minus the truncation -- see
+        # ResumeExistingDatasetMixin.
+        env_cfg.recorders.dataset_file_handler_class_type = make_resumable(
+            env_cfg.recorders.dataset_file_handler_class_type
+        )
 
     # ── Create env ────────────────────────────────────────────────────────────
     try:
@@ -2212,7 +2527,10 @@ def main():
     right_gripper_state = 1.0
     should_reset = False
     running = True
-    demo_count = 0
+    # Demos IN THE DATASET, not demos recorded by this process -- under --resume those differ by
+    # resume_offset, and it is the former that --num_demos is about and that the on-screen counter
+    # should show.
+    demo_count = resume_offset
     success_step_count = 0
     ramp_test_requested = False
     # Whether env.step()'s data is meant to be kept AND the robot is allowed to move -- for the
@@ -2254,9 +2572,10 @@ def main():
         0: "waiting for the RIGHT arm to grasp the can",
         1: "right arm has it -- waiting for the LEFT arm to take it while the right still holds",
         # NOT "and the can to land": handover_success dropped that requirement, because with manual
-        # saving the operator routinely stops the episode still holding the can. Releasing is all
-        # 2 -> 3 needs.
-        2: "passed to the left arm -- waiting for the RIGHT arm to let go",
+        # saving the operator routinely stops the episode still holding the can. What 2 -> 3 does
+        # need besides the release is the LEFT hand keeping hold of the can for a stretch -- see
+        # HANDOVER_RECEIVER_HOLD_STEPS -- so keep carrying it for ~1 s after letting go.
+        2: "passed to the left arm -- waiting for the RIGHT arm to let go while the LEFT keeps hold",
         3: "complete",
     }
     _HANDOVER_STALL_REPORT_PERIOD = 40
@@ -2320,9 +2639,40 @@ def main():
             )
         elif stage == 2:
             lines.append(f"  right {_arm('right_ee_frame', openarm_task_modes.RIGHT_FINGER_JOINTS)} -> must go False")
+            # The other half of 2->3, and the one an operator cannot see: the left hand has to be
+            # confirmed still holding the can (jaw aperture inside the band -- shut on nothing
+            # fails it) for HANDOVER_RECEIVER_HOLD_STEPS steps running, or the counter restarts.
+            aperture = float(
+                openarm_task_modes.gripper_aperture(env, openarm_task_modes.LEFT_FINGER_JOINTS)[0]
+            )
+            confirmed = bool(
+                openarm_task_modes.receiver_grip_confirmed(
+                    env,
+                    ee_frame_cfg=SceneEntityCfg("ee_frame"),
+                    gripper_joint_names=openarm_task_modes.LEFT_FINGER_JOINTS,
+                    object_cfg=object_cfg,
+                    diff_threshold=diff_threshold,
+                )[0]
+            )
+            lo, hi = openarm_task_modes.HANDOVER_RECEIVER_APERTURE_RANGE
+            held_steps = int(openarm_task_modes.handover_latches(env)["receiver_grip_steps"][0])
+            lines.append(
+                f"  left  grip_confirmed={str(confirmed):5} aperture={aperture:.4f} in"
+                f" [{lo:.3f}, {hi:.3f}]  held {held_steps}/"
+                f"{openarm_task_modes.HANDOVER_RECEIVER_HOLD_STEPS} steps running"
+            )
+        elif stage >= 3:
+            # Stage 3 is reached and stays reached, but handover_success also re-asserts the grip
+            # live, so an operator who opens the receiving hand after the pass is back to NOT
+            # meeting the success condition -- with the stage line still reading "complete". Say
+            # so, or that reads as the auto-save being broken.
+            lines.append(
+                "  the pass is done, but the LEFT hand has let go of the can -- close it again"
+                " (or save manually); success needs the can still in that hand"
+            )
         return "\n".join(lines)
 
-    def _report_handover_stage():
+    def _report_handover_stage(succeeded: bool = False):
         if args_cli.task_mode != "handover":
             return
         try:
@@ -2335,9 +2685,12 @@ def main():
             print(f"[HANDOVER {stage}/3] {_HANDOVER_STAGE_LABELS.get(stage, '?')}")
         handover_stall_steps["value"] += 1
 
-        # Nothing left to wait for once complete, and no point reporting a stage the same step it
-        # was entered -- the conditions that block it have not had a chance to change yet.
-        if stage >= 3:
+        # Nothing left to wait for once complete AND the success condition is actually being met --
+        # which past stage 3 is no longer the same thing, since handover_success re-checks the
+        # receiving hand's grip live. Keep reporting while stage 3 is not converting into success.
+        # No point reporting a stage the same step it was entered either: the conditions that block
+        # it have not had a chance to change yet.
+        if stage >= 3 and succeeded:
             return
         if handover_stall_steps["value"] < _HANDOVER_STALL_REPORT_PERIOD:
             return
@@ -2603,7 +2956,7 @@ def main():
             # auto-export mid-ramp would truncate the very retreat it is recording.
             if success_term is not None and recording_armed:
                 succeeded = bool(success_term.func(env, **success_term.params)[0])
-                _report_handover_stage()
+                _report_handover_stage(succeeded)
                 if succeeded and not args_cli.manual_save and not rtr_active:
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
@@ -2618,9 +2971,13 @@ def main():
                     success_step_count = 0
 
             # Update demo counter label
-            if env.recorder_manager.exported_successful_episode_count > demo_count:
-                demo_count = env.recorder_manager.exported_successful_episode_count
-                print(f"Total demos recorded: {demo_count}")
+            total_in_dataset = resume_offset + env.recorder_manager.exported_successful_episode_count
+            if total_in_dataset > demo_count:
+                demo_count = total_in_dataset
+                if resume_offset:
+                    print(f"Total demos in dataset: {demo_count} ({demo_count - resume_offset} this session)")
+                else:
+                    print(f"Total demos recorded: {demo_count}")
                 _refresh_label()
 
             # Check exit condition
@@ -2661,7 +3018,17 @@ def main():
             rate_limiter.sleep(env)
 
     env.close()
-    print(f"\nRecording done. {demo_count} successful demos saved to: {args_cli.dataset_file}")
+    session_count = demo_count - resume_offset
+    print(
+        f"\nRecording done. {demo_count} successful demos in {dataset_path}"
+        + (f" ({session_count} added this session, {resume_offset} were already there)." if resume_offset else ".")
+    )
+    if args_cli.num_demos > 0 and demo_count < args_cli.num_demos:
+        print(
+            f"That is short of --num_demos {args_cli.num_demos}. Re-run the same command with"
+            " --resume to add the remaining"
+            f" {args_cli.num_demos - demo_count} without losing what is already recorded."
+        )
 
     if feedback_receiver is not None:
         _save_plot_once()
