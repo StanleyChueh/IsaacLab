@@ -28,7 +28,16 @@ R	                    reset/discard
 Subscribe joint topic from dora, and control robot in isaac sim
 
 ```
-/isaaclab.sh -p scripts/tools/record_demos_openarm.py   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0   --dataset_file logs/demos/pickup_pringle.hdf5 --enable_cameras --num_demos 10   --teleop_device vr_joint_ros2_native --ros2_domain_id 1   --task_mode handover --manual_save
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/pickup_pringle.hdf5 \
+    --enable_cameras \
+    --num_demos 10 \
+    --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 \
+    --task_mode handover \
+    --manual_save 
 ```
 
 Dora publish code
@@ -40,6 +49,24 @@ cd dora-openarm-data-collection
 dora run dataflow-vr-mujoco-ros2.yaml --uv
 ```
 
+Resume recording
+
+Add --resume to resume recording 
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/pickup_pringle.hdf5 \
+    --enable_cameras \
+    --num_demos 10 \
+    --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 \
+    --task_mode handover \
+    --manual_save 
+    --resume
+```
+
 # Replay dataset
 
 ```
@@ -48,6 +75,14 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
     --dataset_file logs/demos/pickup_pringle.hdf5 \
     --enable_cameras
+```
+
+# Remove episode
+
+```
+./isaaclab.sh -p scripts/tools/remove_demos_hdf5.py \
+    --dataset_file logs/demos/pickup_pringles_VR_V7.hdf5 --episodes 3 7 \
+    --output logs/demos/pickup_pringles_VR_V7_fixed.hdf5
 ```
 
 # Environment Setup
@@ -109,12 +144,13 @@ Record source demo (keyboard teleoperation)
 Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 
 ```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_pringle.hdf5 \
-    --output_file logs/demos/pickup_pringle_annotated.hdf5 \
-    --task_mode handover --auto --from_states --enable_cameras
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
+  --task_mode handover --auto --from_states \
+  --enable_cameras \
+  --input_file logs/demos/pickup_pringle_annotated.hdf5 \
+  --output_file logs/demos/pickup_pringle_annotated_v3.hdf5
+
 ```
 
 Generate augmented dataset
@@ -127,6 +163,12 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --output_file logs/demos/pickup_generated.hdf5 \
     --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras
+```
+
+Generate augemented dataset w domain randomization(No background changing)
+
+```
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringle_annotated_V6.hdf5     --output_file logs/demos/pickup_pringle_V6_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handove
 ```
 
 Generate augemented dataset w domain randomization
@@ -257,7 +299,7 @@ python mirror_bridge.py --calibration calibration.json --udp-port 9999     --rig
 sim-to-real
 
 ```
- env -u PYTHONPATH -u LD_LIBRARY_PATH   ~/miniforge3/envs/lerobot-openarm-cf/bin/python replay_hf_sim_episode.py     --repo-id ethanCSL/openarm_visuomotor_VR_pringles --episode 0     --calibration calibration.json --model-path model/openarm_description_leader.urdf     --handshake-tolerance 1.0 --ramp-duration 10.0     --max-steps 3000 --plot sim_vs_real_20260812.png
+ env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V6 --episode 1   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
 ```
 
 real-to-sim
