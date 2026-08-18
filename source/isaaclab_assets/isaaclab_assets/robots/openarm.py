@@ -99,24 +99,31 @@ OPENARM_BI_CFG = ArticulationCfg(
             damping=10.0,
         ),
         "openarm_gripper": ImplicitActuatorCfg(
-            # BOTH finger joints must be listed. *_finger_joint2 (which drives the
-            # *_left_finger link) is additionally a native PhysX mimic joint of joint1
-            # (gearing=-1) baked into v1_camera_isaac.usd by the URDF importer, and it is
-            # tempting to therefore leave it out and let the mimic carry it. That is wrong:
-            # a joint absent from every actuator group keeps the USD's drive, and the
-            # importer authors NO PhysicsDriveAPI on a mimic joint, so joint2 came up with
-            # stiffness=0, damping=0 and effort_limit=0 -- measured directly off
-            # root_physx_view. Its only tie to joint1 was then the mimic constraint, which
-            # the importer makes *compliant* (physxMimicJoint:rotY:naturalFrequency=25,
-            # dampingRatio=0.005). Per PhysX's own compliance formulation that lands ~23x
-            # softer than a rigid constraint, so the left finger simply yielded whenever it
-            # pushed on anything -- the gripper looked like it closed but could not hold.
-            # Listing joint2 here does NOT fight the mimic: the mimic enforces pos2 == pos1,
-            # and the action terms command both joints the same value, so drive and
-            # constraint agree. Keep the two in sync -- every BinaryJointPositionActionCfg
-            # for this robot must name both finger joints (see the openarm stack/pickup
-            # env cfgs); driving joint1 alone while joint2 is actuated would peg joint2 at
-            # its default and genuinely fight the mimic.
+            # BOTH finger joints must be listed, AND the two jaws are additionally tied
+            # together by a PhysX mimic joint in the USD -- belt and braces, and both parts
+            # are load-bearing.
+            #
+            # The mimic joint (PhysxMimicJointAPI on each *_finger_joint2, referencing its
+            # *_finger_joint1, gearing=-1 offset=0, i.e. pos2 == pos1) is what makes the
+            # gripper behave like the real one, where a single motor drives both jaws through
+            # a mechanical coupling. It is applied by
+            # scripts/tools/add_gripper_mimic_joints.py, NOT by the URDF importer -- the
+            # importer dropped the URDF's <mimic> tag, and without it "both jaws move
+            # together" was only ever an agreement between two independent action targets.
+            # Contact broke that agreement instantly: a jaw touching the object stalled
+            # there while the other kept closing, so the pair ended up split by up to 17 mm
+            # (measured across the ten teleop demos in logs/demos/pickup_pringles_V8.hdf5)
+            # and the object was never centred. Re-run that script against any freshly
+            # re-imported v1_camera_isaac.usd; --check reports whether it is still applied.
+            #
+            # Listing joint2 here does NOT fight the mimic: the constraint says pos2 == pos1
+            # and the action terms command both joints the same value, so the two agree. Nor
+            # is the mimic a reason to drop joint2 from this group -- the constraint only
+            # couples the jaws, it produces no grip force of its own, so an undriven joint2
+            # would be dragged along contributing no squeeze. Keep the two in sync -- every
+            # BinaryJointPositionActionCfg for this robot must name both finger joints (see
+            # the openarm stack/pickup env cfgs); driving joint1 alone while joint2 is
+            # actuated would peg joint2 at its default and genuinely fight the mimic.
             joint_names_expr=[
                 "openarm_left_finger_joint.*",
                 "openarm_right_finger_joint.*",
