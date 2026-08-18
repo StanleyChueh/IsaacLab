@@ -528,6 +528,23 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         # and PickUpDomainRandomizationEventCfg.randomize_camera_pose).
         self.scene.front_cam = None
 
+        # ── Env spacing: keep neighbouring envs out of every camera frustum ──
+        # The stack base cfg ships env_spacing=2.5, but each env clones a full Table +
+        # workspace_pad + robot. With 2.5 m spacing the neighbour table's near edge sits at
+        # ~2.0 m from the env origin, and the wrist camera travels another 0.3-0.5 m toward it
+        # during a reach -- so the neighbour renders at ~1.5-1.7 m, inside the wrist cams'
+        # 2.0 m far plane (and inside body_cam's 3.0 m one). With --num_envs > 1 that puts a
+        # second table and a second robot into the training images, which the single-env
+        # teleop recordings never contain: the generated data stops matching the demos it was
+        # cloned from, and a policy trained on it sees clutter that does not exist at eval.
+        #
+        # 6.0 m clears both far planes with margin (nearest neighbour geometry lands at
+        # ~5.4 m), so the frustum culls every neighbour regardless of how far the arm reaches.
+        # env_spacing only offsets the GridCloner origins -- no extra physics bodies, no extra
+        # render products, no measurable cost. Raise this if any camera's far clip is ever
+        # increased past ~5 m.
+        self.scene.env_spacing = 6.0
+
         # ── Observations ─────────────────────────────────────────────────────
         self.observations.policy = PickUpObservationsCfg.PolicyCfg()
         self.observations.subtask_terms = PickUpObservationsCfg.SubtaskCfg()
