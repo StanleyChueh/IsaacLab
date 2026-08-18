@@ -148,9 +148,8 @@ Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
   --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
   --task_mode handover --auto --from_states \
   --enable_cameras \
-  --input_file logs/demos/pickup_pringle_annotated.hdf5 \
-  --output_file logs/demos/pickup_pringle_annotated_v3.hdf5
-
+  --input_file logs/demos/pickup_pringles_V8.hdf5 \
+  --output_file logs/demos/pickup_pringles_V8_annotated.hdf5
 ```
 
 Generate augmented dataset
