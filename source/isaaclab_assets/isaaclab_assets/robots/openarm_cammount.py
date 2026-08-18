@@ -61,8 +61,8 @@ OPENARM_BI_CAMMOUNT_CFG = ArticulationCfg(
         joint_pos={
             "openarm_left_joint.*": 0.0,
             "openarm_right_joint.*": 0.0,
-            "openarm_left_finger_joint.*": 0.0,
-            "openarm_right_finger_joint.*": 0.0,
+            "openarm_left_finger_joint.*": 0.044,
+            "openarm_right_finger_joint.*": 0.044,
         },
     ),
     # Actuator gains copied from OPENARM_BI_CFG (openarm.py) -- same physical motors, this is a

@@ -59,9 +59,19 @@ reuse eval_smolvla.py's _get_state() (joint_pos[:7]) -- a plain leading slice mi
 right-arm values under this interleaved ordering and would feed the model a wrong state.
 
 Action (16D by default): applied DIRECTLY as target joint positions for those same joints -- no
-IK, no delta interpretation, no gripper open/close threshold. Each gripper's finger_joint2 is a
-native PhysX mimic of its finger_joint1 in this USD (confirmed: no PhysicsDriveAPI on joint2),
-so only the one actuated joint per hand needs a target -- the mimic partner follows.
+IK, no delta interpretation. The two gripper columns are the one exception: they are binarized
+to fully open (0.044) or fully closed (0.0) at --gripper_threshold_ratio of the open position,
+because the policy regresses that column continuously and a part-closed jaw neither holds the
+can nor lets it through, while the teleop demos it learned from only ever commanded those two
+values. Everything else is passed through untouched. Each gripper's finger_joint2 gets
+the same target as its finger_joint1 (see FOLLOWER_OF_LEADER): joint2 is a PhysX mimic of joint1
+but is ALSO independently actuated by this robot's "openarm_gripper" group, so leaving it out
+does not let the mimic carry it -- it pegs joint2 at the untouched buffer value of 0.0, which is
+fully CLOSED, and shuts both hands for the entire rollout.
+
+For the same reason the whole joint-position-target buffer is seeded from the reset pose at the
+top of every rollout: it starts as zeros and env.reset() does not reseed it, so any joint this
+script does not command is driven to 0.0 rather than left alone.
 
 The layout MUST match the --arms convert_hdf5_to_lerobot.py exported this checkpoint's dataset
 with. Pass --arms left for an older 8D left-arm-only checkpoint; then only LJ_IDX is driven and
@@ -97,6 +107,17 @@ parser.add_argument(
         " swaps in the can, and also sets the per-mode object spawn range and success"
         " condition. Omitting it on such a task evaluates the policy against the wrong object"
         " entirely, so it is refused rather than run (see CAN_TARGET_TASKS)."
+    ),
+)
+parser.add_argument(
+    "--gripper_threshold_ratio", type=float, default=0.95,
+    help=(
+        "Binarize each gripper command at this fraction of the fully-open position"
+        " (GRIPPER_OPEN_VAL = 0.044 m): a commanded value at or above the threshold becomes"
+        " fully open, anything below becomes fully closed. The policy's gripper column is"
+        " regressed continuously and lands mid-range whenever it is unsure, which reads as a"
+        " half-shut jaw that neither grasps nor clears the object. 0 disables binarization and"
+        " passes the raw commanded position through."
     ),
 )
 parser.add_argument(
@@ -143,6 +164,7 @@ import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.manipulation.stack  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
     CAN_TARGET_TASKS,
+    GRIPPER_OPEN_VAL,
     apply_task_mode,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -194,8 +216,76 @@ RJ_IDX = list(range(1, 14, 2)) + [16]
 # observation.state / action, and of the real robot's action dict.
 BOTH_IDX = LJ_IDX + RJ_IDX
 
-# The joints this run actually drives, and the exact column order of the state it sends.
+# The joints the POLICY speaks for, and the exact column order of the state it sends.
 DRIVEN_IDX = BOTH_IDX if args_cli.arms == "both" else LJ_IDX
+
+# Each hand's finger_joint2 is a PhysX mimic of joint1 AND an independently actuated member of
+# the "openarm_gripper" group (stiffness 3000) -- see OPENARM_BI_CFG in
+# isaaclab_assets/robots/openarm.py, which spells out that "driving joint1 alone while joint2 is
+# actuated would peg joint2 at its default and genuinely fight the mimic". The dataset carries
+# only the leader joint per hand (convert_hdf5_to_lerobot.py exports LJ8/RJ8 = joint1, since the
+# follower holds no independent information), so the follower has no action column of its own and
+# has to be commanded the leader's value -- exactly what the tasks' BinaryJointPositionActionCfg
+# does by naming both finger joints. Without this the follower keeps the target every joint this
+# script never writes keeps, which is 0.0 (Articulation._initialize_impl zeroes the buffer and
+# nothing reseeds it), and 0.0 is a gripper's FULLY CLOSED position -- so both hands sit shut for
+# the whole rollout no matter what the policy commands.
+FOLLOWER_OF_LEADER = {
+    "openarm_left_finger_joint1": "openarm_left_finger_joint2",
+    "openarm_right_finger_joint1": "openarm_right_finger_joint2",
+}
+
+
+# Commanded gripper positions at or above this are snapped fully open, below it fully closed --
+# the same two values the tasks' own BinaryJointPositionActionCfg commands (open_command_expr
+# 0.044 / close_command_expr 0.0), so a binarized rollout drives the jaws exactly where a teleop
+# demo drove them. 0.0 turns binarization off (see --gripper_threshold_ratio).
+GRIPPER_BINARY_THRESHOLD = args_cli.gripper_threshold_ratio * GRIPPER_OPEN_VAL
+GRIPPER_CLOSED_VAL = 0.0
+
+
+def _binarize_grippers(target_q: np.ndarray, gripper_cols: list[int]) -> np.ndarray:
+    """Snap every gripper column of *target_q* to fully open or fully closed.
+
+    The dataset's gripper column is an absolute finger position in metres that the policy
+    regresses continuously, so its output drifts through the middle of the 0..0.044 range -- a
+    part-closed jaw, which on this gripper is the one command that neither holds the can nor
+    lets it through. The source demos themselves are effectively two-valued (teleop drives the
+    task's BinaryJointPositionActionCfg), so snapping to those two values recovers the intent
+    rather than discarding information.
+
+    The default 0.8 ratio is NOT a midpoint: only a command within 20% of fully open is read as
+    "open", so any partial retraction counts as a close. That asymmetry is deliberate -- an
+    under-committed close drops the can, whereas an over-eager close on this task's 60 mm can
+    still leaves the jaws well short of each other.
+    """
+    if not gripper_cols or args_cli.gripper_threshold_ratio <= 0.0:
+        return target_q
+    out = target_q.copy()
+    cols = np.asarray(gripper_cols)
+    out[cols] = np.where(out[cols] >= GRIPPER_BINARY_THRESHOLD, GRIPPER_OPEN_VAL, GRIPPER_CLOSED_VAL)
+    return out
+
+
+def _resolve_grippers(env) -> tuple[list[int], list[int]]:
+    """Map each gripper column of the action vector to the articulation joint index of that
+    gripper's mimic follower. Resolved BY NAME off the live articulation rather than hardcoded
+    alongside LJ_IDX, so a USD whose joint order differs fails loudly here instead of quietly
+    driving some unrelated joint. Returns (action columns, follower joint indices)."""
+    names = list(env.scene["robot"].data.joint_names)
+    cols, followers = [], []
+    for col, joint_idx in enumerate(DRIVEN_IDX):
+        follower = FOLLOWER_OF_LEADER.get(names[joint_idx])
+        if follower is None:
+            continue
+        if follower not in names:
+            raise RuntimeError(
+                f"'{names[joint_idx]}' is driven but its mimic follower '{follower}' is not a"
+                f" joint of this robot. Joints: {names}"
+            )
+        cols.append(col)
+        followers.append(names.index(follower))
+    return cols, followers
 
 
 def _get_state(env) -> np.ndarray:
@@ -220,7 +310,7 @@ def _get_cameras(obs_dict: dict, camera_names: list[str]) -> dict:
     return cameras
 
 
-def _step_direct(env, target_q: np.ndarray) -> dict:
+def _step_direct(env, target_q: np.ndarray, apply_idx: list[int], gripper_cols: list[int]) -> dict:
     """Advance the sim by one env "step" worth of physics (env.cfg.decimation substeps), driving
     the DRIVEN_IDX joints directly instead of going through the env's IK action term -- see
     module docstring for the exact ManagerBasedRLEnv.step() sequence this replicates. Returns a
@@ -234,12 +324,16 @@ def _step_direct(env, target_q: np.ndarray) -> dict:
             " (LJ1..LJ8+RJ1..RJ8), 8 = --arms left. Re-run with the matching --arms."
         )
     robot = env.scene["robot"]
-    target_t = torch.as_tensor(target_q, dtype=torch.float32, device=env.device).unsqueeze(0)  # (1, n)
+    target_q = _binarize_grippers(target_q, gripper_cols)
+    # Append each gripper leader's value again, once per follower joint -- see FOLLOWER_OF_LEADER.
+    # Done AFTER binarizing so both jaws of a hand get the same snapped value.
+    full_q = np.concatenate([target_q, target_q[gripper_cols]]) if gripper_cols else target_q
+    target_t = torch.as_tensor(full_q, dtype=torch.float32, device=env.device).unsqueeze(0)
 
     is_rendering = env.sim.has_gui() or env.sim.has_rtx_sensors()
     for _ in range(env.cfg.decimation):
         env._sim_step_counter += 1
-        robot.set_joint_position_target(target_t, joint_ids=DRIVEN_IDX)
+        robot.set_joint_position_target(target_t, joint_ids=apply_idx)
         env.scene.write_data_to_sim()
         env.sim.step(render=False)
         if (env._sim_step_counter % env.cfg.sim.render_interval == 0) and is_rendering:
@@ -284,9 +378,23 @@ class KeyboardHandler:
 
 # ── rollout ────────────────────────────────────────────────────────────────────
 
-def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera_names: list[str]) -> bool:
+def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera_names: list[str],
+            apply_idx: list[int], gripper_cols: list[int], gripper_labels: list[str]) -> bool:
     obs_dict, _ = env.reset()
     policy_reset(sock)
+
+    # Seed the FULL joint-position-target buffer from the pose reset() just produced. That buffer
+    # is zeros until something writes it (Articulation._initialize_impl) and env.reset() does not
+    # reseed it, so every joint this script never commands is actively driven to 0.0 rather than
+    # left where it is -- an arbitrary pose for an arm, and fully CLOSED for a gripper. The joints
+    # we do command are overwritten every substep below, so this only affects the rest.
+    robot = env.scene["robot"]
+    robot.set_joint_position_target(robot.data.joint_pos.clone())
+
+    # Previous open/closed decision per hand, so the report can flag the transitions -- over a
+    # 300-step rollout the two or three steps where a jaw actually changes state are the whole
+    # story and are otherwise invisible in a wall of identical lines.
+    prev_open: list[bool] | None = None
 
     for step in range(horizon):
         if kb.consume_reset():
@@ -302,7 +410,26 @@ def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera
 
         policy_action = policy_step(sock, state, cameras)   # (n,) absolute joint targets
 
-        obs_dict = _step_direct(env, policy_action)
+        # Report what the gripper columns were commanded BEFORE _step_direct binarizes them, so
+        # both the policy's raw regressed value and the open/closed call it lands on are visible.
+        # Compared against the same GRIPPER_BINARY_THRESHOLD _binarize_grippers uses, so the
+        # printed decision cannot disagree with the one actually driven into the sim.
+        if gripper_cols:
+            binarizing = args_cli.gripper_threshold_ratio > 0.0
+            open_now = [bool(policy_action[c] >= GRIPPER_BINARY_THRESHOLD) for c in gripper_cols]
+            fields = [
+                f"{label} cmd={float(policy_action[col]):+.4f}"
+                + (f" -> {'OPEN ' if is_open else 'CLOSE'}" if binarizing else " (raw, not binarized)")
+                for label, col, is_open in zip(gripper_labels, gripper_cols, open_now)
+            ]
+            changed = binarizing and prev_open is not None and open_now != prev_open
+            print(
+                f"  [step {step+1:3d}] gripper  " + "  |  ".join(fields)
+                + ("   <-- CHANGED" if changed else "")
+            )
+            prev_open = open_now
+
+        obs_dict = _step_direct(env, policy_action, apply_idx, gripper_cols)
 
         if bool(success_term.func(env, **success_term.params)[0]):
             print(f"  [step {step+1:3d}] SUCCESS")
@@ -356,6 +483,33 @@ def main():
     print(f"Joint layout   : --arms {args_cli.arms} -> {len(DRIVEN_IDX)}D state/action")
     print(f"Task mode      : {args_cli.task_mode or 'none (base task cfg as-is)'}")
 
+    gripper_cols, follower_joints = _resolve_grippers(env)
+    apply_idx = list(DRIVEN_IDX) + follower_joints
+    joint_names = list(env.scene["robot"].data.joint_names)
+    print(
+        "Gripper binary : "
+        + (
+            f"open>={GRIPPER_BINARY_THRESHOLD:.4f} m"
+            f" ({args_cli.gripper_threshold_ratio:g} x {GRIPPER_OPEN_VAL} open),"
+            f" else {GRIPPER_CLOSED_VAL} closed"
+            if args_cli.gripper_threshold_ratio > 0.0
+            else "disabled (raw commanded position)"
+        )
+    )
+    # "openarm_left_finger_joint1" -> "left": the hand each gripper column speaks for, for the
+    # per-step report in rollout().
+    gripper_labels = [
+        joint_names[DRIVEN_IDX[c]].removeprefix("openarm_").removesuffix("_finger_joint1")
+        for c in gripper_cols
+    ]
+    print(
+        "Gripper mimic  : "
+        + ", ".join(
+            f"{joint_names[DRIVEN_IDX[c]]} -> {joint_names[j]}"
+            for c, j in zip(gripper_cols, follower_joints)
+        )
+    )
+
     print(f"\nConnecting to policy server on port {args_cli.port} …")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("127.0.0.1", args_cli.port))
@@ -372,7 +526,8 @@ def main():
             print("[keyboard] Quitting early.")
             break
         print(f"── Trial {trial + 1}/{args_cli.num_rollouts} ──────────────────")
-        success = rollout(env, sock, success_term, args_cli.horizon, kb, camera_names)
+        success = rollout(env, sock, success_term, args_cli.horizon, kb, camera_names,
+                          apply_idx, gripper_cols, gripper_labels)
         results.append(success)
 
     n_ok = results.count(True)
