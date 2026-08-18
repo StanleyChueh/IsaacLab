@@ -89,6 +89,72 @@ def transform_source_data_segment_using_object_pose(
     return transformed_eef_poses
 
 
+def smooth_eef_pose_segment(eef_poses: torch.Tensor, window: int) -> torch.Tensor:
+    """Low-pass a segment of target eef poses, without delaying it.
+
+    Args:
+        eef_poses: pose sequence (shape [T, 4, 4]) to smooth.
+        window: moving-average width in timesteps. Anything below 2 returns the input unchanged.
+            Even widths are rounded up to the next odd one, since only a symmetric window is
+            phase-free.
+
+    Returns:
+        smoothed pose sequence (shape [T, 4, 4]).
+
+    A moving average is applied TWICE (the second pass turns the box into a triangular kernel,
+    which rolls off far better at high frequency for the same delay -- none -- and the same
+    corner-cutting budget). The window is centred, so the filter has zero phase: a smoothed waypoint
+    sits at the same timestep as the one it replaces. That matters here because a segment is
+    replayed with a FIXED number of steps against a fixed subtask boundary; a causal filter would
+    smooth just as well but hand the arm a target that arrives late, so the grasp pose is reached
+    after the segment has ended.
+
+    Edges are clamped rather than shrunk, so the first and last waypoints stay within a millimetre
+    or so of where they were -- which is the part that has to be preserved, being where the seam to
+    the next segment is anchored and where the grasp actually happens.
+
+    Orientations are filtered as quaternions (hemisphere-aligned first, so a sign flip in the source
+    is not averaged into a tumble) and then re-normalised. Averaging quaternions componentwise is
+    only valid for small angular spreads, which is what neighbouring timesteps of a control
+    trajectory are.
+    """
+    window = int(window)
+    if window < 2:
+        return eef_poses
+    if window % 2 == 0:
+        window += 1
+    num_steps = eef_poses.shape[0]
+    if num_steps < 3:
+        return eef_poses
+
+    positions, rot_matrices = PoseUtils.unmake_pose(eef_poses)
+    quats = PoseUtils.quat_from_matrix(rot_matrices)
+
+    # Hemisphere-align: q and -q are the same rotation, but averaging across a sign flip is not.
+    # Each step's flip is relative to the ALREADY-aligned previous step, which is what the running
+    # product expresses.
+    signs = torch.ones(num_steps, dtype=quats.dtype, device=quats.device)
+    step_signs = torch.sign((quats[1:] * quats[:-1]).sum(dim=-1))
+    signs[1:] = torch.where(step_signs == 0, torch.ones_like(step_signs), step_signs)
+    quats = quats * torch.cumprod(signs, dim=0).unsqueeze(-1)
+
+    def _moving_average(values: torch.Tensor) -> torch.Tensor:
+        """Centred moving average over dim 0 of a (T, D) tensor, with the edges clamped."""
+        pad = window // 2
+        # conv1d wants (batch=D, channel=1, length=T); 'replicate' padding clamps the edges.
+        signal = values.transpose(0, 1).unsqueeze(1)
+        signal = torch.nn.functional.pad(signal, (pad, pad), mode="replicate")
+        kernel = torch.full((1, 1, window), 1.0 / window, dtype=values.dtype, device=values.device)
+        return torch.nn.functional.conv1d(signal, kernel).squeeze(1).transpose(0, 1)
+
+    for _ in range(2):
+        positions = _moving_average(positions)
+        quats = _moving_average(quats)
+
+    quats = quats / torch.linalg.norm(quats, dim=-1, keepdim=True).clamp_min(1e-8)
+    return PoseUtils.make_pose(positions, PoseUtils.matrix_from_quat(quats))
+
+
 def get_delta_pose_with_scheme(
     src_obj_pose: torch.Tensor,
     cur_obj_pose: torch.Tensor,
@@ -525,6 +591,13 @@ class DataGenerator:
 
                     # Skip transformation if no reference object is provided
                     transformed_eef_poses = src_eef_poses
+
+        # Low-pass the segment before executing it, if this subtask asks for it. Done AFTER the
+        # transform rather than on the source poses, so a segment's smoothing budget is spent on the
+        # trajectory that is actually run.
+        transformed_eef_poses = smooth_eef_pose_segment(
+            transformed_eef_poses, subtask_configs[subtask_ind].waypoint_smoothing_window
+        )
 
         # Construct trajectory for the transformed segment.
         transformed_seq = WaypointSequence.from_poses(

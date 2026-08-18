@@ -101,6 +101,18 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils.math import quat_apply_inverse
 
 
+# ── Tasks whose real target object is the can ────────────────────────────────
+# These tasks' own cfgs still describe the ORIGINAL cube (cube_2) -- apply_task_mode() is what
+# swaps in the can, along with the per-arm signals and success condition. Using one of them
+# without a task mode therefore silently gets you the CUBE: the run looks completely normal, and
+# the mistake only surfaces as a dataset (or an eval rollout) whose object is the wrong shape.
+# Cheaper to refuse up front than to discover it afterwards -- record_demos_openarm.py and
+# eval_smolvla_jointspace.py both check their --task against this list.
+CAN_TARGET_TASKS = (
+    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
+    "Isaac-PickUp-RedCube-OpenArm-CamMount-IK-Abs-v0",
+)
+
 # ── Modes ─────────────────────────────────────────────────────────────────────
 TASK_MODE_LEFT = "left"
 TASK_MODE_RIGHT = "right"
@@ -1165,7 +1177,13 @@ have nothing to say about that arm's action columns."""
 # ── Mimic subtask structures ──────────────────────────────────────────────────
 
 def _pick_subtasks(term_signal_grasp: str) -> list:
-    """The two-subtask pick-up sequence used by both single-arm modes: grasp, then lift."""
+    """The two-subtask pick-up sequence used by both single-arm modes: grasp, then lift.
+
+    ``action_noise`` / ``waypoint_smoothing_window`` are set to the same values as the hand-over's,
+    for the same measured reasons -- see :func:`_handover_subtask_configs`'s ``_subtask``. The demos
+    all these modes draw on are recorded by the same operator through the same VR teleop, so they
+    carry the same tremor.
+    """
     from isaaclab.envs.mimic_env_cfg import SubTaskConfig
 
     return [
@@ -1177,10 +1195,11 @@ def _pick_subtasks(term_signal_grasp: str) -> list:
             subtask_term_offset_range=(2, 5),
             selection_strategy="nearest_neighbor_object",
             selection_strategy_kwargs={"nn_k": 10},
-            action_noise=0.001,
+            action_noise=0.0,
             num_interpolation_steps=50,
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
+            waypoint_smoothing_window=5,
             description="Reach and grasp the can",
             next_subtask_description="Lift the can",
         ),
@@ -1190,10 +1209,11 @@ def _pick_subtasks(term_signal_grasp: str) -> list:
             subtask_term_offset_range=(0, 0),
             selection_strategy="nearest_neighbor_object",
             selection_strategy_kwargs={"nn_k": 10},
-            action_noise=0.001,
+            action_noise=0.0,
             num_interpolation_steps=10,
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
+            waypoint_smoothing_window=5,
             description="Lift the can above the table",
         ),
     ]
@@ -1344,10 +1364,39 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             # 3, not 10: |T| is now the episode's ONLY transform, so halving it is worth more than
             # the source diversity it costs. See the table in this function's docstring.
             selection_strategy_kwargs={"nn_k": 3} if object_ref is not None else {},
-            action_noise=0.001,
+            # 0, not the 0.001 this used to carry. That noise is iid per step and per axis, i.e.
+            # white: it is the one component of the generated motion that has no counterpart in the
+            # source demos, and it lands squarely in the band the arm can actually track. Measured
+            # over logs/demos/pickup_pringles_V8_generated.hdf5 against its own source
+            # (pickup_pringles_V8_annotated.hdf5), the high-frequency wiggle of the eef path -- the
+            # residual after a 5-step moving average -- is 2.02/2.70 mm (left/right) generated
+            # against 1.45/2.05 mm in the source, and the difference in quadrature (1.4/1.8 mm) is
+            # exactly the ~1.7 mm a 1 mm-per-axis Gaussian puts into a 3D norm. The same measurement
+            # shows the per-axis eef velocity reversing direction on 51-59% of generated steps
+            # against 17-32% of source steps, which is the signature of dither, not of motion.
+            #
+            # Mimic's action noise buys trajectory diversity, but this task gets its diversity from
+            # the spawn range and the nn_k=3 source selection, and the cost is paid by every frame
+            # of every exported demo.
+            action_noise=0.0,
             num_interpolation_steps=interp,
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
+            # The source demos are hand-recorded through VR teleop and are NOT smooth: measured on
+            # pickup_pringles_V8_annotated.hdf5 the right eef carries a mean |accel| of 3.1 mm/step^2
+            # against a mean speed of 4.9 mm/step, with peaks of 53 mm/step^2 -- i.e. the operator's
+            # hand tremor and lurches are about as large as the motion itself. Generation replays
+            # those waypoints one per control step, so all of it is inherited verbatim; the
+            # generated episodes' accel peaks (24-49 mm/step^2) are simply the source's.
+            #
+            # 5 is picked from what it does to the source paths, filtered offline the same way this
+            # filter does it: mean |accel| 3.08 -> 0.88 mm/step^2 and peak 53 -> 5.3, with the mean
+            # speed only dropping 4.93 -> 4.19 mm/step. The cost is corner-cutting -- up to ~2.7 cm
+            # at the sharpest direction change in a segment -- while the segment ENDPOINTS, which is
+            # where the grasp and the seam live, move by ~1 mm. Widening to 9 buys another halving of
+            # the accel but pushes the worst-case corner past 3.8 cm, which starts to matter against
+            # this task's 7 cm grasp cylinder.
+            waypoint_smoothing_window=5,
             description=description,
         )
 

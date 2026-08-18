@@ -146,9 +146,10 @@ parser.add_argument(
         " space and the episode is exported only once it arrives -- so the retreat is RECORDED as"
         " part of the demo instead of happening off-camera during the reset. The grippers are held"
         " at whatever they were commanded to, so a held object is carried back rather than dropped."
-        " The trajectory picks up from the pose and speed the arms were last commanded at and eases"
-        " to a stop (see ReturnToRestTrajectory), so this buys a shorter tail on every episode"
-        " without the joints being asked to jump or to stop dead -- lower it"
+        " The path is planned once, from the pose the arms are in when X is pressed, and walked with"
+        " a minimum-jerk profile that eases out of that pose and into the rest pose (see"
+        " ReturnToRestTrajectory) -- so this buys a shorter tail on every episode without the joints"
+        " being asked to start or stop dead, and without any joint overshooting. Lower it"
         " further if the retreat still drags, raise it if a carried object slips or swings."
         " Set to 0 to export immediately on the second press (the old behavior). Only applies to"
         " the joint-space Quest-button devices (vr_joint_ros2 / vr_joint_ros2_native); the N key"
@@ -504,6 +505,7 @@ from isaaclab.utils import configclass
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm import openarm_task_modes
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+    CAN_TARGET_TASKS,
     CONTROLLED_ARMS,
     apply_task_mode,
 )
@@ -703,17 +705,6 @@ def make_resumable(handler_class: type) -> type:
     """
     return type(f"Resumable{handler_class.__name__}", (ResumeExistingDatasetMixin, handler_class), {})
 
-
-# ─── Tasks whose real target object is the can ────────────────────────────────
-# These tasks' own cfgs still describe the ORIGINAL cube (cube_2) -- apply_task_mode() is what
-# swaps in the can, along with the per-arm signals and success condition. Recording one of them
-# without --task_mode therefore silently produces cube demos: the run looks completely normal,
-# and the mistake only surfaces later as a dataset whose object is the wrong shape. Cheaper to
-# refuse up front than to discover it after a recording session (see main()).
-CAN_TARGET_TASKS = (
-    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
-    "Isaac-PickUp-RedCube-OpenArm-CamMount-IK-Abs-v0",
-)
 
 # ─── Motion gate: no robot motion before the episode is armed ─────────────────
 MOTION_GATE = {"enabled": True}
@@ -2016,20 +2007,22 @@ def run_ramp_to_rest_test(env, duration: float = 4.0, rate_hz: float = 50.0, sto
 
 
 class ReturnToRestTrajectory:
-    """The closing motion of a recorded episode: a joint-space trajectory from wherever the arms
-    were last commanded to back to the task's rest pose, executed one control step at a time THROUGH
-    the main loop's ``env.step()`` so every step of it lands in the episode.
+    """The closing motion of a recorded episode: a joint-space trajectory from the pose the arms
+    were in when the operator pressed X back to the task's rest pose, executed one control step at a
+    time THROUGH the main loop's ``env.step()`` so every step of it lands in the episode.
 
-    The same straight line through joint space as ``run_ramp_to_rest_test`` (and, on hardware,
-    reset_to_rest_pose.py's ``ramp_to()``) -- ``cmd = start + alpha * (rest - start)`` -- but with
-    three differences that matter. That one drives PhysX directly with ``env.step()`` bypassed, which
-    is exactly why it records nothing; here the ramp only *produces* an action vector and the main
-    loop steps the env with it. Its ``alpha`` is linear in time, where this one is a quintic
-    minimum-jerk profile (see :meth:`advance`) so the retreat can be short without arriving abruptly.
-    And its start state is the arms' *measured* pose at rest, where this one starts from the pose and
-    velocity the arms were last **commanded** to and were actually moving at (see :meth:`start`) --
-    which is what makes the handover from live teleop to this trajectory seamless from any pose the
-    operator happens to stop in, mid-motion or not.
+    The whole path is fixed at the press (see :meth:`start`) and never re-planned: it is the
+    straight line in joint space from that latched pose to the rest pose, walked with a quintic
+    minimum-jerk time profile (see :meth:`advance`). Both halves of that matter for how it looks --
+    a straight line cannot wander off the path, and a monotone profile cannot leave the segment, so
+    no joint can swing past the rest pose or away from it and come back.
+
+    The same straight line as ``run_ramp_to_rest_test`` (and, on hardware, reset_to_rest_pose.py's
+    ``ramp_to()``) -- ``cmd = start + alpha * (rest - start)`` -- but with two differences that
+    matter. That one drives PhysX directly with ``env.step()`` bypassed, which is exactly why it
+    records nothing; here the ramp only *produces* an action vector and the main loop steps the env
+    with it. And its ``alpha`` is linear in time, where this one is smooth in velocity and
+    acceleration at both ends, so the retreat can be short without starting or arriving abruptly.
 
     Only meaningful for the two joint-layout devices (see requires_manual_arm), and the two encode
     that 16D vector differently, hence ``is_native``:
@@ -2068,21 +2061,11 @@ class ReturnToRestTrajectory:
     #: a pose the arm has never been in.
     MAX_COMMAND_LAG = 0.5
 
-    #: Cap on the departure velocity the profile is allowed to carry, expressed as the distance it
-    #: would cover at that velocity over the ramp's whole duration (rad). The velocity term peaks at
-    #: ~0.2x this much of extra excursion beyond the direct path, so 0.75 rad buys the smooth
-    #: deceleration while bounding any overshoot at roughly 0.15 rad (~9 deg) per joint.
-    MAX_START_LEAD = 0.75
-
     def __init__(self, robot, sim_device: str, duration: float, rate_hz: float, is_native: bool):
         self._robot = robot
         self._device = sim_device
         self._is_native = is_native
         self._steps = max(1, int(round(duration * rate_hz)))
-        # The duration actually flown, which is the step count rounded above rather than the
-        # requested `duration` -- the velocity term is scaled by it and has to agree with the `s`
-        # advance() computes, or the profile would depart at a velocity slightly off the arm's.
-        self._duration = self._steps / rate_hz
         # Same find_joints() calls, in the same order, that ROS2NativeJointTeleop/
         # swap_to_joint_position_actions resolve the 16D layout's columns with -- index by the
         # resolved ids, never by assuming the regex enumerates joint1..joint7 in order.
@@ -2099,15 +2082,13 @@ class ReturnToRestTrajectory:
         self.right_gripper_cmd = 0.0
         self._grippers_latched = False
         self._step = 0
-        # Placeholders only -- start() overwrites all four, and `active` is what gates advance().
+        # Placeholders only -- start() overwrites both, and `active` is what gates advance().
         self._left_start = torch.zeros(len(self._left_ids), device=sim_device)
         self._right_start = torch.zeros(len(self._right_ids), device=sim_device)
-        self._left_lead = torch.zeros_like(self._left_start)
-        self._right_lead = torch.zeros_like(self._right_start)
 
     def start(self) -> None:
-        """Latch the trajectory's start state -- the arms' last COMMANDED joint targets and the
-        velocity they are actually travelling at -- and begin.
+        """Latch the pose the whole trajectory is planned from -- the arms' last COMMANDED joint
+        targets, i.e. where they are at the instant X was pressed -- and begin.
 
         The start pose is read from ``robot.data.joint_pos_target``, NOT ``robot.data.joint_pos``,
         because this trajectory *commands* positions rather than measuring them. Under the implicit
@@ -2122,11 +2103,19 @@ class ReturnToRestTrajectory:
         sequence continuous matters just as much: a jump baked into the same place in every demo is a
         jump the policy learns to reproduce.
 
-        Velocities are latched for the same reason one derivative up. The operator's hands are often
-        still moving when they press X, and a profile that departs at zero velocity is a demand for
-        an instantaneous stop -- so :meth:`advance` departs at this velocity and bleeds it off
-        instead. Between the two, the trajectory is smooth out of any pose *and* any motion the
-        episode happens to end in.
+        Position is ALL that is latched. An earlier version also latched the joint velocities and
+        had :meth:`advance` depart at them, on the theory that a profile leaving from zero velocity
+        demands an instantaneous stop from an operator whose hands are still moving. In practice
+        that made the retreat visibly worse, which is why it is gone: a velocity term does not
+        travel along the start-to-rest line, it bulges off it, so a joint that happened to be
+        drifting when X was pressed first swung up to ~8 deg the way it was already going and only
+        then came back -- an overshoot on the way OUT, worst for exactly the joints already near
+        their rest pose and with nowhere to go. It was also fed from measured ``joint_vel``, so
+        per-step velocity noise went straight into the commanded path. Departing from rest instead
+        costs one thing only, a step in commanded velocity at the handover, and the profile below
+        answers that where it belongs: it leaves at zero acceleration, so the command barely moves
+        over the first few steps and the arm is decelerated by the tracking loop rather than by a
+        demand to be somewhere else immediately.
 
         The grippers are deliberately NOT latched here: this runs from the button callback, which
         fires from inside the teleop device's own build_dual_action() before that method has
@@ -2138,27 +2127,19 @@ class ReturnToRestTrajectory:
         ones the simulation is still converging to.
         """
         self._step = 0
-        self._left_start, self._left_lead = self._latch_arm_start(self._left_ids)
-        self._right_start, self._right_lead = self._latch_arm_start(self._right_ids)
+        self._left_start = self._latch_arm_start(self._left_ids)
+        self._right_start = self._latch_arm_start(self._right_ids)
         self._grippers_latched = False
         self.active = True
 
-    def _latch_arm_start(self, joint_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        """One arm's start pose and departure lead -- see :meth:`start` for why these come from the
-        commanded targets and the measured velocities.
-
-        Returns:
-            ``(start_pos, lead)``. ``lead`` is the start velocity pre-multiplied by the ramp's
-            duration, i.e. already in the units :meth:`advance`'s normalised-time basis wants, and
-            clamped to :attr:`MAX_START_LEAD`.
+    def _latch_arm_start(self, joint_ids: list[int]) -> torch.Tensor:
+        """One arm's start pose -- see :meth:`start` for why it comes from the commanded targets,
+        and :attr:`MAX_COMMAND_LAG` for why it is clamped against the measured ones.
         """
         measured = self._robot.data.joint_pos[0, joint_ids]
         commanded = self._robot.data.joint_pos_target[0, joint_ids]
         start = torch.clamp(commanded, measured - self.MAX_COMMAND_LAG, measured + self.MAX_COMMAND_LAG)
-        lead = (self._robot.data.joint_vel[0, joint_ids] * self._duration).clamp(
-            -self.MAX_START_LEAD, self.MAX_START_LEAD
-        )
-        return start.clone(), lead.clone()
+        return start.clone()
 
     def stop(self) -> None:
         """End the ramp and hand control back to the teleop device."""
@@ -2186,34 +2167,27 @@ class ReturnToRestTrajectory:
             self.right_gripper_cmd = right_gripper_cmd
             self._grippers_latched = True
         self._step += 1
-        # A quintic minimum-jerk profile rather than the linear `s` run_ramp_to_rest_test uses: it
-        # arrives at zero joint velocity AND zero acceleration, which is what makes a SHORT return
-        # usable. A linear ramp reaches its full speed on step one and drops to zero on the last, and
-        # at these durations that pair of velocity steps is what shakes a carried object loose -- so
-        # the same peak effort buys a noticeably quicker retreat here. Peak rate is 1.875x the
-        # average, i.e. --return_to_rest_secs 1.5 moves no faster at its quickest than a linear 0.8 s
-        # ramp would throughout.
+        # Quintic minimum-jerk interpolation (10s^3 - 15s^4 + 6s^5) between the pose latched at the
+        # press and the rest pose, rather than the linear `s` run_ramp_to_rest_test uses. Two
+        # properties, and the retreat needs both:
         #
-        # Two bases, summed, because the boundary conditions at the two ends are not symmetric:
-        #
-        # * `pos_basis` (10s^3 - 15s^4 + 6s^5) carries the actual travel, 0 -> 1, flat in both
-        #   velocity and acceleration at each end.
-        # * `vel_basis` (s - 6s^3 + 8s^4 - 3s^5) starts at zero with unit slope and decays to zero
-        #   value, slope and curvature by s = 1. Scaled by the latched lead, it is what lets the
-        #   trajectory *depart at the speed the arm is already moving* and bleed that motion off,
-        #   instead of demanding it stop dead on the first sample. This is the half the older
-        #   smoothstep could not express: smoothstep eases in from zero velocity, which reads as
-        #   smooth only if the arm was already stationary when the operator pressed X.
-        #
-        # Both are exact at the endpoints, so s = 1 still lands on the rest pose to the bit.
+        # * It leaves AND arrives at zero velocity and zero acceleration. A linear ramp reaches full
+        #   speed on step one and drops to zero on the last, and at these durations that pair of
+        #   velocity steps is what shakes a carried object loose. Peak rate here is 1.875x the
+        #   average, i.e. --return_to_rest_secs 1.5 moves no faster at its quickest than a linear
+        #   0.8 s ramp would throughout -- so the same peak effort buys a noticeably shorter tail.
+        # * It is monotone on [0, 1]: `alpha` climbs from 0 to 1 without ever exceeding 1 or turning
+        #   back. Every joint therefore travels its own straight line from start to rest and stops
+        #   there. There is nothing in the expression that can overshoot the rest pose or bulge off
+        #   the line on the way -- which is precisely what the velocity feed-forward this replaced
+        #   did (see :meth:`start`).
         s = min(1.0, self._step / self._steps)
-        pos_basis = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
-        vel_basis = s * (1.0 - s * s * (6.0 - 8.0 * s + 3.0 * s * s))
+        alpha = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
         default = self._robot.data.default_joint_pos
         left_rest = default[0, self._left_ids]
         right_rest = default[0, self._right_ids]
-        left_target = self._left_start + pos_basis * (left_rest - self._left_start) + vel_basis * self._left_lead
-        right_target = self._right_start + pos_basis * (right_rest - self._right_start) + vel_basis * self._right_lead
+        left_target = self._left_start + alpha * (left_rest - self._left_start)
+        right_target = self._right_start + alpha * (right_rest - self._right_start)
 
         if self._is_native:
             full_target = default.clone()

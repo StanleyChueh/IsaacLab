@@ -18,10 +18,14 @@ Protocol (TCP, framed by 4-byte big-endian length prefix + pickle payload):
     {"cmd": "step",
      "state": ndarray(state_dim,),
      "cameras": {"camera1": uint8 HWC, "camera2": uint8 HWC, "camera3": uint8 HWC}}
-    {"cmd": "close"}                   → shut down server
+    {"cmd": "close"}                   → end this client session
   Server → Client:
     {"ok": True}                       → after reset / close
     {"action": ndarray(action_dim,)}   → after step
+    {"error": str}                     → a step raised; the session and server both survive
+
+The server keeps listening after a client disconnects (or sends "close"), so eval runs can be
+repeated back-to-back without restarting it and re-loading the checkpoint. Stop it with Ctrl-C.
 """
 
 import argparse
@@ -205,32 +209,54 @@ def main():
     srv.bind(("127.0.0.1", args.port))
     srv.listen(1)
     print(f"[server] Listening on 127.0.0.1:{args.port} — waiting for Isaac Sim client …")
+    print("[server] Stays up across client disconnects; Ctrl-C to shut down.")
 
+    # Outer loop: serve one client at a time, but keep the (expensively loaded) policy alive and
+    # go back to accept() when that client goes away, so repeated eval runs don't need a restart.
     try:
-        conn, addr = srv.accept()
-        print(f"[server] Client connected from {addr}")
-        with conn:
-            while True:
-                raw = recv_msg(conn)
-                if not raw:
-                    print("[server] Client disconnected.")
-                    break
-                msg = pickle.loads(raw)
-                cmd = msg.get("cmd", "step")
+        while True:
+            conn, addr = srv.accept()
+            print(f"[server] Client connected from {addr}")
+            # Fresh action queue for the new session even if the client forgets to send "reset".
+            server.reset()
+            try:
+                with conn:
+                    while True:
+                        raw = recv_msg(conn)
+                        if not raw:
+                            print("[server] Client disconnected.")
+                            break
+                        msg = pickle.loads(raw)
+                        cmd = msg.get("cmd", "step")
 
-                if cmd == "close":
-                    send_msg(conn, pickle.dumps({"ok": True}))
-                    break
-                elif cmd == "reset":
-                    server.reset()
-                    send_msg(conn, pickle.dumps({"ok": True}))
-                elif cmd == "step":
-                    action = server.step(msg["state"], msg["cameras"])
-                    # Send as a plain Python list so the client can unpickle it
-                    # regardless of numpy version (lerobot=numpy2, isaaclab=numpy1).
-                    send_msg(conn, pickle.dumps({"action": action.tolist()}))
-                else:
-                    send_msg(conn, pickle.dumps({"error": f"unknown cmd {cmd!r}"}))
+                        if cmd == "close":
+                            send_msg(conn, pickle.dumps({"ok": True}))
+                            print("[server] Client closed the session.")
+                            break
+                        elif cmd == "reset":
+                            server.reset()
+                            send_msg(conn, pickle.dumps({"ok": True}))
+                        elif cmd == "step":
+                            try:
+                                action = server.step(msg["state"], msg["cameras"])
+                            except Exception as exc:
+                                # Report it instead of dying -- a bad state/camera shape from one
+                                # eval run must not take the loaded checkpoint down with it.
+                                print(f"[server] step failed: {exc!r}")
+                                send_msg(conn, pickle.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+                                continue
+                            # Send as a plain Python list so the client can unpickle it
+                            # regardless of numpy version (lerobot=numpy2, isaaclab=numpy1).
+                            send_msg(conn, pickle.dumps({"action": action.tolist()}))
+                        else:
+                            send_msg(conn, pickle.dumps({"error": f"unknown cmd {cmd!r}"}))
+            except OSError as exc:
+                # Client vanished mid-message (killed Isaac Sim, crashed rollout) -- log it and
+                # go back to accept() rather than taking the server down.
+                print(f"[server] Connection lost: {exc!r}")
+            print(f"[server] Listening again on 127.0.0.1:{args.port} — Ctrl-C to shut down.")
+    except KeyboardInterrupt:
+        print("\n[server] Interrupted.")
     finally:
         srv.close()
         print("[server] Shut down.")

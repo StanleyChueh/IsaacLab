@@ -159,6 +159,25 @@ class SubTaskConfig:
     apply_noise_during_interpolation: bool = False
     """Whether to apply noise during interpolation."""
 
+    waypoint_smoothing_window: int = 0
+    """Width of the moving-average filter applied to this subtask's transformed waypoints. 0 = off.
+
+    Generation replays a source segment one recorded waypoint per control step, so the generated
+    motion is exactly as smooth as the teleoperation was. Hand-recorded demos are not smooth: the
+    high-frequency dither of the operator's hand is in every waypoint, and a policy trained on it
+    learns to reproduce it.
+
+    Set to an odd width (5 is a good starting point) to low-pass the segment's target poses --
+    positions and orientations both -- before they are executed. The filter is symmetric and applied
+    forward only, i.e. ZERO PHASE: it removes jitter without delaying the trajectory, which a causal
+    filter could not do (a lagging target arrives at the grasp pose late, and the segment has a fixed
+    number of steps to get there).
+
+    Smoothing cuts corners, so it trades path fidelity for smoothness. The endpoints are edge-clamped
+    and move by ~1 mm, but a sharp direction change mid-segment can be rounded off by a few
+    centimetres. Widen this only as far as the task's own tolerances allow.
+    """
+
     description: str = ""
     """Description of the subtask"""
 
