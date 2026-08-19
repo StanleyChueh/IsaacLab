@@ -89,6 +89,8 @@ its params (see ``ManagerBase._resolve_common_term_cfg``) and a ``**kwargs`` cat
 it as an unsatisfied mandatory argument.
 """
 
+import logging
+
 import torch
 
 import isaaclab.sim as sim_utils
@@ -99,6 +101,8 @@ from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
 from isaaclab.sensors import FrameTransformer, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils.math import quat_apply_inverse
+
+logger = logging.getLogger(__name__)
 
 
 # ── Tasks whose real target object is the can ────────────────────────────────
@@ -250,6 +254,22 @@ Costs ~1.3 mm of the can sinking into the pad at rest (rest offsets sum across a
 which is well under what is visible on a 200 mm can. Do not make this much larger for that reason,
 and do not make it positive -- a positive rest offset is an actual air gap at every contact."""
 
+CAN_NOMINAL_LENGTH = 2.0 * CAN_HALF_HEIGHT
+"""m -- the can's full length at :data:`CAN_SCALE` (0.2 m). The size that
+:func:`randomize_object_size` perturbs AROUND, so a delta of 0 reproduces today's can exactly."""
+
+CAN_NOMINAL_RADIUS = 0.030
+"""m -- the can's body radius at :data:`CAN_SCALE`. Half of the 0.0586 m body-visual diameter
+measured in-sim (see :data:`CAN_REST_OFFSET`), rounded to the 60 mm the rest of this module quotes.
+The other size :func:`randomize_object_size` perturbs around."""
+
+MAX_GRASPABLE_DIAMETER = 2.0 * GRIPPER_OPEN_VAL
+"""m -- how wide an object the hand can close around at all: both jaws travel
+:data:`GRIPPER_OPEN_VAL` from shut, so a can fatter than this cannot be picked up no matter how
+good the trajectory is. Used only to warn about a randomization range that would generate
+impossible episodes -- nothing clamps to it, because a deliberately impossible can is a legitimate
+thing to ask for and silently shrinking it would be worse."""
+
 EEF_TO_CAN_THRESHOLD = 0.07
 """Max distance (m) from a TCP to the can's origin for a single-arm grasp to count as holding it.
 A hand steadying a free-standing 200 mm can (60 mm diameter, 30 mm radius post-scale) grips near
@@ -286,6 +306,43 @@ link as the end-effector makes every hand-to-object distance overshoot by 102.5 
 on its own to stop any grasp signal from ever firing -- a real closed grasp measured 0.1236 m
 against a 0.07 m threshold. It also feeds Mimic, which transforms source segments relative to the
 eef pose it is given, so a frame 10 cm behind the hand mis-places every generated trajectory."""
+
+
+# ── Per-env object size ───────────────────────────────────────────────────────
+
+_OBJECT_SIZE_ATTR = "_openarm_object_size_deltas"
+"""Attribute :func:`randomize_object_size` hangs its sampled per-env sizes off the env object.
+
+Stored on the env rather than threaded through every term's params because the sizes are drawn at
+prestartup, long after the cfg (and therefore every term's params) has been frozen, and because
+five different signals need them -- see :func:`object_size_deltas`."""
+
+
+def object_size_deltas(env) -> tuple[torch.Tensor | float, torch.Tensor | float]:
+    """(length_delta, radius_delta) in metres, per env, relative to the nominal can.
+
+    Returns ``(0.0, 0.0)`` -- plain floats, which broadcast against anything -- when
+    :func:`randomize_object_size` was never installed, so every caller can add these
+    unconditionally instead of branching on whether randomization is on.
+
+    Five things depend on the can's actual size, and all of them are wrong by exactly these deltas
+    if they keep using the nominal numbers:
+
+    * where the can's ORIGIN rests (its centre, so half the length delta above the pad) --
+      :func:`_object_rest_z`;
+    * what counts as lifted, which is measured from that resting origin --
+      :func:`object_lifted_and_grasped` and :func:`_handover_tick`;
+    * how far along the can a hand may be and still be on it -- half the length delta again,
+      in :func:`hand_on_object`;
+    * how far ACROSS the can a hand may be -- the radius delta, same place;
+    * how far apart the jaws sit when they are holding it -- twice the radius delta, in
+      :func:`receiver_grip_confirmed`, whose band is narrow enough that a 2 cm-fatter can falls
+      straight out of the top of it and every hand-over reads as a drop.
+    """
+    deltas = getattr(env, _OBJECT_SIZE_ATTR, None)
+    if deltas is None:
+        return 0.0, 0.0
+    return deltas["length"], deltas["radius"]
 
 
 # ── Signal primitives ─────────────────────────────────────────────────────────
@@ -406,6 +463,14 @@ def receiver_grip_confirmed(
     """
     aperture = gripper_aperture(env, gripper_joint_names, robot_cfg)
     min_aperture, max_aperture = aperture_range
+    # The band brackets the aperture a hand settles at around a NOMINAL can, so it has to slide
+    # with the can's actual width: jaws around a can 1 cm larger in radius sit 2 cm further apart
+    # (one cm per side). This is the signal that breaks first without the correction -- the band is
+    # only 4 cm wide, so a can 2 cm fatter lands clean outside its top and every completed
+    # hand-over reads as the receiving hand shutting on empty air.
+    _, radius_delta = object_size_deltas(env)
+    min_aperture = min_aperture + 2.0 * radius_delta
+    max_aperture = max_aperture + 2.0 * radius_delta
     return (
         hand_on_object(env, ee_frame_cfg, object_cfg, diff_threshold, axial_threshold)
         & (aperture <= max_aperture)
@@ -426,9 +491,19 @@ def hand_on_object(
     two halves separately: :func:`receiver_grip_confirmed` pairs this same "the hand is on the can"
     test with an aperture BAND rather than with "the jaws left the open position", which is what
     lets it tell a hand holding the can from a hand shut on empty air.
+
+    Both bounds move with the can's actual size (:func:`object_size_deltas`): a can 5 cm longer
+    reaches 2.5 cm further past its own origin at each end, and one 1 cm fatter puts the hand 1 cm
+    further out from the axis for the identical grip. Leaving the thresholds at their nominal
+    values would make the same physical grasp read as "on the can" or not depending only on which
+    env drew which size.
     """
+    length_delta, radius_delta = object_size_deltas(env)
     radial, axial = hand_to_object_offsets(env, ee_frame_cfg, object_cfg)
-    return torch.logical_and(radial < diff_threshold, axial < axial_threshold)
+    return torch.logical_and(
+        radial < diff_threshold + radius_delta,
+        axial < axial_threshold + 0.5 * length_delta,
+    )
 
 
 def object_grasped_by_obs(
@@ -473,8 +548,12 @@ def object_lifted_and_grasped(
     producing "successful" episodes with no grasp anywhere in them.
     """
     obj: RigidObject = env.scene[object_cfg.name]
+    # *min_height* was computed at cfg-build time from the NOMINAL can's resting origin; a longer
+    # can rests with its centre half the length delta higher, so without this shift a randomized
+    # tall can would count as lifted before it had left the pad.
+    length_delta, _ = object_size_deltas(env)
     return torch.logical_and(
-        obj.data.root_pos_w[:, 2] > min_height,
+        obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta,
         object_grasped_by(
             env,
             ee_frame_cfg=ee_frame_cfg,
@@ -845,7 +924,10 @@ def _handover_tick(
     # the other hand, so demanding height at the instant of the pass rejects the natural motion.
     # Measured on real demos, the can peaks at 0.416-0.427 while the right arm carries it and is
     # back down at 0.388-0.398 by the time both hands are on it.
-    lifted_now = obj.data.root_pos_w[:, 2] > min_height
+    # + half the length delta for the same reason as in object_lifted_and_grasped: a taller can
+    # starts higher, and *min_height* is a nominal-can number baked in at cfg-build time.
+    length_delta, _ = object_size_deltas(env)
+    lifted_now = obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta
     memory["was_lifted"] |= right_holds & lifted_now
     stage[(stage == HANDOVER_STAGE_WAITING) & right_holds] = HANDOVER_STAGE_RIGHT_HELD
 
@@ -1119,15 +1201,211 @@ def reset_object_free(
     states = asset.data.default_root_state[env_ids].clone()
     states[:, 0] = env.scene.env_origins[env_ids, 0] + x
     states[:, 1] = env.scene.env_origins[env_ids, 1] + y
-    states[:, 2] = env.scene.env_origins[env_ids, 2] + _object_rest_z(env)
+    states[:, 2] = env.scene.env_origins[env_ids, 2] + _object_rest_z(env, env_ids)
     states[:, 3:7] = torch.tensor(rot, device=device, dtype=states.dtype)
     states[:, 7:] = 0.0  # a spawn should not inherit the velocity it had when the episode ended
     asset.write_root_state_to_sim(states, env_ids=env_ids)
 
 
-def _object_rest_z(env) -> float:
-    """Height (env-local m) at which the can's origin sits when standing on the pad."""
-    return 2.0 * float(env.cfg.scene.workspace_pad.init_state.pos[2]) + CAN_HALF_HEIGHT
+def _object_rest_z(env, env_ids: torch.Tensor | None = None):
+    """Height (env-local m) at which the can's origin sits when standing on the pad.
+
+    A float when every env's can is the nominal size, an (N,) tensor once
+    :func:`randomize_object_size` has given the envs different lengths -- the origin is the can's
+    CENTRE, so a can 5 cm longer stands with its origin 2.5 cm higher on the same pad. Pass
+    *env_ids* to get the rows for a subset (:func:`reset_object_free` writes only the envs it is
+    resetting); omit it for all of them.
+    """
+    nominal = 2.0 * float(env.cfg.scene.workspace_pad.init_state.pos[2]) + CAN_HALF_HEIGHT
+    length_delta, _ = object_size_deltas(env)
+    if isinstance(length_delta, float):
+        return nominal
+    if env_ids is not None:
+        length_delta = length_delta[env_ids]
+    return nominal + 0.5 * length_delta
+
+
+def randomize_object_size(
+    env,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    length_delta_range: tuple[float, float] = (0.0, 0.0),
+    radius_delta_range: tuple[float, float] = (0.0, 0.0),
+) -> None:
+    """Give each env its own can size, by rewriting that env's can prim's USD scale.
+
+    A ``prestartup`` event term, not a ``reset`` one, and it cannot be anything else: the scale
+    lives in USD and is read by PhysX when the simulation starts, so it is settable exactly once,
+    before play. Isaac Lab enforces that (``randomize_rigid_body_scale`` raises if the sim is
+    playing) and this follows the same rule. The practical consequence is worth being explicit
+    about, because it decides how you should invoke the caller:
+
+        **one size per ENV, fixed for the whole run -- not one size per episode.**
+
+    So a run with ``--num_envs 4`` generates every one of its episodes against just 4 can sizes.
+    For a dataset that actually covers the range, raise ``--num_envs`` (each env is an independent
+    draw) and/or make several runs -- the draws are unseeded at this point in startup, so repeated
+    runs of the same command get different sizes.
+
+    Length and radius are drawn INDEPENDENTLY, and applied as a non-uniform scale: (r, r, l) about
+    the can's own axes, which is +Z (see :data:`CAN_ROT`). The deltas are absolute metres off
+    :data:`CAN_NOMINAL_LENGTH` / :data:`CAN_NOMINAL_RADIUS` rather than scale factors, because the
+    thing worth controlling is how far the prop is from the real Pringles can, in the units the
+    real one is measured in.
+
+    Mass is deliberately left alone. The asset carries an explicit MassAPI (0.205 kg) which USD
+    scale does not touch, so every size weighs the same. That keeps the dynamics comparable across
+    sizes -- the variation being trained against here is geometric.
+
+    Args:
+        env_ids: envs to randomize; ``None`` (what the event manager passes at prestartup) means
+            all of them.
+        asset_cfg: the object to resize. Its prim is looked up per env off
+            ``scene.env_prim_paths`` rather than by regex match, so the env index that gets a
+            given size is the env index that reports it -- ``find_matching_prim_paths`` orders
+            lexically, which puts env_10 before env_2.
+        length_delta_range: (min, max) metres to add to the can's length. (0, 0) leaves it nominal.
+        radius_delta_range: (min, max) metres to add to the can's radius.
+    """
+    # Imported here rather than at module scope: this module is imported by env cfgs, and pxr is
+    # only importable once the Isaac Sim app has been launched.
+    from pxr import Gf, Sdf, UsdGeom, Vt
+
+    from isaaclab.sim.utils.stage import get_current_stage
+
+    if env.sim.is_playing():
+        raise RuntimeError(
+            "randomize_object_size must run before the simulation starts -- USD scale is baked"
+            " into PhysX at play time, so changing it later has no effect on the collision"
+            " geometry. Install it with mode='prestartup'."
+        )
+
+    asset: RigidObject = env.scene[asset_cfg.name]
+    num_envs = env.scene.num_envs
+    ids = list(range(num_envs)) if env_ids is None else [int(i) for i in env_ids]
+
+    length_delta = torch.empty(len(ids)).uniform_(*length_delta_range)
+    radius_delta = torch.empty(len(ids)).uniform_(*radius_delta_range)
+    # Scale is a RATIO to the authored asset, and CAN_SCALE is already a ratio to it, so the two
+    # multiply -- writing the delta ratio alone here would silently drop the 0.8 the whole task is
+    # calibrated at.
+    length_scale = CAN_SCALE * (CAN_NOMINAL_LENGTH + length_delta) / CAN_NOMINAL_LENGTH
+    radius_scale = CAN_SCALE * (CAN_NOMINAL_RADIUS + radius_delta) / CAN_NOMINAL_RADIUS
+
+    prim_name = asset.cfg.prim_path.rsplit("/", 1)[-1]
+    stage = get_current_stage()
+    with Sdf.ChangeBlock():
+        for row, env_id in enumerate(ids):
+            prim_path = f"{env.scene.env_prim_paths[env_id]}/{prim_name}"
+            prim_spec = Sdf.CreatePrimInLayer(stage.GetRootLayer(), prim_path)
+
+            scale_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOp:scale")
+            has_scale_attr = scale_spec is not None
+            if not has_scale_attr:
+                scale_spec = Sdf.AttributeSpec(prim_spec, prim_path + ".xformOp:scale", Sdf.ValueTypeNames.Double3)
+            scale_spec.default = Gf.Vec3f(
+                float(radius_scale[row]), float(radius_scale[row]), float(length_scale[row])
+            )
+            if not has_scale_attr:
+                op_order_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOpOrder")
+                if op_order_spec is None:
+                    op_order_spec = Sdf.AttributeSpec(
+                        prim_spec, UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray
+                    )
+                op_order_spec.default = Vt.TokenArray(["xformOp:translate", "xformOp:orient", "xformOp:scale"])
+
+    # Record what was drawn. Every size-dependent signal reads it back through
+    # object_size_deltas() -- see that function for the list of what would be wrong without it.
+    store = getattr(env, _OBJECT_SIZE_ATTR, None)
+    if store is None:
+        store = {
+            "length": torch.zeros(num_envs, device=env.device),
+            "radius": torch.zeros(num_envs, device=env.device),
+        }
+        setattr(env, _OBJECT_SIZE_ATTR, store)
+    idx = torch.tensor(ids, dtype=torch.long, device=env.device)
+    store["length"][idx] = length_delta.to(env.device)
+    store["radius"][idx] = radius_delta.to(env.device)
+
+    # Reported down BOTH channels on purpose. Under --enable_cameras the rendering Kit app
+    # captures python's stdout, so the print vanishes and the log file is the only place these
+    # numbers survive -- and a generated dataset whose can sizes cannot be recovered afterwards is
+    # most of the value of this gone. Under plain --headless the print is the one that shows up.
+    lines = ["[OBJ SIZE] per-env can size for this run (fixed until the process exits):"] + [
+        f"[OBJ SIZE]   env {env_id:>3}: length {1000 * (CAN_NOMINAL_LENGTH + length_delta[row]):6.1f} mm"
+        f" ({1000 * length_delta[row]:+6.1f})   diameter"
+        f" {2000 * (CAN_NOMINAL_RADIUS + radius_delta[row]):6.1f} mm"
+        f" ({2000 * radius_delta[row]:+6.1f})"
+        for row, env_id in enumerate(ids)
+    ]
+    for line in lines:
+        print(line)
+    logger.info("\n".join(lines))
+
+
+def attach_object_size_randomization(
+    env_cfg,
+    length_delta_range: tuple[float, float],
+    radius_delta_range: tuple[float, float],
+) -> str:
+    """Install :func:`randomize_object_size` on *env_cfg* IN PLACE. Call AFTER `apply_task_mode`.
+
+    After, because the object it resizes is the can that `apply_task_mode` puts in the scene --
+    before it, there is nothing to point at. The asset is read off the same spawn term
+    `apply_task_mode` installs (``randomize_object``), so this follows a task mode that ever
+    changes which object it manipulates without needing to be told.
+
+    Also flips ``scene.replicate_physics`` off, which is not optional: with replication on, the
+    envs SHARE their parsed asset properties, so all of them would silently get whichever size
+    env_0 drew -- and Isaac Lab's ``EventManager`` refuses to accept a ``prestartup`` term at all
+    while it is on. The cost is a slower scene build and slightly more memory per env; there is no
+    way to have per-env geometry without paying it.
+
+    Returns a one-line human-readable summary of what was installed, for the caller to print.
+    """
+    spawn_term = getattr(env_cfg.events, "randomize_object", None)
+    if spawn_term is None:
+        raise ValueError(
+            "attach_object_size_randomization() found no 'randomize_object' event term, so the"
+            " task has not had a task mode applied and has no can to resize. Call apply_task_mode()"
+            " first (i.e. pass --task_mode)."
+        )
+    object_name = spawn_term.params["asset_cfg"].name
+
+    max_radius = CAN_NOMINAL_RADIUS + max(radius_delta_range)
+    if 2.0 * max_radius > MAX_GRASPABLE_DIAMETER:
+        print(
+            f"[OBJ SIZE] WARNING: the widest can this range can draw is"
+            f" {2000 * max_radius:.1f} mm across, but the hand only opens to"
+            f" {1000 * MAX_GRASPABLE_DIAMETER:.1f} mm. Envs that draw near the top of the range"
+            " cannot grasp their can at all and will fail every trial."
+        )
+    if CAN_NOMINAL_LENGTH + min(length_delta_range) <= 0 or CAN_NOMINAL_RADIUS + min(radius_delta_range) <= 0:
+        raise ValueError(
+            f"Object size range would produce a non-positive can: length"
+            f" {CAN_NOMINAL_LENGTH} m + {min(length_delta_range)} m, radius {CAN_NOMINAL_RADIUS} m"
+            f" + {min(radius_delta_range)} m."
+        )
+
+    env_cfg.scene.replicate_physics = False
+    env_cfg.events.randomize_object_size = EventTerm(
+        func=randomize_object_size,
+        mode="prestartup",
+        params={
+            "asset_cfg": SceneEntityCfg(object_name),
+            "length_delta_range": tuple(length_delta_range),
+            "radius_delta_range": tuple(radius_delta_range),
+        },
+    )
+    return (
+        f"'{object_name}' size randomized per env: length"
+        f" {1000 * (CAN_NOMINAL_LENGTH + length_delta_range[0]):.0f}-"
+        f"{1000 * (CAN_NOMINAL_LENGTH + length_delta_range[1]):.0f} mm, diameter"
+        f" {2000 * (CAN_NOMINAL_RADIUS + radius_delta_range[0]):.0f}-"
+        f"{2000 * (CAN_NOMINAL_RADIUS + radius_delta_range[1]):.0f} mm"
+        " (replicate_physics disabled; one size per env, fixed for the whole run)"
+    )
+
 
 CONTROLLED_ARMS = {
     TASK_MODE_LEFT: ("left",),

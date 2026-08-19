@@ -85,6 +85,50 @@ parser.add_argument(
         " train against."
     ),
 )
+parser.add_argument(
+    "--randomize_object_size",
+    action="store_true",
+    default=False,
+    help=(
+        "OpenArm pick-up tasks only (needs --task_mode): give each environment its own"
+        " Pringles-can size, drawn from --object_length_range / --object_radius_range. Off by"
+        " default, in which case every env gets the nominal 200 mm x 60 mm can."
+        " The sizes actually drawn are printed as a [OBJ SIZE] table, and also written to the"
+        " isaaclab log under /tmp/isaaclab/logs/ -- with --enable_cameras the rendering app"
+        " captures stdout, so the log file is where to read them back.\n"
+        " NOTE: one size per ENVIRONMENT, fixed for the whole run -- USD scale is baked into the"
+        " physics at startup and cannot be redrawn per episode, so a run with --num_envs 4 covers"
+        " only 4 sizes however many trials it generates. Raise --num_envs (each env is an"
+        " independent draw) and/or repeat the run for real coverage. Also forces"
+        " replicate_physics off, which makes the scene slower to build."
+    ),
+)
+parser.add_argument(
+    "--object_length_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=[-0.025, 0.025],
+    help=(
+        "Metres to ADD to the can's 200 mm length (ignored without --randomize_object_size)."
+        " Default -0.025 0.025 spans the requested 5 cm of variation, symmetric about the real"
+        " can, i.e. lengths of 175-225 mm. Pass '0 0.05' instead to only ever grow it."
+    ),
+)
+parser.add_argument(
+    "--object_radius_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=[-0.01, 0.01],
+    help=(
+        "Metres to ADD to the can's 30 mm radius (ignored without --randomize_object_size)."
+        " Default -0.01 0.01 spans the requested 2 cm of variation, symmetric about the real can,"
+        " i.e. diameters of 40-80 mm. Note the ceiling: the hand opens to 88 mm, so anything past"
+        " +0.014 here draws cans that cannot be grasped at all -- '0 0.02' (up to 100 mm across)"
+        " is over it, and the script warns rather than clamping."
+    ),
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -174,6 +218,22 @@ def main():
                 f"[DR] --enable_domain_randomization was set, but task '{env_name}' has no matching"
                 " domain-randomization event cfg; ignoring."
             )
+
+    # Optional per-env object size randomization -- opt-in via --randomize_object_size.
+    # Attached AFTER the task mode (setup_env_config applies it) because the can it resizes is
+    # what the task mode puts in the scene, and BEFORE gym.make() because the scale is a USD
+    # property that has to be written before the simulation starts.
+    if args_cli.randomize_object_size:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
+            attach_object_size_randomization,
+        )
+
+        summary = attach_object_size_randomization(
+            env_cfg,
+            length_delta_range=tuple(args_cli.object_length_range),
+            radius_delta_range=tuple(args_cli.object_radius_range),
+        )
+        print(f"[OBJ SIZE] {summary}")
 
     # Create environment
     env = gym.make(env_name, cfg=env_cfg).unwrapped

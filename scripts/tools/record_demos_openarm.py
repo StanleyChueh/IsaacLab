@@ -123,6 +123,47 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--randomize_object_size",
+    action="store_true",
+    default=False,
+    help=(
+        "Draw this session's Pringles-can size from --object_length_range /"
+        " --object_radius_range instead of using the nominal 200 mm x 60 mm can. Needs"
+        " --task_mode (the can only exists once a mode has been applied)."
+        " The sizes actually drawn are printed as a [OBJ SIZE] table, and also written to the"
+        " isaaclab log under /tmp/isaaclab/logs/ -- with --enable_cameras the rendering app"
+        " captures stdout, so the log file is where to read them back.\n"
+        " Recording runs a single environment and USD scale is fixed at startup, so this is ONE"
+        " size for the whole session, not one per demo -- vary the source set by re-running with"
+        " the flag on, which redraws each time. Also forces replicate_physics off."
+    ),
+)
+parser.add_argument(
+    "--object_length_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=[-0.025, 0.025],
+    help=(
+        "Metres to ADD to the can's 200 mm length (ignored without --randomize_object_size)."
+        " Default -0.025 0.025 spans 5 cm of variation symmetric about the real can, i.e."
+        " lengths of 175-225 mm."
+    ),
+)
+parser.add_argument(
+    "--object_radius_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=[-0.01, 0.01],
+    help=(
+        "Metres to ADD to the can's 30 mm radius (ignored without --randomize_object_size)."
+        " Default -0.01 0.01 spans 2 cm of variation symmetric about the real can, i.e."
+        " diameters of 40-80 mm. The hand only opens to 88 mm, so a MAX past +0.014 draws cans"
+        " that cannot be grasped; the script warns rather than clamping."
+    ),
+)
+parser.add_argument(
     "--manual_save",
     action="store_true",
     default=False,
@@ -2196,6 +2237,20 @@ def main():
                 f"[TASK MODE] Locked at rest pose: {', '.join(locked_arms).upper()}"
                 " (still recorded, just not driveable)"
             )
+
+    # Object size randomization, after the task mode for the same reason as above: the can it
+    # resizes is what the task mode puts in the scene.
+    if args_cli.randomize_object_size:
+        try:
+            summary = openarm_task_modes.attach_object_size_randomization(
+                env_cfg,
+                length_delta_range=tuple(args_cli.object_length_range),
+                radius_delta_range=tuple(args_cli.object_radius_range),
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            return
+        print(f"[OBJ SIZE] {summary}")
 
     if args_cli.teleop_device == "vr_joint_ros2":
         try:
