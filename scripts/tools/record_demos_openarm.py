@@ -155,12 +155,13 @@ parser.add_argument(
     type=float,
     nargs=2,
     metavar=("MIN", "MAX"),
-    default=[-0.01, 0.01],
+    default=[-0.005, 0.005],
     help=(
         "Metres to ADD to the can's 30 mm radius (ignored without --randomize_object_size)."
-        " Default -0.01 0.01 spans 2 cm of variation symmetric about the real can, i.e."
-        " diameters of 40-80 mm. The hand only opens to 88 mm, so a MAX past +0.014 draws cans"
-        " that cannot be grasped; the script warns rather than clamping."
+        " Default -0.005 0.005 spans 1 cm of variation symmetric about the real can, i.e."
+        " diameters of 50-70 mm -- a quarter of the length's span, because the gripper's 88 mm"
+        " of travel against a 60 mm can leaves far less room in width than in length. A MAX past"
+        " +0.014 draws cans that cannot be grasped; the script warns rather than clamping."
     ),
 )
 parser.add_argument(

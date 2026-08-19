@@ -120,13 +120,15 @@ parser.add_argument(
     type=float,
     nargs=2,
     metavar=("MIN", "MAX"),
-    default=[-0.01, 0.01],
+    default=[-0.005, 0.005],
     help=(
         "Metres to ADD to the can's 30 mm radius (ignored without --randomize_object_size)."
-        " Default -0.01 0.01 spans the requested 2 cm of variation, symmetric about the real can,"
-        " i.e. diameters of 40-80 mm. Note the ceiling: the hand opens to 88 mm, so anything past"
-        " +0.014 here draws cans that cannot be grasped at all -- '0 0.02' (up to 100 mm across)"
-        " is over it, and the script warns rather than clamping."
+        " Default -0.005 0.005 spans 1 cm of variation, symmetric about the real can, i.e."
+        " diameters of 50-70 mm. Deliberately a quarter of the length's span: the gripper has"
+        " only 88 mm of travel against a 60 mm can, so width is the dimension that runs out of"
+        " room first, and the wider 2 cm span this used to default to made most grasps miss."
+        " Note the ceiling: anything past +0.014 here draws cans too fat to grasp at all --"
+        " '0 0.02' (up to 100 mm across) is over it, and the script warns rather than clamping."
     ),
 )
 # append AppLauncher cli args
