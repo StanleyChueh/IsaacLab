@@ -1355,11 +1355,12 @@ def attach_object_size_randomization(
     `apply_task_mode` installs (``randomize_object``), so this follows a task mode that ever
     changes which object it manipulates without needing to be told.
 
-    Also flips ``scene.replicate_physics`` off, which is not optional: with replication on, the
+    Also asserts ``scene.replicate_physics`` off, which is not optional: with replication on the
     envs SHARE their parsed asset properties, so all of them would silently get whichever size
     env_0 drew -- and Isaac Lab's ``EventManager`` refuses to accept a ``prestartup`` term at all
-    while it is on. The cost is a slower scene build and slightly more memory per env; there is no
-    way to have per-env geometry without paying it.
+    while it is on. In practice this costs nothing here, because the whole stack task family
+    already ships with it off (stack_env_cfg.py's ObjectTableSceneCfg); the line is a guard for the
+    day that changes, not a setting this feature turns on.
 
     Returns a one-line human-readable summary of what was installed, for the caller to print.
     """
@@ -1403,7 +1404,7 @@ def attach_object_size_randomization(
         f"{1000 * (CAN_NOMINAL_LENGTH + length_delta_range[1]):.0f} mm, diameter"
         f" {2000 * (CAN_NOMINAL_RADIUS + radius_delta_range[0]):.0f}-"
         f"{2000 * (CAN_NOMINAL_RADIUS + radius_delta_range[1]):.0f} mm"
-        " (replicate_physics disabled; one size per env, fixed for the whole run)"
+        " (one size per env, fixed for the whole run)"
     )
 
 

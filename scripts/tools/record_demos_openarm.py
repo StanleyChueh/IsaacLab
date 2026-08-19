@@ -135,7 +135,7 @@ parser.add_argument(
         " captures stdout, so the log file is where to read them back.\n"
         " Recording runs a single environment and USD scale is fixed at startup, so this is ONE"
         " size for the whole session, not one per demo -- vary the source set by re-running with"
-        " the flag on, which redraws each time. Also forces replicate_physics off."
+        " the flag on, which redraws each time."
     ),
 )
 parser.add_argument(

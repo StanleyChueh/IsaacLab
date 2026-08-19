@@ -99,8 +99,7 @@ parser.add_argument(
         " NOTE: one size per ENVIRONMENT, fixed for the whole run -- USD scale is baked into the"
         " physics at startup and cannot be redrawn per episode, so a run with --num_envs 4 covers"
         " only 4 sizes however many trials it generates. Raise --num_envs (each env is an"
-        " independent draw) and/or repeat the run for real coverage. Also forces"
-        " replicate_physics off, which makes the scene slower to build."
+        " independent draw) and/or repeat the run for real coverage."
     ),
 )
 parser.add_argument(
