@@ -82,6 +82,55 @@ step rather than being silently truncated.
 eval_smolvla.py's own --cameras -- MUST match this exact checkpoint's --rename_map at train
 time. Verify before trusting a rollout; a mismatch is silent (no error), it just degrades to
 generic/wrong behavior.
+
+MIRRORING THE ROLLOUT ONTO THE REAL ROBOT (--mirror_udp_port, off by default)
+----------------------------------------------------------------------------
+The same policy that is driving the sim can drive the real dual-arm follower at the same time,
+over the identical two-process bridge a teleop recording session uses (scripts/tools/
+record_demos_openarm.py --mirror_udp_port + lerobot_openarm/mirror_bridge.py). This process still
+never talks to hardware: it only broadcasts the sim robot's joint positions as UDP JSON, and
+mirror_bridge.py owns calibration, speed clamping, the startup handshake and the kill switch.
+The shared broadcaster/listener/plotter live in scripts/tools/sim_mirror.py.
+
+This is NOT the same thing as lerobot_openarm/deploy_smolvla_pickup_jointspace.py, which runs the
+policy directly against the real robot's own cameras and joint feedback. Here the policy sees ONLY
+the sim: sim cameras in, sim joints out, and the real arm is a follower of sim's resulting pose.
+Every real-world difference (lighting, can pose, contact) is therefore invisible to the policy, so
+treat this as a way to watch a sim rollout play out on hardware, not as a real-world evaluation.
+Use deploy_smolvla_pickup_jointspace.py for that.
+
+  Terminal 2 (Isaac Sim), same command as above plus:
+        --mirror_udp_port 5557 --mirror_feedback_port 5558 --mirror_rate_hz 20
+
+  Terminal 3 (lerobot-openarm env, real hardware) -- start this only ONCE the sim has printed its
+  "[MIRROR] Holding this pose on the wire" prompt, NOT before. The bridge gives up if no packet
+  arrives within 10s of connecting to the robot, and this script does not broadcast anything until
+  it reaches that first hold, which is minutes after launch. Started at the right moment it sees
+  packets immediately, prints a real-vs-sim pose comparison, and refuses to move until you type
+  YES. Then answer the sim's Enter prompt once the real arm has settled:
+    cd ~/Stanley_ws/lerobot_openarm
+    python mirror_bridge.py --calibration calibration.json --udp-port 5557 \
+        --model-path <path>/urdf --right-port can0 --left-port can1 \
+        --max-joint-speed 0.3 --feedback-port 5558
+
+--mirror_rate_hz paces the whole eval loop when mirroring. Without it this script runs as fast as
+the policy server answers, which is fine for a sim-only eval but hands the follower a command
+stream whose timing bears no relation to the ~20-30 Hz cadence the demos were recorded at; the
+bridge's speed clamp would then be absorbing all of that discrepancy on its own.
+
+Between rollouts the script broadcasts the post-reset pose and waits for Enter, because env.reset()
+teleports the sim robot in one frame and the real arm needs seconds to follow at a safe speed. It
+keeps broadcasting through that wait rather than going quiet, since silence past mirror_bridge.py's
+--timeout-ms makes the bridge ramp down and disable the motors.
+
+Gripper: what gets mirrored is the BINARIZED open/closed decision (see --gripper_threshold_ratio),
+not sim's measured finger position -- sim's fingers stall against the rigid can at first contact
+while the real compliant pads must keep closing past that point to actually hold it. mirror_bridge
+maps those 0.0 / 0.044 values through calibration.json's open_raw/closed_raw. Note this differs
+from deploy_smolvla_pickup_jointspace.py's own gripper handling (a Schmitt trigger closing to
+0.015, read off the training set's action distribution) -- that script commands the real robot
+directly, this one goes through the mirror bridge's calibration path like every other sim-side
+script.
 """
 
 """Launch Isaac Sim first."""
@@ -98,6 +147,14 @@ parser.add_argument("--num_rollouts",type=int, default=5,   help="Number of eval
 parser.add_argument("--horizon",     type=int, default=300,  help="Max steps per episode")
 parser.add_argument("--port",        type=int, default=5556, help="Policy server TCP port")
 parser.add_argument("--seed",        type=int, default=42)
+parser.add_argument(
+    "--policy_server_timeout", type=float, default=600.0,
+    help=(
+        "Seconds to keep retrying the connection to smolvla_server.py before giving up; 0 waits"
+        " indefinitely. The server binds its port only after the checkpoint finishes loading, so"
+        " launching it and this script together used to fail outright with ConnectionRefusedError."
+    ),
+)
 parser.add_argument(
     "--task_mode", type=str, default=None, choices=["left", "right", "handover"],
     help=(
@@ -140,6 +197,41 @@ parser.add_argument(
         "Sending the wrong env camera into a policy slot is silent (no error, no crash)."
     ),
 )
+parser.add_argument(
+    "--mirror_udp_port", type=int, default=0,
+    help=(
+        "If nonzero, broadcast the sim robot's joint positions (by name, radians) as a UDP JSON"
+        " packet to <--mirror_udp_host>:<port> after every step, so a separate out-of-process"
+        " bridge (lerobot_openarm/mirror_bridge.py, run with a matching --udp-port) can drive the"
+        " REAL robot along with the rollout. Off by default. This process never talks to hardware."
+        " See the MIRRORING section of the module docstring -- in particular that the policy still"
+        " sees only the sim, so this is not a real-world evaluation."
+    ),
+)
+parser.add_argument(
+    "--mirror_udp_host", type=str, default="127.0.0.1",
+    help="Destination host for --mirror_udp_port (and bind address for --mirror_feedback_port)."
+    " Defaults to loopback; only change this if you know why.",
+)
+parser.add_argument(
+    "--mirror_feedback_port", type=int, default=0,
+    help=(
+        "If nonzero, listen for UDP JSON packets from mirror_bridge.py's --feedback-port carrying"
+        " the real robot's ACTUAL joint positions (already inverse-mapped to sim joint names), and"
+        " save a per-joint sim-vs-real comparison plot on exit. Requires --mirror_udp_port. Still"
+        " no hardware access here -- this only listens for numbers the bridge sends back."
+    ),
+)
+parser.add_argument(
+    "--mirror_rate_hz", type=float, default=20.0,
+    help=(
+        "Pace the eval loop to this rate while mirroring (ignored without --mirror_udp_port)."
+        " Ungated, this script steps as fast as the policy server answers, which gives the real"
+        " follower a command stream unrelated to the cadence the demos were recorded at. Match it"
+        " to the --inference-hz you would use in deploy_smolvla_pickup_jointspace.py."
+    ),
+)
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -148,10 +240,15 @@ simulation_app = app_launcher.app
 
 """Everything else after Isaac Sim is up."""
 
+import atexit
+import os
 import pickle
 import random
 import socket
 import struct
+import sys
+import threading
+import time
 
 import carb
 import carb.input
@@ -168,6 +265,13 @@ from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task
     apply_task_mode,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+# The sim-side half of the real-robot mirror bridge (--mirror_udp_port), shared verbatim with
+# scripts/tools/record_demos_openarm.py so one mirror_bridge.py process serves either sim-side
+# script over one wire format. Reached by path because scripts/ is a directory of standalone
+# scripts, not an installed package.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
+from sim_mirror import JointFeedbackReceiver, JointMirrorBroadcaster, save_sim_vs_real_plot  # noqa: E402
 
 # ── TCP client helpers (identical to eval_smolvla.py, must match server) ───────
 
@@ -343,6 +447,111 @@ def _step_direct(env, target_q: np.ndarray, apply_idx: list[int], gripper_cols: 
     return env.observation_manager.compute()
 
 
+# ── real-robot mirroring helpers (only used with --mirror_udp_port) ────────────
+
+class RateLimiter:
+    """Pace the eval loop to a fixed rate, rendering the viewport while waiting.
+
+    Only used while mirroring. On its own this script steps as fast as the policy server answers,
+    which is exactly right for a sim-only eval but hands the real follower a command stream whose
+    timing has nothing to do with the cadence the demos were recorded at -- mirror_bridge.py's
+    speed clamp would then be absorbing the entire discrepancy by itself. Renders rather than
+    dead-sleeping through the wait so the viewport stays live (same reason record_demos_openarm.py's
+    own RateLimiter does).
+    """
+
+    def __init__(self, hz: float):
+        self._period = 1.0 / hz
+        self._next = time.time() + self._period
+
+    def sleep(self, env):
+        is_rendering = env.sim.has_gui() or env.sim.has_rtx_sensors()
+        while True:
+            remaining = self._next - time.time()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.005, remaining))
+            if is_rendering:
+                env.sim.render()
+        self._next += self._period
+        # Fell behind (a slow policy step, a long render): re-base off now instead of trying to
+        # catch up with a burst of un-paced steps, which is the one thing the real arm must not see.
+        if self._next < time.time():
+            self._next = time.time() + self._period
+
+
+class EnterWaiter:
+    """Background 'press Enter' watcher, so the caller can keep broadcasting while it waits.
+
+    A failed read is NOT treated as a press. When stdin is closed or redirected (nohup, a
+    launcher that hands the process /dev/null, a pipe that has already ended) input() returns
+    EOF immediately and forever; counting that as "the operator pressed Enter" would silently
+    skip the very wait it exists to enforce and start the rollout with the real arm still
+    seconds behind sim. Instead the waiter marks itself unusable and simply never fires, leaving
+    the Isaac-window key as the way in -- see _mirror_hold_until_enter, which says so out loud
+    rather than letting the hold look like it is waiting on a key that can never arrive.
+    """
+
+    def __init__(self):
+        self._done = threading.Event()
+        self._usable = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            input()
+        except (EOFError, OSError):
+            self._usable = False
+            return
+        self._done.set()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    @property
+    def stdin_unusable(self) -> bool:
+        return not self._usable
+
+
+def _mirror_hold_until_enter(env, mirror, rate_hz: float, message: str, kb: "KeyboardHandler") -> bool:
+    """Broadcast the robot's current, static pose until the operator presses Enter.
+
+    env.reset() teleports the sim robot to its reset pose in a single frame; the real follower can
+    only get there at mirror_bridge.py's --max-joint-speed, which takes seconds. Starting the
+    policy loop immediately would run the opening of every rollout against an arm still crawling
+    toward the start pose. Keeping the broadcast going through the wait (rather than simply not
+    sending) is what lets the bridge close that gap at all -- silence for longer than its
+    --timeout-ms is its signal to ramp down and disable the motors.
+
+    No gripper state is passed, so the broadcaster mirrors the measured finger position: during a
+    hold there is no commanded open/close decision to forward, only the pose actually being held.
+
+    Returns False if the operator asked to quit instead of starting (Q in the Isaac window, which
+    is also watched here -- otherwise the only way out of a hold would be the Enter it is waiting
+    for, i.e. starting the very rollout you wanted to abandon).
+    """
+    print(f"\n[MIRROR] {message}")
+    print("[MIRROR] Holding this pose on the wire. Once the real arm has settled on it, start the"
+          " rollout with EITHER Enter in this terminal OR Enter/Space in the Isaac Sim window"
+          " (whichever has your keyboard). Q in the Isaac window quits.")
+    waiter = EnterWaiter()
+    limiter = RateLimiter(rate_hz)
+    warned_stdin = False
+    while not (waiter.done or kb.consume_start()):
+        if kb.quit_requested:
+            print("[MIRROR] Quit requested during the hold -- not starting this rollout.")
+            return False
+        if waiter.stdin_unusable and not warned_stdin:
+            warned_stdin = True
+            print("[MIRROR] stdin is not readable in this process (redirected or closed), so the"
+                  " terminal's Enter cannot reach it. Use Enter/Space in the Isaac Sim window.")
+        mirror.broadcast()
+        limiter.sleep(env)
+    print("[MIRROR] Starting rollout.")
+    return True
+
+
 # ── keyboard reset (identical to eval_smolvla.py) ───────────────────────────────
 
 class KeyboardHandler:
@@ -351,13 +560,15 @@ class KeyboardHandler:
     def __init__(self):
         self.reset_requested = False
         self.quit_requested  = False
+        self.start_requested = False
         app_window = omni.appwindow.get_default_app_window()
         self._keyboard = app_window.get_keyboard()
         self._input    = carb.input.acquire_input_interface()
         self._sub = self._input.subscribe_to_keyboard_events(
             self._keyboard, self._on_key
         )
-        print("[keyboard] Press  R  to reset episode early,  Q  to quit.")
+        print("[keyboard] Press  R  to reset episode early,  Q  to quit,"
+              "  Enter/Space to start a held rollout (--mirror_udp_port only).")
 
     def _on_key(self, event, *args, **kwargs):
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -367,6 +578,13 @@ class KeyboardHandler:
             elif event.input == carb.input.KeyboardInput.Q:
                 self.quit_requested = True
                 print("[keyboard] Quit requested.")
+            elif event.input in (carb.input.KeyboardInput.ENTER, carb.input.KeyboardInput.SPACE):
+                # Second way to answer the mirror hold, for when the terminal's stdin is not
+                # reaching this process (the Isaac Sim app owns the foreground window, and whether
+                # Enter typed in the launching terminal arrives here depends on how the session was
+                # started). Ignored outside a hold -- consume_start() is only polled there.
+                self.start_requested = True
+                print("[keyboard] Start requested.")
         return True
 
     def consume_reset(self) -> bool:
@@ -375,11 +593,19 @@ class KeyboardHandler:
             return True
         return False
 
+    def consume_start(self) -> bool:
+        if self.start_requested:
+            self.start_requested = False
+            return True
+        return False
+
 
 # ── rollout ────────────────────────────────────────────────────────────────────
 
 def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera_names: list[str],
-            apply_idx: list[int], gripper_cols: list[int], gripper_labels: list[str]) -> bool:
+            apply_idx: list[int], gripper_cols: list[int], gripper_labels: list[str],
+            mirror=None, limiter: "RateLimiter | None" = None,
+            feedback_receiver=None, trial: int | None = None) -> bool | None:
     obs_dict, _ = env.reset()
     policy_reset(sock)
 
@@ -391,11 +617,47 @@ def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera
     robot = env.scene["robot"]
     robot.set_joint_position_target(robot.data.joint_pos.clone())
 
+    # Let the real arm walk to the pose reset() just teleported the sim one to, before any policy
+    # action is sent. See _mirror_hold_until_enter for why this waits rather than simply starting.
+    if mirror is not None and not _mirror_hold_until_enter(
+        env, mirror, args_cli.mirror_rate_hz,
+        "Sim has been reset to the rollout start pose.", kb,
+    ):
+        # None, not False: this rollout never ran a single policy step, so scoring it as a failure
+        # would put a trial the operator deliberately abandoned into the success rate.
+        return None
+
     # Previous open/closed decision per hand, so the report can flag the transitions -- over a
     # 300-step rollout the two or three steps where a jaw actually changes state are the whole
     # story and are otherwise invisible in a wall of identical lines.
     prev_open: list[bool] | None = None
 
+    # Timed from here, after the hold: the hold is the real arm catching up to a pose sim reached
+    # instantly, so including it would open every plot with a multi-second interval where the two
+    # legitimately disagree and squash the rollout itself into the right-hand edge.
+    rollout_t0 = time.time()
+    try:
+        return _rollout_steps(env, sock, success_term, horizon, kb, camera_names, apply_idx,
+                              gripper_cols, gripper_labels, mirror, limiter, prev_open, obs_dict)
+    finally:
+        if feedback_receiver is not None and mirror is not None:
+            save_sim_vs_real_plot(
+                mirror, feedback_receiver,
+                t_start=rollout_t0, t_end=time.time(),
+                title=f"Sim vs real joint positions -- rollout {trial}",
+                out_path=os.path.join(
+                    os.getcwd(),
+                    f"sim_vs_real_rollout{trial}_{time.strftime('%Y%m%d_%H%M%S')}.png",
+                ),
+            )
+
+
+def _rollout_steps(env, sock, success_term, horizon: int, kb: "KeyboardHandler",
+                   camera_names: list[str], apply_idx: list[int], gripper_cols: list[int],
+                   gripper_labels: list[str], mirror, limiter, prev_open, obs_dict) -> bool:
+    """The policy loop itself. Split out of rollout() only so the per-rollout plot can be saved
+    from a finally block covering every way the loop exits -- success, horizon, manual reset --
+    without repeating the call at each return."""
     for step in range(horizon):
         if kb.consume_reset():
             print(f"  [step {step+1:3d}] manually reset")
@@ -430,6 +692,24 @@ def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera
             prev_open = open_now
 
         obs_dict = _step_direct(env, policy_action, apply_idx, gripper_cols)
+
+        if mirror is not None:
+            # Forward the SAME binarized open/closed decision _step_direct just drove the sim
+            # with, not the measured finger position: sim's fingers stall against the rigid can
+            # at first contact (correct rigid-body physics), while the real gripper's compliant
+            # pads have to keep closing well past that point to actually hold it -- mirroring the
+            # measured value would cap the real gripper at sim's stopping point. See
+            # JointMirrorBroadcaster.broadcast, which this argument exists for. With
+            # --gripper_threshold_ratio 0 there is no binary decision to forward, so None falls
+            # back to mirroring the measured position, which is then what sim is really doing.
+            grip_state = {"left_gripper_state": None, "right_gripper_state": None}
+            if gripper_cols and args_cli.gripper_threshold_ratio > 0.0:
+                for label, is_open in zip(gripper_labels, open_now):
+                    grip_state[f"{label}_gripper_state"] = (
+                        GRIPPER_OPEN_VAL if is_open else GRIPPER_CLOSED_VAL
+                    )
+            mirror.broadcast(**grip_state)
+            limiter.sleep(env)
 
         if bool(success_term.func(env, **success_term.params)[0]):
             print(f"  [step {step+1:3d}] SUCCESS")
@@ -510,9 +790,90 @@ def main():
         )
     )
 
+    # ── Real-robot mirroring (opt-in, off by default) ──────────────────────────
+    mirror, limiter = None, None
+    if args_cli.mirror_udp_port:
+        # rollout() forwards each hand's binarized command as broadcast()'s
+        # <side>_gripper_state keyword, so the labels resolved off the live articulation above
+        # have to be exactly the two sides that keyword exists for. Checked here, before the
+        # policy server is even connected, rather than as a TypeError on the first step of a
+        # rollout that is already moving the real arm.
+        if set(gripper_labels) - {"left", "right"}:
+            raise SystemExit(
+                f"--mirror_udp_port cannot forward gripper commands for {gripper_labels}: this"
+                " robot's gripper joints did not resolve to the 'left'/'right' sides"
+                " JointMirrorBroadcaster.broadcast() takes. Re-run without mirroring, or fix the"
+                " joint naming."
+            )
+        mirror = JointMirrorBroadcaster(
+            robot=env.scene["robot"], host=args_cli.mirror_udp_host, port=args_cli.mirror_udp_port
+        )
+        limiter = RateLimiter(args_cli.mirror_rate_hz)
+        print(
+            f"[MIRROR] Eval loop paced to {args_cli.mirror_rate_hz:g} Hz while mirroring.\n"
+            "[MIRROR] SAFETY: this moves the REAL robot along with the rollout. mirror_bridge.py"
+            " owns the calibration, the speed clamp, the startup handshake and the 'q'+Enter kill"
+            " switch -- keep emergency_disable.py within reach anyway.\n"
+            "[MIRROR] Start mirror_bridge.py now if it isn't already running; it needs packets"
+            " from here before it will do anything."
+        )
+
+    feedback_receiver = None
+    save_plot_once = None
+    if args_cli.mirror_feedback_port:
+        if mirror is None:
+            raise SystemExit(
+                "--mirror_feedback_port needs --mirror_udp_port: the plot compares what THIS"
+                " process broadcast against what the bridge sent back, and without the broadcast"
+                " there is nothing to compare (and no bridge running to send anything)."
+            )
+        feedback_receiver = JointFeedbackReceiver(
+            host=args_cli.mirror_udp_host, port=args_cli.mirror_feedback_port
+        )
+
+        # Ctrl+C under Isaac Sim tears the process down without raising a KeyboardInterrupt that
+        # reaches code after the main loop, so the plot has to be hung off interpreter shutdown --
+        # same reasoning, and the same guard against double-running, as record_demos_openarm.py.
+        plot_state = {"saved": False}
+
+        def save_plot_once():  # noqa: F811
+            if plot_state["saved"]:
+                return
+            plot_state["saved"] = True
+            feedback_receiver.stop()
+            save_sim_vs_real_plot(mirror, feedback_receiver)
+
+        atexit.register(save_plot_once)
+
+    # Retry rather than die on the first refusal. smolvla_server.py binds its port only AFTER
+    # SmolVLAPolicy.from_pretrained() returns, which on a cold HF cache is minutes -- so "the
+    # server is running" and "the server is accepting connections" are two very different moments,
+    # and a single connect() attempt turns that gap into a crash that also strands whatever else
+    # was started alongside this run (the mirror bridge waiting for packets that now never come).
     print(f"\nConnecting to policy server on port {args_cli.port} …")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(("127.0.0.1", args_cli.port))
+    deadline = None if args_cli.policy_server_timeout <= 0 else time.time() + args_cli.policy_server_timeout
+    attempt = 0
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect(("127.0.0.1", args_cli.port))
+            break
+        except ConnectionRefusedError:
+            sock.close()
+            attempt += 1
+            if deadline is not None and time.time() > deadline:
+                raise SystemExit(
+                    f"Policy server did not start accepting connections on port {args_cli.port}"
+                    f" within {args_cli.policy_server_timeout:g}s. Start smolvla_server.py first and"
+                    " wait for its '[server] Listening on 127.0.0.1:<port>' line -- it prints that"
+                    " only once the checkpoint has finished loading. Raise"
+                    " --policy_server_timeout (or set it to 0 to wait indefinitely) for a slow"
+                    " first-time checkpoint download."
+                )
+            if attempt == 1 or attempt % 10 == 0:
+                print(f"  … not accepting connections yet (attempt {attempt}). Waiting for"
+                      " smolvla_server.py to finish loading the checkpoint.")
+            time.sleep(1.0)
     print("Connected.\n")
 
     kb = KeyboardHandler()
@@ -527,14 +888,26 @@ def main():
             break
         print(f"── Trial {trial + 1}/{args_cli.num_rollouts} ──────────────────")
         success = rollout(env, sock, success_term, args_cli.horizon, kb, camera_names,
-                          apply_idx, gripper_cols, gripper_labels)
+                          apply_idx, gripper_cols, gripper_labels, mirror, limiter,
+                          feedback_receiver, trial + 1)
+        if success is None:  # aborted before it started -- not a trial, see rollout()
+            break
         results.append(success)
 
     n_ok = results.count(True)
     print(f"\n{'='*50}")
     print(f"Success: {n_ok} / {len(results)}")
-    print(f"Rate   : {n_ok / len(results):.1%}")
+    if results:
+        print(f"Rate   : {n_ok / len(results):.1%}")
     print(f"Results: {results}")
+
+    if mirror is not None:
+        print(
+            "\n[MIRROR] No longer broadcasting. mirror_bridge.py will hit its --timeout-ms and"
+            " ramp the real arm down to a hold on its own; watch it do so before walking away."
+        )
+    if save_plot_once is not None:
+        save_plot_once()
 
     policy_close(sock)
     sock.close()
