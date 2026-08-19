@@ -238,10 +238,7 @@ Run Isaac Lab Eval
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
-    --num_rollouts 5 --horizon 300 --enable_cameras \
-    --cameras right_wrist_cam,wrist_cam,body_cam
+ ./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover
 ```
 
 `--cameras` must list the env cameras in the same slot order as the
