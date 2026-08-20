@@ -198,7 +198,7 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 # Convert HDF5 to LeRobot format 
 
 ```
-python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_V7     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 20 --cameras right_wrist_cam wrist_cam body_cam
+python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringles_V9.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_V9     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 20 --cameras right_wrist_cam wrist_cam body_cam
 ```
 
 20 fps is the env's actual control rate — `sim.dt = 0.01` with `decimation = 5`
