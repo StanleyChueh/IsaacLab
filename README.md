@@ -164,13 +164,26 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --generation_num_trials 50 --num_envs 4 --enable_cameras
 ```
 
-Generate augemented dataset w domain randomization(No background changing)
+Generate augemented dataset w domain randomization(lighting,camera angle...)
 
 ```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringle_annotated_V6.hdf5     --output_file logs/demos/pickup_pringle_V6_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handove
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringle_annotated_V6.hdf5     --output_file logs/demos/pickup_pringle_V6_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handover
 ```
 
-Generate augemented dataset w domain randomization
+Generate augemented dataset w domain randomization(pringles's size)
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
+    --input_file logs/demos/pickup_pringles_V9_annotated.hdf5 \
+    --output_file logs/demos/pickup_pringles_V9_generated.hdf5 \
+    --task_mode handover \
+    --generation_num_trials 50 --num_envs 4 --enable_cameras \
+    --randomize_object_size
+```
+
+Generate augemented dataset w domain randomization(background changing)
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
