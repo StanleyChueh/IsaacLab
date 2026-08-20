@@ -259,6 +259,20 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 …). A mismatch is silent — no error, just a policy fed the wrong view, which
 usually shows up as degenerate behaviour like only ever raising the arm.
 
+Run Isaac Lab Eval, and send command to real robot
+
+Run smolvla server
+
+```
+python scripts/imitation_learning/lerobot/smolvla_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V9_generated_500     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+```
+
+Run Isaac Lab control
+
+```
+./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover     --mirror_udp_port 5557 --mirror_feedback_port 5558 --mirror_rate_hz 20
+```
+
 # Run in Real-world
 
 ```
