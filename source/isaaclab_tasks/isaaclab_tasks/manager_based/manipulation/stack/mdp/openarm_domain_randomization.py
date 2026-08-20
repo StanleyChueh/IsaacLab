@@ -365,75 +365,75 @@ def randomize_mounted_camera_pose(
     pos_range: dict[str, tuple[float, float]],
     rot_range: dict[str, tuple[float, float]],
     asset_cfg: SceneEntityCfg,
-    parent_body_name: str | None = None,
 ):
-    """Jitter a robot-mounted camera's effective mount offset (position + small rotation)
-    relative to its parent link, e.g. `wrist_cam`/`right_wrist_cam`/`body_cam`.
+    """Jitter a robot-mounted camera's mount offset (position + small rotation) relative to its
+    parent link, e.g. `wrist_cam`/`right_wrist_cam`/`body_cam`.
 
     Unlike `front_cam`, these cameras' nominal pose is a LOCAL offset relative to a moving robot
-    link (`CameraCfg.offset`), not a world-frame constant -- so we can't just add jitter to
-    `env_origins` like `randomize_fixed_camera_pose` does. Instead:
+    link (`CameraCfg.offset`), not a world-frame constant. The jitter is therefore written as a
+    LOCAL pose on the camera prim -- the very same `xformOp:translate` / `xformOp:orient` pair
+    that `Camera._initialize_impl` authors from `cfg.offset` when it spawns the prim, so this is
+    literally "re-author the mount offset, with noise". Being parent-relative, it rides along
+    with the link for the rest of the episode and needs no knowledge of where that link currently
+    is.
 
-    1. Read the parent link's CURRENT world pose from the robot's `Articulation` data
-       (`body_pos_w`/`body_quat_w`). This is written synchronously by the physics reset, unlike
-       the camera sensor's own cached `data.pos_w`/`quat_w_world`, which can still be lagging
-       behind a just-reset robot pose (see `num_rerenders_on_reset` elsewhere in this task
-       family -- it exists precisely because camera data doesn't refresh immediately on reset).
-    2. Convert the camera's configured local offset+rotation (`camera.cfg.offset`, which may be
-       authored in "ros"/"opengl"/"world" convention) into the "world"-convention quaternion
-       `body_quat_w` is already expressed in, via `convert_camera_frame_orientation_convention`.
-    3. Add a small random position/rotation delta to that local offset, compose it onto the
-       parent's current world pose, and write it with `Camera.set_world_poses(..., convention="world")`.
+    DO NOT reimplement this via `Camera.set_world_poses`. That was the original implementation and
+    it silently destroyed the wrist views: it composed a target world pose from the parent link's
+    pose in `robot.data.body_pos_w`/`body_quat_w` (live, physics/Fabric-side) and handed it to
+    `Camera.set_world_poses` -> `XformPrimView.set_world_poses`, which converts world -> local by
+    dividing out the parent's world transform *as read from USD*
+    (`_set_world_poses_usd`'s `XformCache.GetLocalToWorldTransform(parent_prim)`). With Fabric
+    enabled -- the default -- PhysX publishes link transforms to Fabric and never writes them back
+    to USD, so that USD-side parent transform is the robot's authored REST pose, not where the
+    link actually is. The camera's local offset came out as
+    `rest_parent^-1 * live_parent * nominal_offset`: an arbitrary transform that threw the camera
+    off into empty space, producing a uniformly blank (~244/255) image for every frame of every
+    episode.
 
-    `Camera.set_world_poses` -> `XformPrimView.set_world_poses` converts the given world pose into
-    a LOCAL xformOp offset relative to the parent's world pose *at call time*, then that offset
-    rides along rigidly with the parent for the rest of the episode (see
-    `isaaclab.sim.views.xform_prim_view._set_world_poses_usd`) -- it does not fight physics, so
-    this is safe to call once per reset.
+    That failure is invisible on `body_cam` and fatal on the wrist cams for the same reason: the
+    error is exactly the gap between a link's rest pose and its live pose. `body_cam` hangs off
+    `openarm_body_link0`, the base link, which never moves -- rest == live, the bogus factor is
+    identity, and its images look perfectly fine (including correctly varying camera angle). Both
+    wrist cams hang off `openarm_*_ee_tcp`, which by grasp time is most of a metre and a large
+    rotation away from where the asset authored it. So "body cam works, wrist cams are blank" is
+    the signature of this bug, not evidence that the wrist ranges below are too wide.
+
+    Writing the local pose sidesteps all of it: no parent world transform is consulted, from
+    either side, so there is nothing for USD and Fabric to disagree about.
     """
     camera = env.scene[asset_cfg.name]
-    robot = env.scene["robot"]
 
-    # Derived from the camera's own prim path by default, never hardcoded. A mounted camera lives
-    # at ".../Robot/<parent link>/<camera name>", so the link is always the second-to-last
-    # component -- and that is the ONE place it cannot go stale. Hardcoding it did go stale: this
-    # term carried "openarm_body_link", which is the dual-arm cfg's chest link, while the cfg the
-    # pick-up task actually inherits mounts body_cam on "openarm_body_link0" (and the CamMount
-    # variant uses "chest_link" again). The result was a ValueError from find_bodies on the first
-    # reset of any randomized run. Pass parent_body_name explicitly only to override this.
-    if parent_body_name is None:
-        parent_body_name = camera.cfg.prim_path.rstrip("/").split("/")[-2]
-    if parent_body_name not in robot.body_names:
-        raise ValueError(
-            f"Camera '{asset_cfg.name}' appears to be mounted on body '{parent_body_name}'"
-            f" (derived from prim_path '{camera.cfg.prim_path}'), which is not a body of the robot."
-            f" Available bodies: {robot.body_names}"
-        )
-    body_ids, _ = robot.find_bodies(parent_body_name)
-    body_id = body_ids[0]
-
-    link_pos_w = robot.data.body_pos_w[env_ids, body_id]
-    link_quat_w = robot.data.body_quat_w[env_ids, body_id]
-
+    # `cfg.offset.rot` is authored in the cfg's own convention ("ros" for every camera in this
+    # task family); the prim's `xformOp:orient` holds it in USD/OpenGL convention. Jitter is
+    # composed in the "world" convention (+X forward, +Z up) so that a `rot_range` of roll/pitch/
+    # yaw means what it reads like -- about the camera's forward/right/up axes -- and only then
+    # converted to OpenGL for the write. Convention conversion is a right-multiplication by a
+    # constant quaternion, so converting the LOCAL orientation here yields exactly the same final
+    # world orientation the old world-space composition was aiming for.
     offset_pos = torch.tensor(camera.cfg.offset.pos, device=env.device, dtype=torch.float32)
     offset_quat_native = torch.tensor(camera.cfg.offset.rot, device=env.device, dtype=torch.float32).unsqueeze(0)
     offset_quat_world = math_utils.convert_camera_frame_orientation_convention(
         offset_quat_native, origin=camera.cfg.offset.convention, target="world"
-    ).squeeze(0)
+    )
 
+    num_envs = len(env_ids)
     pos_ranges = torch.tensor([pos_range.get(k, (0.0, 0.0)) for k in ("x", "y", "z")], device=env.device)
-    pos_delta = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (len(env_ids), 3), device=env.device)
+    pos_delta = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (num_envs, 3), device=env.device)
     rot_ranges = torch.tensor([rot_range.get(k, (0.0, 0.0)) for k in ("roll", "pitch", "yaw")], device=env.device)
-    rot_delta = math_utils.sample_uniform(rot_ranges[:, 0], rot_ranges[:, 1], (len(env_ids), 3), device=env.device)
+    rot_delta = math_utils.sample_uniform(rot_ranges[:, 0], rot_ranges[:, 1], (num_envs, 3), device=env.device)
     delta_quat = math_utils.quat_from_euler_xyz(rot_delta[:, 0], rot_delta[:, 1], rot_delta[:, 2])
 
     local_pos = offset_pos.unsqueeze(0) + pos_delta
-    local_quat = math_utils.quat_mul(offset_quat_world.unsqueeze(0).expand(len(env_ids), -1), delta_quat)
+    local_quat_world = math_utils.quat_mul(offset_quat_world.expand(num_envs, -1), delta_quat)
+    local_quat_opengl = math_utils.convert_camera_frame_orientation_convention(
+        local_quat_world, origin="world", target="opengl"
+    )
 
-    world_pos = link_pos_w + math_utils.quat_apply(link_quat_w, local_pos)
-    world_quat = math_utils.quat_mul(link_quat_w, local_quat)
-
-    camera.set_world_poses(world_pos, world_quat, env_ids=env_ids, convention="world")
+    # `Camera` exposes no local-pose setter, so this goes through its `XformPrimView`. That view
+    # is the same object `Camera.set_world_poses` writes through, and `set_local_poses` takes the
+    # USD path in both Fabric and non-Fabric mode (see `XformPrimView._set_local_poses_fabric`),
+    # writing the two xformOps the camera prim already carries.
+    camera._view.set_local_poses(local_pos, local_quat_opengl, env_ids)
 
 
 def randomize_scene_lighting(
