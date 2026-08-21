@@ -289,7 +289,7 @@ Deploy in joint states trained model
 cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
-python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_no_domain_randomization_1000_joints     --body-cam-index 4 --wrist-cam-index 10 --side-cam-index 12     --inference-hz 30 --max-joint-speed 1.0 --max-episode-seconds 30     --calibration calibration.json     --no-live-view --save-video rollout_v2.mp4
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V11_dr_strong     --body-cam-index 4 --wrist-cam-index 16 --right-wrist-cam-index 10     --calibration calibration.json     --inference-hz 20 --max-joint-speed 1.5 --max-episode-seconds 600 
 ```
 
 ## OpenARM Motors Check
