@@ -8,10 +8,16 @@ target joint configuration directly, so this
 bypasses the action manager entirely and drives the robot's joints directly every physics
 substep, replicating everything else ManagerBasedRLEnv.step() normally does (scene.write_data_
 to_sim(), sim.step(), sim.render() at the configured interval, scene.update() for fresh sensor/
-camera data) -- see _step_direct() below, confirmed line-by-line against
-source/isaaclab/isaaclab/envs/manager_based_rl_env.py's own step() (lines ~153-197), not guessed.
+camera data, and the post-physics common_step_counter / episode_length_buf bump) -- see
+_step_direct() below, confirmed line-by-line against
+source/isaaclab/isaaclab/envs/manager_based_rl_env.py's own step() (lines ~153-202), not guessed.
 The two calls that ARE skipped are action_manager.process_action() and .apply_action() -- the IK
 solve and its resulting set_joint_position_target() call, replaced by our own direct one.
+
+Skipping a counter here is not cosmetic, which is why the range above ends at 202 rather than at
+the last line that touches the sim: a stateful termination term that de-duplicates itself by step
+number sees a frozen counter as one infinitely long step. See _step_direct()'s comment -- that is
+exactly how --task_mode handover came to report every rollout as failed.
 
 Run smolvla_server.py FIRST (the same server eval_smolvla.py uses -- it's checkpoint-agnostic,
 does plain state-normalize / policy.select_action / action-unnormalize with no assumption about
@@ -443,6 +449,20 @@ def _step_direct(env, target_q: np.ndarray, apply_idx: list[int], gripper_cols: 
         if (env._sim_step_counter % env.cfg.sim.render_interval == 0) and is_rendering:
             env.sim.render()
         env.scene.update(dt=env.physics_dt)
+
+    # ManagerBasedRLEnv.step()'s post-physics counter bump, which this function is standing in for.
+    # Not cosmetic: the hand-over stage machine (openarm_task_modes._handover_tick) reads
+    # common_step_counter to make itself idempotent within a step -- both the subtask_terms
+    # observations and the success condition call it every step, and only the first call may
+    # advance the bookkeeping. With the counter frozen, that guard reads every call for the rest of
+    # the process as a repeat of the same step: the machine ticks ONCE, during the very first
+    # reset's observation compute with nothing grasped, and stays at stage 0 forever. Every
+    # --task_mode handover rollout then reports "failed" no matter how well the pass goes, because
+    # handover_success is asking a counter that stopped moving. episode_length_buf is bumped
+    # alongside it for the same reason step() does -- so anything reading "how far into the episode
+    # are we" sees the truth.
+    env.common_step_counter += 1
+    env.episode_length_buf += 1
 
     return env.observation_manager.compute()
 
