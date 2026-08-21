@@ -167,7 +167,7 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 Generate augemented dataset w domain randomization(lighting,camera angle...)
 
 ```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringle_annotated_V6.hdf5     --output_file logs/demos/pickup_pringle_V6_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handover
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_V9_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_lighting.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handover
 ```
 
 Generate augemented dataset w domain randomization(pringles's size)
@@ -198,7 +198,7 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 # Convert HDF5 to LeRobot format 
 
 ```
-python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_V7     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 20 --cameras right_wrist_cam wrist_cam body_cam
+python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringles_V9.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_V9     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 20 --cameras right_wrist_cam wrist_cam body_cam
 ```
 
 20 fps is the env's actual control rate — `sim.dt = 0.01` with `decimation = 5`
@@ -259,6 +259,20 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 …). A mismatch is silent — no error, just a policy fed the wrong view, which
 usually shows up as degenerate behaviour like only ever raising the arm.
 
+Run Isaac Lab Eval, and send command to real robot
+
+Run smolvla server
+
+```
+python scripts/imitation_learning/lerobot/smolvla_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V9_generated_500     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+```
+
+Run Isaac Lab control
+
+```
+./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover     --mirror_udp_port 5557 --mirror_feedback_port 5558 --mirror_rate_hz 20
+```
+
 # Run in Real-world
 
 ```
@@ -275,7 +289,7 @@ Deploy in joint states trained model
 cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
-python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_no_domain_randomization_1000_joints     --body-cam-index 4 --wrist-cam-index 10 --side-cam-index 12     --inference-hz 30 --max-joint-speed 1.0 --max-episode-seconds 30     --calibration calibration.json     --no-live-view --save-video rollout_v2.mp4
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V11_dr_strong     --body-cam-index 4 --wrist-cam-index 16 --right-wrist-cam-index 10     --calibration calibration.json     --inference-hz 20 --max-joint-speed 1.5 --max-episode-seconds 600 
 ```
 
 ## OpenARM Motors Check
