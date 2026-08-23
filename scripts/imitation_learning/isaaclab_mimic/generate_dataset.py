@@ -214,6 +214,10 @@ def main():
                     " saturation/brightness/roughness with hue unchanged; camera angle varies on"
                     " all four cameras; pad position is not jittered."
                 )
+            print(
+                "[DR] Pad HEIGHT is randomized in every profile (one height per env, fixed for"
+                " the run -- see randomize_pad_height); raise --num_envs for more heights."
+            )
         else:
             print(
                 f"[DR] --enable_domain_randomization was set, but task '{env_name}' has no matching"

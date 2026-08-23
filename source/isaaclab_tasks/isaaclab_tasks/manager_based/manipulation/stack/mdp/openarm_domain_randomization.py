@@ -44,6 +44,7 @@ def randomize_static_asset_pose(
     pose_range: dict[str, tuple[float, float]],
     base_pos: tuple[float, float, float],
     asset_cfg: SceneEntityCfg,
+    keep_current_z: bool = False,
 ):
     """Jitter a static (non-rigid-body) `AssetBaseCfg` asset's world pose around a known default
     local position, e.g. the workspace pad.
@@ -55,6 +56,14 @@ def randomize_static_asset_pose(
     e.g. `PAD_CENTER_X`/`PAD_HEIGHT` in stack_joint_pos_env_cfg.py) rather than read back from a
     cached default -- reading it back would need a class instance to cache it in, which is
     exactly the pattern this module avoids (see module docstring above).
+
+    Set ``keep_current_z`` when something ELSE owns the asset's height. The pad is exactly that
+    case: `openarm_task_modes.randomize_pad_height` re-scales and re-centres it at prestartup, so
+    a per-env pad is not sitting at the cfg's authored ``base_pos[2]`` any more. Writing the
+    authored z back here would drop the box to nominal-centre height while leaving it scaled --
+    a pad whose top is at neither the nominal nor the randomized height, and whose bottom is
+    through the floor. Reading the live z back instead makes this term do only what its name says
+    (jitter the pad's position on the ground) and leaves height to the term that owns it.
     """
     asset = env.scene[asset_cfg.name]
     range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
@@ -63,6 +72,9 @@ def randomize_static_asset_pose(
 
     base_pos_t = torch.tensor(base_pos, device=env.device, dtype=torch.float32)
     positions = env.scene.env_origins[env_ids] + base_pos_t.unsqueeze(0) + rand_samples[:, 0:3]
+    if keep_current_z:
+        current_pos, _ = asset.get_world_poses(indices=env_ids.tolist())
+        positions[:, 2] = current_pos[:, 2].to(positions.dtype)
     orientations = math_utils.quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
 
     asset.set_world_poses(positions, orientations, indices=env_ids.tolist())

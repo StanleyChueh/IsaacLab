@@ -345,6 +345,209 @@ def object_size_deltas(env) -> tuple[torch.Tensor | float, torch.Tensor | float]
     return deltas["length"], deltas["radius"]
 
 
+# ── Per-env pad height ────────────────────────────────────────────────────────
+
+_PAD_HEIGHT_ATTR = "_openarm_pad_height_deltas"
+"""Attribute :func:`randomize_pad_height` hangs its sampled per-env pad heights off the env object.
+
+Same reasoning as :data:`_OBJECT_SIZE_ATTR`: drawn at prestartup, long after every term's params
+were frozen, and read back by every height-sensitive signal in this module (see
+:func:`pad_height_deltas`)."""
+
+
+def pad_height_deltas(env) -> torch.Tensor | float:
+    """Metres each env's pad top is above (or below) the nominal pad top, per env.
+
+    Returns ``0.0`` -- a plain float, which broadcasts against anything -- when
+    :func:`randomize_pad_height` was never installed, so every caller can add it unconditionally
+    instead of branching on whether randomization is on. Exactly the contract
+    :func:`object_size_deltas` has, for exactly the same reason.
+
+    Everything measured from the pad's top surface moves with this:
+
+    * where the can's origin rests -- :func:`_object_rest_z`, which is also what
+      :func:`reset_object_free` spawns it at;
+    * what counts as lifted, which is an absolute world height baked in at cfg-build time from
+      the NOMINAL pad -- :func:`object_lifted_and_grasped` and :func:`_handover_tick`;
+    * what counts as put back down -- the ``put_down`` test in :func:`_handover_tick`, which
+      reads :func:`_object_rest_z` and so is covered for free.
+
+    Without the shift, an env whose pad is 3 cm taller starts its can 3 cm above the nominal lift
+    threshold: the can reads as "lifted" before it has been touched, and the 0->1 transition the
+    annotator and Mimic look for never happens.
+    """
+    deltas = getattr(env, _PAD_HEIGHT_ATTR, None)
+    return 0.0 if deltas is None else deltas
+
+
+def randomize_pad_height(
+    env,
+    env_ids: torch.Tensor | None,
+    height_delta_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("workspace_pad"),
+) -> None:
+    """Give each env its own workspace-pad height, by rewriting that env's pad prim's USD scale.
+
+    Why the pad height is worth varying at all: it is the single number that sets how high the
+    object sits relative to the robot's base, and the real rig's is neither exact nor stable (the
+    cfg's own comment records 17 cm real plus 2 cm "temporarily"). A policy trained at exactly one
+    pad height learns the absolute wrist height its grasp happens at, which is the easiest possible
+    thing to memorise and the first thing to break when the real table is a centimetre off.
+
+    A ``prestartup`` event term, and -- like :func:`randomize_object_size`, whose implementation
+    this mirrors -- it cannot be anything else. The pad is a static collider: PhysX reads its
+    transform out of USD when the simulation starts and does not re-read it afterwards, so a
+    reset-time pose write would move the pad the cameras see while leaving the collider the can
+    actually rests on behind. That desync is invisible in x/y on a flat pad and catastrophic in z.
+    Authoring the scale before play means PhysX parses the randomized geometry itself, so the
+    visible pad and the collidable pad are the same object by construction.
+
+        **one pad height per ENV, fixed for the whole run -- not one per episode.**
+
+    So a run with ``--num_envs 4`` covers 4 pad heights. Raise ``--num_envs`` and/or make several
+    runs for wider coverage; the draws are unseeded at this point in startup, so repeated runs of
+    the same command get different heights. This also happens to match how the quantity varies in
+    reality -- a table height is fixed for a session and different between sessions.
+
+    Height is changed by SCALING the pad box in z and re-centring it, not by translating it: the
+    pad is a full-height box centred at ``PAD_HEIGHT / 2`` (stack_joint_pos_env_cfg.py), so a box
+    of height ``H + delta`` re-centred at ``(H + delta) / 2`` still sits exactly on the ground
+    plane. Translating it instead would raise the top by ``delta`` and leave a ``delta``-tall gap
+    of daylight under a slab that is supposed to be standing on the floor -- visible to body_cam,
+    and a texture no real scene contains.
+
+    Args:
+        env_ids: envs to randomize; ``None`` (what the event manager passes at prestartup) means
+            all of them.
+        asset_cfg: the pad to resize. Its prim is looked up per env off ``scene.env_prim_paths``
+            for the same reason :func:`randomize_object_size` does -- ``find_matching_prim_paths``
+            orders lexically, which puts env_10 before env_2.
+        height_delta_range: (min, max) metres to add to the pad's authored height. (0, 0) leaves
+            it nominal.
+    """
+    # Imported here rather than at module scope, for the reason given in randomize_object_size:
+    # this module is imported by env cfgs, and pxr is only importable after the app has launched.
+    from pxr import Gf, Sdf, UsdGeom, Vt
+
+    from isaaclab.sim.utils.stage import get_current_stage
+
+    if env.sim.is_playing():
+        raise RuntimeError(
+            "randomize_pad_height must run before the simulation starts -- the pad is a static"
+            " collider whose transform PhysX bakes in at play time, so changing it later moves"
+            " only the rendered pad and not the one the can rests on. Install it with"
+            " mode='prestartup'."
+        )
+
+    nominal_height = 2.0 * float(env.cfg.scene.workspace_pad.init_state.pos[2])
+    if nominal_height + min(height_delta_range) <= 0.0:
+        raise ValueError(
+            f"Pad height range would produce a non-positive pad: {nominal_height} m"
+            f" + {min(height_delta_range)} m."
+        )
+
+    num_envs = env.scene.num_envs
+    ids = list(range(num_envs)) if env_ids is None else [int(i) for i in env_ids]
+    height_delta = torch.empty(len(ids)).uniform_(*height_delta_range)
+
+    prim_name = asset_cfg.name
+    stage = get_current_stage()
+    with Sdf.ChangeBlock():
+        for row, env_id in enumerate(ids):
+            prim_path = f"{env.scene.env_prim_paths[env_id]}/{prim_name}"
+            prim_spec = Sdf.CreatePrimInLayer(stage.GetRootLayer(), prim_path)
+            new_height = nominal_height + float(height_delta[row])
+            # A RATIO to whatever the pad is authored at, so this composes with (rather than
+            # silently replaces) any scale the spawner already put on the root prim.
+            z_ratio = new_height / nominal_height
+
+            scale_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOp:scale")
+            has_scale_attr = scale_spec is not None
+            if not has_scale_attr:
+                scale_spec = Sdf.AttributeSpec(prim_spec, prim_path + ".xformOp:scale", Sdf.ValueTypeNames.Double3)
+                current_scale = Gf.Vec3f(1.0, 1.0, 1.0)
+            else:
+                current = scale_spec.default
+                current_scale = Gf.Vec3f(1.0, 1.0, 1.0) if current is None else Gf.Vec3f(current)
+            scale_spec.default = Gf.Vec3f(current_scale[0], current_scale[1], current_scale[2] * z_ratio)
+
+            # Re-centre so the taller/shorter box still stands on the ground plane rather than
+            # floating above it or sinking through it -- see the docstring.
+            translate_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOp:translate")
+            if translate_spec is None:
+                translate_spec = Sdf.AttributeSpec(
+                    prim_spec, prim_path + ".xformOp:translate", Sdf.ValueTypeNames.Double3
+                )
+                current_translate = Gf.Vec3d(*(float(v) for v in env.cfg.scene.workspace_pad.init_state.pos))
+            else:
+                current = translate_spec.default
+                current_translate = (
+                    Gf.Vec3d(*(float(v) for v in env.cfg.scene.workspace_pad.init_state.pos))
+                    if current is None
+                    else Gf.Vec3d(current)
+                )
+            translate_spec.default = Gf.Vec3d(current_translate[0], current_translate[1], 0.5 * new_height)
+
+            if not has_scale_attr:
+                op_order_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOpOrder")
+                if op_order_spec is None:
+                    op_order_spec = Sdf.AttributeSpec(
+                        prim_spec, UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray
+                    )
+                op_order_spec.default = Vt.TokenArray(["xformOp:translate", "xformOp:orient", "xformOp:scale"])
+
+    # Record what was drawn -- every height-sensitive signal reads it back through
+    # pad_height_deltas(). See that function for the list of what would be wrong without it.
+    store = getattr(env, _PAD_HEIGHT_ATTR, None)
+    if store is None:
+        store = torch.zeros(num_envs, device=env.device)
+        setattr(env, _PAD_HEIGHT_ATTR, store)
+    store[torch.tensor(ids, dtype=torch.long, device=env.device)] = height_delta.to(env.device)
+
+    # Down both channels, for the reason spelled out in randomize_object_size: under
+    # --enable_cameras the rendering Kit app swallows stdout, and a generated dataset whose pad
+    # heights cannot be recovered afterwards has lost most of the point of randomizing them.
+    lines = ["[PAD] per-env workspace pad height for this run (fixed until the process exits):"] + [
+        f"[PAD]   env {env_id:>3}: height {1000 * (nominal_height + height_delta[row]):6.1f} mm"
+        f" ({1000 * height_delta[row]:+6.1f})"
+        for row, env_id in enumerate(ids)
+    ]
+    for line in lines:
+        print(line)
+    logger.info("\n".join(lines))
+
+
+def attach_pad_height_randomization(env_cfg, height_delta_range: tuple[float, float]) -> str:
+    """Install :func:`randomize_pad_height` on *env_cfg* IN PLACE. Returns a one-line summary.
+
+    Asserts ``scene.replicate_physics`` off for the same non-optional reason
+    :func:`attach_object_size_randomization` does: with replication on the envs share their parsed
+    asset properties, so every env would silently get env_0's pad, and Isaac Lab's ``EventManager``
+    refuses a ``prestartup`` term at all while it is set. The whole stack task family already ships
+    with it off (stack_env_cfg.py's ObjectTableSceneCfg), so this costs nothing today.
+    """
+    if getattr(env_cfg.scene, "workspace_pad", None) is None:
+        raise ValueError(
+            "attach_pad_height_randomization() found no 'workspace_pad' in the scene cfg, so there"
+            " is no pad to resize."
+        )
+    env_cfg.scene.replicate_physics = False
+    env_cfg.events.randomize_pad_height = EventTerm(
+        func=randomize_pad_height,
+        mode="prestartup",
+        params={
+            "asset_cfg": SceneEntityCfg("workspace_pad"),
+            "height_delta_range": tuple(height_delta_range),
+        },
+    )
+    nominal = 2.0 * float(env_cfg.scene.workspace_pad.init_state.pos[2])
+    return (
+        f"'workspace_pad' height randomized per env:"
+        f" {1000 * (nominal + height_delta_range[0]):.0f}-{1000 * (nominal + height_delta_range[1]):.0f} mm"
+        " (one height per env, fixed for the whole run)"
+    )
+
+
 # ── Signal primitives ─────────────────────────────────────────────────────────
 
 def _gripper_is_closed(
@@ -552,8 +755,10 @@ def object_lifted_and_grasped(
     # can rests with its centre half the length delta higher, so without this shift a randomized
     # tall can would count as lifted before it had left the pad.
     length_delta, _ = object_size_deltas(env)
+    # ...and *min_height* is measured up from the NOMINAL pad top, so a randomized pad shifts it
+    # by the whole of its own delta (see pad_height_deltas).
     return torch.logical_and(
-        obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta,
+        obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta + pad_height_deltas(env),
         object_grasped_by(
             env,
             ee_frame_cfg=ee_frame_cfg,
@@ -927,7 +1132,7 @@ def _handover_tick(
     # + half the length delta for the same reason as in object_lifted_and_grasped: a taller can
     # starts higher, and *min_height* is a nominal-can number baked in at cfg-build time.
     length_delta, _ = object_size_deltas(env)
-    lifted_now = obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta
+    lifted_now = obj.data.root_pos_w[:, 2] > min_height + 0.5 * length_delta + pad_height_deltas(env)
     memory["was_lifted"] |= right_holds & lifted_now
     stage[(stage == HANDOVER_STAGE_WAITING) & right_holds] = HANDOVER_STAGE_RIGHT_HELD
 
@@ -1014,8 +1219,8 @@ _OBJECT_Y_RANGE = (-0.27, 0.27)
 """m -- full pad width, both arms' halves AND the middle, keeping the base task's ~1.5 cm margin
 from the pad's y=+-0.285 half-width. Same caveat as :data:`_OBJECT_X_RANGE`."""
 
-_HANDOVER_SOURCE_X_RANGE = (0.2374, 0.3751)
-_HANDOVER_SOURCE_Y_RANGE = (-0.0592, 0.0120)
+_HANDOVER_SOURCE_X_RANGE = (0.2529, 0.3717)
+_HANDOVER_SOURCE_Y_RANGE = (-0.0072, 0.0119)
 """m -- the region the recorded hand-over demos actually put the can in, measured from their reset
 poses rather than chosen. NOT what generation samples (that is :data:`_HANDOVER_X_RANGE` /
 :data:`_HANDOVER_Y_RANGE`, a subset) -- this is the record of what the source data covers, kept
@@ -1025,12 +1230,18 @@ retuning of the sampled range.
 This is the INTERSECTION over every annotated demo set that is still in use, not any one of them.
 Read straight off ``initial_state/rigid_object/can/root_pose`` in each file:
 
-    logs/demos/pickup_pringle_annotated_v4.hdf5   x [0.224656, 0.418972]  y [-0.075389, 0.014304]
-    logs/demos/pickup_pringle_annotated_v5.hdf5   x [0.237397, 0.375137]  y [-0.059279, 0.012062]
-    intersection, ROUNDED INWARD (this constant)  x [0.2374,   0.3751  ]  y [-0.0592,   0.0120  ]
+    logs/demos/pickup_pringles_V9_annotated.hdf5  x [0.252870, 0.371710]  y [-0.007283, 0.011965]
+    intersection, ROUNDED INWARD (this constant)  x [0.2529,   0.3717  ]  y [-0.0072,   0.0119  ]
 
-Two ten-demo sets recorded by hand do NOT cover the same box, and v5's is the tighter one on all
-four sides. Taking the intersection is what makes the sampled range below safe whichever file is
+Retired, and no longer on disk -- kept here only so the numbers above can be compared against what
+they replaced: pickup_pringle_annotated_v4 covered x [0.224656, 0.418972] y [-0.075389, 0.014304]
+and _v5 covered x [0.237397, 0.375137] y [-0.059279, 0.012062], intersecting to x [0.2374, 0.3751]
+y [-0.0592, 0.0120], which is what this constant held before V9 became the only set in use. Note
+that V9 is TIGHTER than that on every side, so the honest source box shrank when the older sets
+retired -- which is exactly the kind of change this constant exists to make visible rather than let
+pass as "the ranges were already fine".
+
+Demo sets recorded by hand do NOT cover the same box. Taking the intersection is what makes the sampled range below safe whichever file is
 passed to ``generate_dataset.py --input_file``; taking either set alone silently extrapolates when
 the other is used. Re-measure and re-intersect when a demo set is added or retired -- an entry left
 here for a file no longer used only costs range, but a missing entry costs correctness.
@@ -1054,47 +1265,96 @@ the wider range, then set both this constant and the sampled one to what that se
 out to cover. Widening the sampled range WITHOUT recording is the failure this pair exists to
 prevent -- see :data:`_HANDOVER_X_RANGE` for the invariant that catches it."""
 
-_HANDOVER_X_RANGE = (0.2374, 0.3751)
-_HANDOVER_Y_RANGE = (-0.0120, 0.0120)
-"""m -- what hand-over generation actually samples: the source region above, with y re-centred on
-the midline between the two hands and shrunk to fit.
+_HANDOVER_EXTRAPOLATION_MARGIN_X = 0.030
+_HANDOVER_EXTRAPOLATION_MARGIN_Y = 0.045
+"""m -- how far OUTSIDE the source region above hand-over generation is allowed to spawn the can.
 
-Mimic can only re-anchor a source segment onto a new object pose, so the distance from a generated
-spawn to its source demo's spawn is the size of the rigid translation applied to every waypoint in
-that segment. Two consequences drive this range:
+This is deliberate extrapolation, and it is the only knob in this file that permits any. It exists
+because the alternative -- sampling strictly inside the source box, as this file did originally --
+gives a y spread of +-1.2 cm, which is not randomization in any useful sense: a policy trained on
+that data never sees the can anywhere but the midline, so it learns *where the can is* instead of
+learning to *look for the can*. That is the failure this margin is here to fix, and it is not a
+subtle one: it looks like a policy that reaches confidently to the same spot regardless of what
+the cameras show.
 
-* **It must stay INSIDE the source region.** A spawn outside it is extrapolation, not
-  interpolation. (For scale, the full-pad y range is +-0.27 against a source spread of
-  [-0.075, 0.014]: it asks Mimic to translate the whole grasp segment up to ~26 cm sideways from
-  anything it has seen, which lands the transformed waypoints outside the arm's reach.)
-* **Smaller is easier.** Every centimetre of spread is a centimetre of translation error the
-  bimanual constraints and the receiving arm's approach have to absorb. NVIDIA's own bimanual
-  hand-over (``Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0``) randomises its object by only
-  +-0.01 m in x and y, which is what lets that task get away with 3 subtask segments, one manual
-  annotation and no constraints at all.
+What it costs, and why that cost is acceptable here: Mimic can only re-anchor a source segment
+onto a new object pose, so the distance from a generated spawn to its source demo's spawn is the
+size of the rigid translation applied to every waypoint in that segment. Past the source box, that
+translation is extrapolation, and some fraction of trials will put the transformed waypoints
+somewhere the arm cannot follow. But generation VALIDATES every trial against the success
+condition and writes the failures to a separate ``*_failed.hdf5``, so the price of extrapolating
+is compute -- a lower success rate, more trials to reach ``--generation_num_trials`` -- and not
+dataset corruption. Trading generation compute for spatial coverage is the right trade when the
+coverage is what the policy is missing.
 
-y is therefore centred on 0 -- the midline between the arms, which park mirror-symmetrically at
-y=+-0.153 (see :data:`_ARM_KEEP_OUT_BOXES`) -- so the can sits equidistant from both hands rather
-than 2.4 cm into the giving arm's side as the raw source centre (-0.0236) does. Centring costs
-width: the source's own upper bound is +0.0120, so the widest y interval that is both centred on 0
-and a subset of the source is exactly +-0.0120. That is where this number comes from -- it is a
-geometric consequence of "centred AND no extrapolation", not a tuned value, and it happens to land
-in the same 2-3 cm band NVIDIA uses.
+Sized so the sampled box below stays inside two hard limits that are NOT negotiable, both of which
+would corrupt data rather than merely waste compute:
 
-x is left at the source bounds unchanged. The same centring argument does not bite there: the source
-x interval is already centred on its own data, so re-centring would not move it, and there is no
-second requirement (nothing analogous to "between the hands") pulling it in. Forward/back spread also
-costs the hand-over less than sideways spread -- both arms reach forward alike, whereas a sideways
-offset pushes the can toward one arm and out of the other's comfortable reach.
+* the arm keep-out boxes (:data:`_ARM_KEEP_OUT_BOXES`, |y| in [0.085, 0.215]) -- y stays well
+  short of 0.085, so the rejection sampler never has to fire for a hand-over spawn;
+* the pad itself (x in [0.03, 0.51], y in +-0.285 -- see stack_joint_pos_env_cfg.py) -- the widest
+  x below plus the can's radius lands at ~0.43, comfortably on the pad.
 
-INVARIANT: this range must remain a subset of :data:`_HANDOVER_SOURCE_X_RANGE` /
-:data:`_HANDOVER_SOURCE_Y_RANGE` unless a new demo set is recorded first.
+If generation success drops further than you are willing to pay for, LOWER these two numbers --
+that is what they are for, and 0.0 restores the original strictly-interpolating behaviour. The
+right permanent fix is still to record a hand-over demo set that actually covers the wider box and
+then move :data:`_HANDOVER_SOURCE_X_RANGE` / :data:`_HANDOVER_SOURCE_Y_RANGE` out to match it, at
+which point these margins can go back to 0."""
 
-Note that narrowing does NOT invalidate the existing annotated dataset: the source demos still
-bracket every pose that can now be sampled. Recording, though, goes through :func:`apply_task_mode`
-too (record_demos_openarm.py), so a new demo set recorded now would come out inside this narrow band
--- which is fine as long as the two constants above are updated to match it, and wrong if they are
-left describing the old, wider set."""
+# Sized ~2.5x the source's own y half-width and comparable to NVIDIA's own bimanual hand-over
+# (`Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0` randomizes its object by +-0.01 m), while
+# staying a long way short of the full-pad +-0.27 that provably breaks generation. A cap rather
+# than a preference: the point of computing the ranges FROM the margins is that widening them is
+# an edit to a constant whose name says what it does, so this catches a slip, not a decision.
+assert (
+    0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_X <= 0.06 and 0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_Y <= 0.06
+), (
+    f"hand-over extrapolation margin (x={_HANDOVER_EXTRAPOLATION_MARGIN_X},"
+    f" y={_HANDOVER_EXTRAPOLATION_MARGIN_Y}) exceeds the 0.06 m this task has any evidence for."
+    " Record a demo set covering the wider box and widen _HANDOVER_SOURCE_*_RANGE instead."
+)
+
+_HANDOVER_X_RANGE = (
+    round(_HANDOVER_SOURCE_X_RANGE[0] - _HANDOVER_EXTRAPOLATION_MARGIN_X, 4),
+    round(_HANDOVER_SOURCE_X_RANGE[1] + _HANDOVER_EXTRAPOLATION_MARGIN_X, 4),
+)
+_HANDOVER_Y_HALF_WIDTH = round(
+    max(abs(_HANDOVER_SOURCE_Y_RANGE[0]), abs(_HANDOVER_SOURCE_Y_RANGE[1])) + _HANDOVER_EXTRAPOLATION_MARGIN_Y, 4
+)
+_HANDOVER_Y_RANGE = (-_HANDOVER_Y_HALF_WIDTH, _HANDOVER_Y_HALF_WIDTH)
+"""m -- what hand-over generation actually samples: the source region above, y re-centred on the
+midline between the two hands, both axes grown by :data:`_HANDOVER_EXTRAPOLATION_MARGIN_X` /
+``_Y``.
+
+COMPUTED from the two pairs of constants above rather than written out, so the sampled range and
+the region it is justified against cannot drift apart: re-measuring the source data moves this
+automatically, and widening the sampled range is only expressible as raising a margin.
+
+y is centred on 0 -- the midline between the arms, which park mirror-symmetrically at y=+-0.153
+(see :data:`_ARM_KEEP_OUT_BOXES`) -- so the can sits equidistant from both hands rather than 2.4 cm
+into the giving arm's side as the raw source centre does. Centring is why the half-width is built
+from ``max(|lower|, |upper|)`` of the source rather than from the source's own width: an interval
+centred on 0 is described by one number, and that number should be the larger of the two sides the
+data actually reached, not their average.
+
+At the margins as set, this samples x over ~24 cm and y over ~11 cm. Compare what it replaced:
++-1.2 cm in y, i.e. a can that never left the midline. The x spread was always the healthier of
+the two axes, which is why the memorization shows up as a policy that has learned the lateral
+position and not the depth.
+
+Sanity numbers to keep in mind when retuning:
+
+* NVIDIA's own bimanual hand-over (``Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0``) randomises
+  its object by only +-0.01 m in x and y -- which is what lets that task get away with 3 subtask
+  segments, one manual annotation and no constraints at all. This task carries constraints and
+  more segments precisely so it can afford more spread than that.
+* The full-pad range (+-0.27 in y) provably does NOT work for hand-over: it asks Mimic to
+  translate the whole grasp segment up to ~26 cm sideways from anything it has seen, which lands
+  the transformed waypoints outside the receiving arm's reach. The margins above are ~1/5 of that.
+
+Note that widening does NOT invalidate the existing annotated dataset -- the source demos are still
+the segments being re-anchored, and generation still validates every trial. What it does invalidate
+is any assumption that a generated spawn was interpolated; see the margins' docstring."""
 
 OBJECT_SPAWN_RANGES = {
     # Single-arm modes keep the full-pad range: their own demos have not been re-measured the way
@@ -1107,22 +1367,6 @@ OBJECT_SPAWN_RANGES = {
     TASK_MODE_HANDOVER: (_HANDOVER_X_RANGE, _HANDOVER_Y_RANGE),
 }
 """Where each mode may spawn the can, as (x_range, y_range) in env-local metres."""
-
-# The invariant from :data:`_HANDOVER_X_RANGE`, enforced rather than described: a sampled range that
-# escapes the source demos' coverage is extrapolation, and its symptom (Mimic translating whole
-# segments past the arm's reach) shows up as a low generation success rate rather than as an error,
-# so it is worth failing at import instead. Narrowing is always safe; widening needs a new demo set
-# and both constants updated together.
-assert (
-    _HANDOVER_SOURCE_X_RANGE[0] <= _HANDOVER_X_RANGE[0]
-    and _HANDOVER_X_RANGE[1] <= _HANDOVER_SOURCE_X_RANGE[1]
-    and _HANDOVER_SOURCE_Y_RANGE[0] <= _HANDOVER_Y_RANGE[0]
-    and _HANDOVER_Y_RANGE[1] <= _HANDOVER_SOURCE_Y_RANGE[1]
-), (
-    f"hand-over spawn range x={_HANDOVER_X_RANGE} y={_HANDOVER_Y_RANGE} is not a subset of what the "
-    f"source demos cover (x={_HANDOVER_SOURCE_X_RANGE} y={_HANDOVER_SOURCE_Y_RANGE}); record a new "
-    "demo set against the wider range and update both pairs of constants."
-)
 
 
 # ── Where the can must NOT spawn: on top of a parked arm ──────────────────────
@@ -1139,14 +1383,29 @@ assert (
 # If the arms' rest pose is ever raised to clear a standing can (they would need ~7 cm), these
 # boxes can shrink or go away entirely -- they describe the rest pose, not the object.
 #
-# Kept for every mode even though the hand-over range (:data:`_HANDOVER_Y_RANGE`, |y| <= 0.0120)
-# comes nowhere near them: they guard the rest pose, so they must stay correct for whatever range a
-# mode is given, including a wider one restored later. The single-arm modes' full-pad range does
-# still reach them, which is what keeps the rejection sampling in :func:`reset_object_free` load
-# bearing.
+# Kept for every mode even though the hand-over range (:data:`_HANDOVER_Y_RANGE`, |y| <= 0.057)
+# still comes nowhere near them: they guard the rest pose, so they must stay correct for whatever
+# range a mode is given, including a wider one. The single-arm modes' full-pad range does reach
+# them, which is what keeps the rejection sampling in :func:`reset_object_free` load bearing -- and
+# the assert below is what keeps the hand-over range from quietly starting to lean on it too.
 _ARM_KEEP_OUT_BOXES = (
     (0.19, 0.42, 0.085, 0.215),    # left arm's parked footprint  (x_min, x_max, y_min, y_max)
     (0.19, 0.42, -0.215, -0.085),  # right arm's, mirrored
+)
+
+# The subset-of-the-source invariant this file used to enforce is now deliberately relaxed by
+# _HANDOVER_EXTRAPOLATION_MARGIN_X/_Y (see their docstring for why, and for the compute-not-
+# correctness cost of doing so). What has NOT been relaxed, and is checked here instead, is the
+# limit that would corrupt data rather than merely waste it: a hand-over spawn must never land in
+# an arm's parked footprint. reset_object_free's rejection sampler would technically handle it,
+# but silently -- and a range that leans on rejection sampling no longer samples the uniform
+# distribution its docstring claims, because the accepted region is not the rectangle any more.
+assert all(
+    _HANDOVER_Y_RANGE[1] < y_min or _HANDOVER_Y_RANGE[0] > y_max
+    for _, _, y_min, y_max in _ARM_KEEP_OUT_BOXES
+), (
+    f"hand-over spawn range y={_HANDOVER_Y_RANGE} overlaps an arm's parked footprint"
+    f" ({_ARM_KEEP_OUT_BOXES}); lower _HANDOVER_EXTRAPOLATION_MARGIN_Y."
 )
 
 
@@ -1210,19 +1469,24 @@ def reset_object_free(
 def _object_rest_z(env, env_ids: torch.Tensor | None = None):
     """Height (env-local m) at which the can's origin sits when standing on the pad.
 
-    A float when every env's can is the nominal size, an (N,) tensor once
-    :func:`randomize_object_size` has given the envs different lengths -- the origin is the can's
-    CENTRE, so a can 5 cm longer stands with its origin 2.5 cm higher on the same pad. Pass
-    *env_ids* to get the rows for a subset (:func:`reset_object_free` writes only the envs it is
-    resetting); omit it for all of them.
+    A float when every env has the nominal can on the nominal pad, an (N,) tensor once
+    :func:`randomize_object_size` or :func:`randomize_pad_height` has made the envs differ -- the
+    origin is the can's CENTRE, so a can 5 cm longer stands with its origin 2.5 cm higher on the
+    same pad, and a pad 3 cm taller raises it by the full 3 cm. Pass *env_ids* to get the rows for
+    a subset (:func:`reset_object_free` writes only the envs it is resetting); omit it for all of
+    them.
     """
     nominal = 2.0 * float(env.cfg.scene.workspace_pad.init_state.pos[2]) + CAN_HALF_HEIGHT
     length_delta, _ = object_size_deltas(env)
-    if isinstance(length_delta, float):
+    pad_delta = pad_height_deltas(env)
+    if isinstance(length_delta, float) and isinstance(pad_delta, float):
         return nominal
     if env_ids is not None:
-        length_delta = length_delta[env_ids]
-    return nominal + 0.5 * length_delta
+        if not isinstance(length_delta, float):
+            length_delta = length_delta[env_ids]
+        if not isinstance(pad_delta, float):
+            pad_delta = pad_delta[env_ids]
+    return nominal + 0.5 * length_delta + pad_delta
 
 
 def randomize_object_size(

@@ -46,6 +46,8 @@ import isaaclab.envs.mdp as mdp_core
 from isaaclab_tasks.manager_based.manipulation.stack import mdp
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import openarm_domain_randomization
 
+from . import openarm_task_modes
+
 from . import stack_ik_abs_visuomotor_env_cfg
 
 
@@ -168,13 +170,44 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         func=openarm_domain_randomization.randomize_static_asset_pose,
         mode="reset",
         params={
-            # Small jitter only -- height (z) and orientation stay fixed so the deliberately
-            # tuned pad height / robot clearance (see stack_joint_pos_env_cfg.py) still holds.
+            # Small in-plane jitter only. Orientation stays fixed, and height is owned by
+            # `randomize_pad_height` below -- hence keep_current_z, without which this term would
+            # undo that one every reset (see randomize_static_asset_pose's docstring).
             "pose_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
-            # Must match workspace_pad's spawn position in stack_joint_pos_env_cfg.py
-            # (PAD_CENTER_X, 0.0, PAD_HEIGHT / 2) -- update this if that changes.
-            "base_pos": (0.3925, 0.0, 0.095),
+            # Overwritten at attach time from the pad's actual spawn position -- see
+            # attach_domain_randomization. The value here is only a placeholder so the param
+            # exists; a hardcoded literal was previously left behind when the pad geometry moved,
+            # and silently teleported the pad 12 cm forward and 9 cm down on every single reset.
+            "base_pos": (0.0, 0.0, 0.0),
+            "keep_current_z": True,
             "asset_cfg": SceneEntityCfg("workspace_pad"),
+        },
+    )
+
+    # ── Pad height (prestartup, both profiles) ──────────────────────────────
+    # NOT overridden to None by the 'visual' profile the way randomize_pad_position is, even
+    # though pad height is geometry rather than appearance. The reason is sim2real rather than
+    # taxonomy: the pad's height is the single number fixing how high the object sits relative to
+    # the robot base, the real rig's is neither exact nor stable (see PAD_HEIGHT's own "17 cm
+    # real-world + 2 cm extra, temporarily" comment in stack_joint_pos_env_cfg.py), and a policy
+    # trained at exactly one pad height memorises the absolute wrist height its grasp happens at.
+    # Every profile wants that varied, so every profile gets it.
+    #
+    # Lives in openarm_task_modes rather than openarm_domain_randomization because it is not an
+    # appearance term: the same module owns the height-sensitive success signals that have to be
+    # shifted along with it (see `pad_height_deltas`), and keeping the two together is what stops
+    # a randomized pad from making every episode read as "already lifted".
+    randomize_pad_height = EventTerm(
+        func=openarm_task_modes.randomize_pad_height,
+        mode="prestartup",
+        params={
+            "asset_cfg": SceneEntityCfg("workspace_pad"),
+            # +-3 cm on a 28 cm pad. Chosen to bracket the real rig's own uncertainty with room to
+            # spare rather than to be as wide as possible: the demos being re-anchored were
+            # recorded at ONE height, and Mimic shifts a grasp segment vertically by exactly this
+            # delta, so a range much wider than the arm's comfortable vertical slack buys spread
+            # at the cost of generation success. Widen if the success rate holds.
+            "height_delta_range": (-0.03, 0.03),
         },
     )
 
@@ -263,9 +296,10 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
 class PickUpVisualDomainRandomizationEventCfg(PickUpDomainRandomizationEventCfg):
     """A deliberately mild, appearance-only alternative to `PickUpDomainRandomizationEventCfg`.
 
-    Selected by generate_dataset.py's `--domain_randomization_profile visual`. Covers exactly four
-    axes -- lighting, surface finish, colour saturation, and camera angle on all three mounted
-    cameras -- and nothing else. What it leaves alone is as much the point as what it varies:
+    Selected by generate_dataset.py's `--domain_randomization_profile visual`. Covers four
+    appearance axes -- lighting, surface finish, colour saturation, and camera angle on all three
+    mounted cameras -- plus the one non-appearance term every profile inherits, pad height. What
+    it leaves alone is as much the point as what it varies:
 
     * **No skybox swap.** The full profile replaces the dome light's HDR environment map with one
       of thirteen unrelated scenes (a parking lot, a hospital room, a photo studio), which changes
@@ -278,7 +312,9 @@ class PickUpVisualDomainRandomizationEventCfg(PickUpDomainRandomizationEventCfg)
       policy trained on this data can still use colour to find the object, which in a task named
       "PickUp-RedCube" is a cue worth keeping rather than training away.
     * **No pad position jitter.** That moves the geometry the demo was generated against, not its
-      appearance, and appearance is all this profile is for.
+      appearance, and appearance is all this profile is for. Pad HEIGHT is the one exception, and
+      it is inherited on purpose -- see `randomize_pad_height` on the parent for why every profile
+      wants it.
 
     Ranges are set to roughly +-50% of nominal for lighting (3000 intensity, 0.75 grey -- see
     `stack_env_cfg.py`) and +-30% for saturation, versus the full profile's 0.17x-4x intensity and
@@ -333,6 +369,8 @@ class PickUpVisualDomainRandomizationEventCfg(PickUpDomainRandomizationEventCfg)
     # Geometry, not appearance -- switched off. `None` is how EventManager._prepare_terms is told
     # to skip an inherited term entirely (it `continue`s on any term whose cfg is None), which is
     # the same idiom the task cfgs elsewhere in this tree use to drop a manager they don't want.
+    # Note this is the pad's IN-PLANE jitter only; `randomize_pad_height` is deliberately NOT
+    # switched off here.
     randomize_pad_position = None
 
     # The three mounted-camera angle terms are inherited from the parent unchanged and
@@ -399,6 +437,12 @@ def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
     dr_cfg = DOMAIN_RANDOMIZATION_PROFILES[profile]()
     object_name = _manipulated_object_name(env_cfg)
 
+    # A prestartup term (randomize_pad_height) cannot coexist with scene replication -- the envs
+    # would share their parsed asset properties, so every env would silently get env_0's pad, and
+    # EventManager refuses the term outright while it is on. Off is already this task family's
+    # default (stack_env_cfg.py's ObjectTableSceneCfg); this is a guard, not a new setting.
+    env_cfg.scene.replicate_physics = False
+
     attached = []
     for term_name, term in vars(dr_cfg).items():
         if term_name in base_term_names:
@@ -407,6 +451,15 @@ def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
             asset_cfg = term.params.get("asset_cfg")
             if asset_cfg is not None and asset_cfg.name == "cube_2":
                 term.params["asset_cfg"] = SceneEntityCfg(object_name)
+            # The pad's nominal pose is a cfg-time fact, so read it off the cfg rather than
+            # trusting a literal in the event term. A stale literal here is silent and expensive:
+            # the term teleports the pad to wherever the literal says on every reset, so the pad
+            # the cameras see stops being the pad the demos were recorded against, and nothing
+            # errors. That is exactly what had happened -- see randomize_pad_position.
+            if "base_pos" in term.params:
+                term.params["base_pos"] = tuple(
+                    float(v) for v in env_cfg.scene.workspace_pad.init_state.pos
+                )
             attached.append(term_name)
         # None is attached too, not skipped: that is how a profile switches OFF a term it inherits
         # from another profile (EventManager._prepare_terms skips any term whose cfg is None).
