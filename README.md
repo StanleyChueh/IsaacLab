@@ -292,6 +292,11 @@ source .venv/bin/activate
 env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V11_dr_strong     --body-cam-index 4 --wrist-cam-index 16 --right-wrist-cam-index 10     --calibration calibration.json     --inference-hz 20 --max-joint-speed 1.5 --max-episode-seconds 600 
 ```
 
+Deploy in async evaluation
+```
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background     --body-cam-index 4 --wrist-cam-index 15 --right-wrist-cam-index 11     --calibration calibration.json     --control-hz 20 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20
+```
+
 ## OpenARM Motors Check
 
 ```
