@@ -210,6 +210,7 @@ class WaypointTrajectory:
         num_steps,
         skip_interpolation=False,
         action_noise=0.0,
+        easing="linear",
     ):
         """
         Adds a new waypoint sequence corresponding to a desired target pose. A new WaypointSequence
@@ -231,6 +232,11 @@ class WaypointTrajectory:
 
             action_noise (float): scale of random gaussian noise to add during action execution (e.g.
                 when @execute is called)
+
+            easing (str): how the interpolation fraction is scheduled -- "linear" (constant
+                velocity, the long-standing behaviour) or "smoothstep" (starts and ends at rest).
+                See isaaclab.utils.math.interpolate_poses for what this is for and what it costs.
+                Ignored when @skip_interpolation is True.
         """
         if len(self.waypoint_sequences) == 0:
             assert skip_interpolation, "cannot interpolate since this is the first waypoint sequence"
@@ -247,6 +253,7 @@ class WaypointTrajectory:
                 pose_1=last_waypoint.pose,
                 pose_2=pose,
                 num_steps=num_steps,
+                easing=easing,
             )
             assert num_steps == num_steps_2
             gripper_actions = gripper_action.unsqueeze(0).repeat((num_steps + 2, 1))
@@ -285,6 +292,7 @@ class WaypointTrajectory:
         num_steps_interp=None,
         num_steps_fixed=None,
         action_noise=0.0,
+        easing="linear",
     ):
         """
         Merge this trajectory with another (@other).
@@ -299,6 +307,10 @@ class WaypointTrajectory:
                 target poses corresponding to the first target pose in @other
 
             action_noise (float): noise to use during the interpolation segment
+
+            easing (str): fraction schedule for the interpolation segment -- see
+                @add_waypoint_sequence_for_target_pose. This is the splice between two subtask
+                segments, i.e. exactly the join that easing exists to smooth.
         """
         need_interp = (num_steps_interp is not None) and (num_steps_interp > 0)
         need_fixed = (num_steps_fixed is not None) and (num_steps_fixed > 0)
@@ -320,6 +332,7 @@ class WaypointTrajectory:
                     num_steps=num_steps_interp,
                     action_noise=action_noise,
                     skip_interpolation=False,
+                    easing=easing,
                 )
 
             if need_fixed:

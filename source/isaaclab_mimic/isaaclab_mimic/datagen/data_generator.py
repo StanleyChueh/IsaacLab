@@ -669,7 +669,7 @@ class DataGenerator:
             )
         traj_to_execute.add_waypoint_sequence(init_sequence)
 
-        # Merge this trajectory into our trajectory using linear interpolation.
+        # Merge this trajectory into our trajectory using the subtask's interpolation schedule.
         # Interpolation will happen from the initial pose (@init_sequence) to the first element of @transformed_seq.
         traj_to_execute.merge(
             subtask_trajectory,
@@ -679,6 +679,7 @@ class DataGenerator:
                 float(self.env_cfg.subtask_configs[eef_name][subtask_index].apply_noise_during_interpolation)
                 * self.env_cfg.subtask_configs[eef_name][subtask_index].action_noise
             ),
+            easing=self.env_cfg.subtask_configs[eef_name][subtask_index].interpolation_easing,
         )
 
         # We initialized @traj_to_execute with a pose to allow @merge to handle linear interpolation

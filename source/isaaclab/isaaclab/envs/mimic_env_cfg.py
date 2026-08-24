@@ -153,6 +153,19 @@ class SubTaskConfig:
     num_interpolation_steps: int = 5
     """Number of steps for interpolation between waypoints."""
 
+    interpolation_easing: str = "linear"
+    """Fraction schedule for the interpolation segment spliced in ahead of this subtask.
+
+    ``"linear"`` (default) crosses the gap at constant velocity, which leaves a velocity step at
+    each end of the splice wherever the neighbouring segments are moving at a different speed --
+    two acceleration spikes of ``gap / num_interpolation_steps``, and the reason a boundary can
+    read as a jolt even when both segments either side are smooth. ``"smoothstep"`` leaves and
+    arrives at rest instead, removing the steps, at the cost of a 1.5x higher mid-splice speed.
+
+    Only worth enabling once ``num_interpolation_steps`` is long enough to afford that 1.5x, and
+    only where the neighbouring segments are near rest at the boundary. See
+    :func:`isaaclab.utils.math.interpolate_poses` for the measured trade-off table."""
+
     num_fixed_steps: int = 0
     """Number of fixed steps for the subtask."""
 

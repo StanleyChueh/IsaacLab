@@ -1886,10 +1886,55 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     """
     from isaaclab.envs.mimic_env_cfg import SubTaskConfig
 
+    # ── How long the splices are ─────────────────────────────────────────────
+    # The bridge crosses |T| in `interp` steps, so peak speed and peak acceleration across it both
+    # scale as 1/interp. Step count is the DOMINANT term -- easing is a 2-3x multiplier on top of
+    # it, not a substitute (interpolate_poses carries the measured table). On this task's seam
+    # geometry (37 mm gap, neighbours at 0.3 mm/step):
+    #
+    #     interp= 5 linear      7.41 mm/step^2      <- what produced the observed jolt
+    #     interp=15 smoothstep  0.86 mm/step^2      <- this
+    #
+    # 15 rather than more because every added step is right-arm-only delay, and this mode's
+    # two-arm synchronisation has no constraints holding it together -- only the fact that both
+    # arms replay one source demo whose phasing already worked.
+    SEAM_INTERP = 15
+
+    # The phase compensation that makes raising SEAM_INTERP safe.
+    #
+    # The right arm has TWO splices (its entry bridge, which also crosses |T| because segment 0 is
+    # the transformed one, and the seam at the grasp); the left arm has one, and its bridge is
+    # near-zero-length because its first waypoint is its own rest pose. So raising `interp`
+    # uniformly delays the right arm by twice what it delays the left, and the hand-over drifts
+    # apart by the difference.
+    #
+    # That drift is the one failure this structure has no guard against: the docstring's measured
+    # margin is a median of 1 step (range -26 to +24), the receiving hand already tends to arrive
+    # first, and a left hand that closes before the can is there is the dominant failure mode
+    # (40 of 69 failures in the old ten-segment structure). Making the right arm 20 steps later
+    # without moving the left is walking straight into it.
+    #
+    # So the left arm absorbs the same TOTAL splice time the right arm does, less the 5-step head
+    # start the right arm had when every subtask used interp=5 (right 2 splices = 10 steps, left
+    # 1 splice = 5). Preserving that difference, not zeroing it, is the point: 5 steps of right-arm
+    # lag is what the source demos' phasing was validated against.
+    #
+    #     left = (right's total) - 5 = 2 * SEAM_INTERP - 5
+    #
+    # which degenerates to 5 at SEAM_INTERP=5, i.e. exactly today's config.
+    #
+    # Getting this arithmetic wrong is not a subtle failure. An earlier version of this line read
+    # `SEAM_INTERP + 2 * (SEAM_INTERP - 5)` = 35, which delays the left arm 10 steps MORE than the
+    # right instead of matching it -- the same desynchronisation, sign-flipped. Measured over 5
+    # generated demos it took the trial success rate from 5/6 to 5/11 while the smoothness fix
+    # itself worked exactly as intended, so the two effects are independent and this one is purely
+    # the arithmetic.
+    LEFT_INTERP = 2 * SEAM_INTERP - 5
+
     # term_signal deliberately untyped: SubTaskConfig annotates it as plain `str` while defaulting
     # it to None, so an honest `str | None` here just moves the type error into the
     # SubTaskConfig(...) call. Same loose style as _idle_subtasks.
-    def _subtask(term_signal, description, interp: int = 5, object_ref: str | None = None):
+    def _subtask(term_signal, description, interp: int = SEAM_INTERP, object_ref: str | None = None):
         # 'nearest_neighbor_object' needs an object to measure against, so a segment with no
         # object_ref falls back to 'random' -- same pairing as _idle_subtasks. 'random' does not
         # mean this segment picks its own demo: with generation_select_src_per_arm False the demo
@@ -1940,6 +1985,24 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             # the accel but pushes the worst-case corner past 3.8 cm, which starts to matter against
             # this task's 7 cm grasp cylinder.
             waypoint_smoothing_window=5,
+            # The one thing waypoint_smoothing_window structurally CANNOT fix. That filter pins
+            # segment endpoints on purpose (see smooth_eef_pose_segment: "the first and last
+            # waypoints stay within a millimetre or so of where they were"), because the endpoint
+            # is where the splice to the next segment is anchored -- so the splice itself is
+            # exactly what it leaves alone. The jolt lives in the splice, not in either segment.
+            #
+            # Measured on the seam, right arm, logs/demos/pickup_pringles_VR_pringles_dr_jerky_test.hdf5:
+            # the commanded eef sits at 0.2-0.5 mm/step through the grasp and then jumps to
+            # 15-21 mm/step for two steps, i.e. 40-50x the surrounding motion. That is |T| (a
+            # measured 3.0-6.2 cm) crossed by a CONSTANT-velocity bridge in `interp` steps: a
+            # velocity step up at the start of the bridge and back down at the end, which is two
+            # acceleration spikes of |T|/interp with nothing either side to absorb them.
+            #
+            # Both neighbours are at rest at this boundary (the arm decelerates into a grasp and
+            # leaves it slowly), which is precisely the condition under which a zero-velocity
+            # bridge is the right shape rather than the wrong one -- see interpolate_poses' note
+            # that easing MANUFACTURES a stop-and-go where the neighbours are moving.
+            interpolation_easing="smoothstep",
             description=description,
         )
 
@@ -1952,7 +2015,10 @@ def _handover_subtask_configs() -> tuple[dict, list]:
         # boundary to place because there is nothing this arm has to adapt to -- see the
         # one-transform invariant above.
         LEFT_EEF: [
-            _subtask(None, "Wait, take the presented can and carry it away"),
+            # interp=LEFT_INTERP, not SEAM_INTERP: this arm's bridge is a near-zero-length
+            # interpolation from its rest pose to its rest pose, so the extra steps are extra
+            # waiting, deliberately matched to the right arm's total. See LEFT_INTERP above.
+            _subtask(None, "Wait, take the presented can and carry it away", interp=LEFT_INTERP),
         ],
         RIGHT_EEF: [
             # The only transformed segment in the mode: the can is wherever it spawned.
