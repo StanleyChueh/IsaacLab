@@ -1265,8 +1265,8 @@ the wider range, then set both this constant and the sampled one to what that se
 out to cover. Widening the sampled range WITHOUT recording is the failure this pair exists to
 prevent -- see :data:`_HANDOVER_X_RANGE` for the invariant that catches it."""
 
-_HANDOVER_EXTRAPOLATION_MARGIN_X = 0.030
-_HANDOVER_EXTRAPOLATION_MARGIN_Y = 0.045
+_HANDOVER_EXTRAPOLATION_MARGIN_X = 0.050
+_HANDOVER_EXTRAPOLATION_MARGIN_Y = 0.065
 """m -- how far OUTSIDE the source region above hand-over generation is allowed to spawn the can.
 
 This is deliberate extrapolation, and it is the only knob in this file that permits any. It exists
@@ -1301,17 +1301,15 @@ right permanent fix is still to record a hand-over demo set that actually covers
 then move :data:`_HANDOVER_SOURCE_X_RANGE` / :data:`_HANDOVER_SOURCE_Y_RANGE` out to match it, at
 which point these margins can go back to 0."""
 
-# Sized ~2.5x the source's own y half-width and comparable to NVIDIA's own bimanual hand-over
-# (`Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0` randomizes its object by +-0.01 m), while
-# staying a long way short of the full-pad +-0.27 that provably breaks generation. A cap rather
-# than a preference: the point of computing the ranges FROM the margins is that widening them is
-# an edit to a constant whose name says what it does, so this catches a slip, not a decision.
+# These are set right up against the task's two HARD geometric limits, which are asserted below
+# rather than described here. The magnitude check is only a typo guard -- an order-of-magnitude
+# slip (0.5 for 0.05) would otherwise sail past the geometry asserts into the full-pad regime that
+# provably breaks generation.
 assert (
-    0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_X <= 0.06 and 0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_Y <= 0.06
+    0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_X <= 0.12 and 0.0 <= _HANDOVER_EXTRAPOLATION_MARGIN_Y <= 0.12
 ), (
     f"hand-over extrapolation margin (x={_HANDOVER_EXTRAPOLATION_MARGIN_X},"
-    f" y={_HANDOVER_EXTRAPOLATION_MARGIN_Y}) exceeds the 0.06 m this task has any evidence for."
-    " Record a demo set covering the wider box and widen _HANDOVER_SOURCE_*_RANGE instead."
+    f" y={_HANDOVER_EXTRAPOLATION_MARGIN_Y}) is implausibly large -- the pad is only 0.48 x 0.57 m."
 )
 
 _HANDOVER_X_RANGE = (
@@ -1406,6 +1404,19 @@ assert all(
 ), (
     f"hand-over spawn range y={_HANDOVER_Y_RANGE} overlaps an arm's parked footprint"
     f" ({_ARM_KEEP_OUT_BOXES}); lower _HANDOVER_EXTRAPOLATION_MARGIN_Y."
+)
+
+# The second hard limit, and the one that bounds x. The base task measured it directly: an earlier
+# spawn band reaching in to x=0.17 put the can's near corner ~17 cm from the robot origin, close
+# enough for the gripper to clip its own base while reaching, and widening the near edge out to
+# 0.20 is what fixed it (see PickUpEventCfg's docstring). That is a collision, not a low success
+# rate -- it corrupts episodes rather than discarding them -- so unlike the extrapolation margins
+# it is not a knob.
+_MIN_SPAWN_X = 0.20
+assert _HANDOVER_X_RANGE[0] >= _MIN_SPAWN_X, (
+    f"hand-over spawn range x={_HANDOVER_X_RANGE} reaches closer to the robot base than"
+    f" {_MIN_SPAWN_X} m, where the gripper clips the base while reaching;"
+    " lower _HANDOVER_EXTRAPOLATION_MARGIN_X."
 )
 
 
@@ -1949,9 +1960,27 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             # the whole mode there is nothing left to tie with.
             subtask_term_offset_range=(0, 0),
             selection_strategy="nearest_neighbor_object" if object_ref is not None else "random",
-            # 3, not 10: |T| is now the episode's ONLY transform, so halving it is worth more than
-            # the source diversity it costs. See the table in this function's docstring.
-            selection_strategy_kwargs={"nn_k": 3} if object_ref is not None else {},
+            # 1, not 3 and not 10 -- the same trade as the docstring's table, taken one step
+            # further because the spawn range has since been widened well past what those numbers
+            # were measured against. |T| is the episode's ONLY transform, and it now has to cover a
+            # 22 x 15 cm spawn box from 10 source demos clustered in a 12 x 2 cm patch, so every
+            # centimetre of it is worth more than the source diversity it costs. Measured against
+            # this source set at the current range:
+            #
+            #     nn_k=3  |T| median 5.13 cm, p90 7.75, max 9.98
+            #     nn_k=1  |T| median 4.17 cm, p90 6.84, max 9.45
+            #
+            # That ~1 cm is what pays for the widening: nn_k=1 at the CURRENT range gives roughly
+            # the same |T| as nn_k=3 did at the previous, narrower one (median 3.84 cm), so the
+            # spawn box grew ~35% in y and ~22% in x at near-constant seam cost.
+            #
+            # What it costs: source selection becomes deterministic in the spawn pose, i.e. a
+            # Voronoi partition of the spawn box over the 10 demos rather than a random draw from
+            # the nearest 3. All 10 still get used across a run; what is lost is several different
+            # renderings of the SAME spawn. For a policy whose problem is that it has only ever
+            # seen the can in one place, spawn diversity is the axis that matters and source
+            # diversity is not.
+            selection_strategy_kwargs={"nn_k": 1} if object_ref is not None else {},
             # 0, not the 0.001 this used to carry. That noise is iid per step and per axis, i.e.
             # white: it is the one component of the generated motion that has no counterpart in the
             # source demos, and it lands squarely in the band the arm can actually track. Measured
