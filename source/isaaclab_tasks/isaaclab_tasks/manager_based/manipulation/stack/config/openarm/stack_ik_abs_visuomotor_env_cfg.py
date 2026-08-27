@@ -47,16 +47,16 @@ class ObservationsCfg:
 
 @configclass
 class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvCfg):
-    """OpenArm stack env with two cameras for visuomotor data collection.
+    """Base cfg adding two cameras to the OpenArm scene for visuomotor data collection.
+
+    NOT a registered task -- it is the direct parent of
+    :class:`pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg` and exists only to carry the
+    camera setup. Record against ``Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0`` instead (see
+    ``scripts/tools/record_demos_openarm.py``).
 
     Cameras:
-      front_cam — fixed table-side view (640×480)
+      front_cam — fixed table-side view (640×480); the pick-up cfg switches this one OFF
       wrist_cam — mounted on openarm_left_ee_tcp (640×480)
-
-    Record with:
-      ./isaaclab.sh -p scripts/tools/record_demos.py \\
-          --task Isaac-Stack-Cube-OpenArm-IK-Abs-Visuomotor-v0 \\
-          --dataset_file logs/demos/openarm_visuomotor.hdf5
     """
 
     def __post_init__(self):

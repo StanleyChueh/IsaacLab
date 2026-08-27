@@ -87,17 +87,28 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 
 # Environment Setup
 
-If you want to change environment in IsaacSim, please refer to the following setting
+The pick-up task manipulates a **chips can (pringles)**, not a cube. The task ids still say
+`RedCube` for backwards compatibility with the recorded datasets, but `--task_mode` swaps the
+can in for `cube_2` on every run -- `record_demos_openarm.py` and `eval_smolvla_jointspace.py`
+refuse to start without it, so you cannot get the old cube by accident.
+
+Two files hold everything worth tuning:
 
 ```
-source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/stack/config/franka/stack_joint_pos_env_cfg.py
+# scene: pad, robot, cameras
+source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/stack/config/openarm/stack_joint_pos_env_cfg.py
+
+# the can, the per-mode spawn region, grasp/hand-over thresholds
+source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/stack/config/openarm/openarm_task_modes.py
 ```
 
 ### Table / Workspace (Pad)
 
-PAD_HEIGHT = 0.13          # height of the gray platform (m)
+In `stack_joint_pos_env_cfg.py` -- the pad pos and the object resting height both follow from it:
 
-CUBE_Z = PAD_HEIGHT + 0.02 # cube resting height = pad top + half-block
+```
+PAD_HEIGHT = 0.28          # height of the gray platform (m)
+```
 
 ### Robot Base Height
 
@@ -105,32 +116,30 @@ CUBE_Z = PAD_HEIGHT + 0.02 # cube resting height = pad top + half-block
 self.scene.robot.init_state.pos = (0.0, 0.0, 0.0)  # adjust Z to raise/lower
 ```
 
-### Cube Size and Color
+### Can (pringles) Asset
+
+In `openarm_task_modes.py`:
 
 ```
-for i, (name, pos, color) in enumerate([
-    ("cube_1", [0.2,  0.08,  CUBE_Z], "blue"),   # change "blue" → any color name
-    ("cube_2", [0.55, 0.05,  CUBE_Z], "red"),     # the pickup cube
-    ("cube_3", [0.60, -0.10, CUBE_Z], "green")
-]):
-    spawn=UsdFileCfg(
-        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/{color}_block.usd",  # USD determines size too
-    )
+CAN_USD_PATH = ".../Isaac_task_asset/Lightwheel_.../chips_can_berkeley_meshes.usd"
+CAN_SCALE    = 0.8                  # post-scale: ~60 mm across, ~200 mm tall
+CAN_ROT      = (1.0, 0.0, 0.0, 0.0) # identity = standing upright on the pad
 ```
 
-### Cube Randomization Range (each episode)
+Per-episode size randomization is available too -- see `randomize_object_size` /
+`attach_object_size_randomization` in the same file.
+
+### Can Randomization Range (each episode)
+
+Also in `openarm_task_modes.py`. These are ABSOLUTE env-local metres, per task mode, and the
+`handover` range is deliberately a subset of what the recorded source demos cover (Mimic will
+not generate reliably outside it):
 
 ```
-randomize_cube_2 = EventTerm(
-    func=mdp_core.reset_root_state_uniform,
-    params={
-        "pose_range": {
-            "x": (-0.38, -0.28),  # offset from default x=0.55 → actual x:[0.17, 0.27]
-            "y": (-0.02,  0.12),  # offset from default y=0.05 → actual y:[0.03, 0.17]
-        },
-        ...
-    },
-)
+_OBJECT_X_RANGE = (0.20, 0.46)    # pad-limited forward band
+_OBJECT_Y_RANGE = (-0.27, 0.27)   # full pad width; +y is the LEFT-arm side
+
+OBJECT_SPAWN_RANGES = { "left": ..., "right": ..., "handover": ... }
 ```
 
 # Isaac Lab Mimic
@@ -246,6 +255,13 @@ python scripts/imitation_learning/lerobot/smolvla_server.py \
     --task "Pick up the red cube." \
     --port 5556
 ```
+
+`--task` here is the LANGUAGE PROMPT the policy is conditioned on, not an Isaac Lab task id.
+It must match, character for character, the `--task` string that
+`convert_hdf5_to_lerobot.py` stamped into the dataset this checkpoint was trained on. The
+string above is what `ethanCSL/openarm_visuomotor_augmented_dataset_1000` was trained with, so
+it stays as-is even though the object is a pringles can -- change it only together with a
+re-converted dataset and a re-trained checkpoint.
 
 Run Isaac Lab Eval
 

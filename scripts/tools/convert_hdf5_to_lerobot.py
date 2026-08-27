@@ -6,7 +6,7 @@ Run with the lerobot conda env:
   conda run -n lerobot python -u scripts/tools/convert_hdf5_to_lerobot.py \\
       --hdf5 logs/demos/pickup.hdf5 \\
       --output ~/datasets/openarm \\
-      --task "Pick up the red cube." \\
+      --task "Pick up the pringles can." \\
       --fps 30 --cameras right_wrist_cam wrist_cam body_cam
 
 --cameras names are matched against what the HDF5 actually contains and any that are missing
