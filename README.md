@@ -1,27 +1,4 @@
-<img width="5152" height="2528" alt="image" src="https://github.com/user-attachments/assets/d65a0dad-00ac-4ab2-8849-91b8ba8e604a" />
-
-# Record dataset
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --dataset_file logs/demos/pickup.hdf5     --enable_cameras --num_demos 1 --teleop_device keyboard
-```
-
-```
-=== OpenArm Dual-Arm Recording ===
-Key	                  Action
-W / S	                EE forward / backward (+X / -X)
-A / D	                EE left / right (+Y / -Y)
-PgUp / PgDn	            EE up / down (+Z / -Z)
-↑ / ↓	                pitch ±
-← / →	                yaw ±
-[ / ]	                roll ±
-K	                    gripper toggle
-TAB	                    switch arm (left ↔ right)
-N	                    save episode
-R	                    reset/discard
-
-```
+<img width="5896" height="2260" alt="image" src="https://github.com/user-attachments/assets/4613ed23-8c02-4d02-97a2-5d3f5b0a8c2f" />
 
 # Record dataset w Meta Quest3 Pro
 
