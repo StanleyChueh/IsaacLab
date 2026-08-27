@@ -31,9 +31,11 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
+
 OPENARM_BI_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"/home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/v1_camera_isaac.usd",
+        usd_path=f"{ISAACLAB_ASSETS_DATA_DIR}/v1_camera_isaac/v1_camera_isaac.usd",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,

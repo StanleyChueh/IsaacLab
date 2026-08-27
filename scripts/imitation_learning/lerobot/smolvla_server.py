@@ -39,8 +39,11 @@ import sys
 import numpy as np
 import torch
 
-LEROBOT_SRC = "/home/csl/CSL/lerobot/src"
-if LEROBOT_SRC not in sys.path:
+# A lerobot checkout living OUTSIDE this repo, so there is nothing repo-relative to resolve
+# against. Only needed when lerobot is not already importable (it is inside the `lerobot` conda
+# env); set LEROBOT_SRC to point at your own checkout's src/ if it is somewhere else.
+LEROBOT_SRC = os.environ.get("LEROBOT_SRC", "/home/csl/CSL/lerobot/src")
+if LEROBOT_SRC and LEROBOT_SRC not in sys.path and os.path.isdir(LEROBOT_SRC):
     sys.path.insert(0, LEROBOT_SRC)
 
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy

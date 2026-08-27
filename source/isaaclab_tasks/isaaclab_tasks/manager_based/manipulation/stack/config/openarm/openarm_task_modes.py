@@ -90,6 +90,8 @@ it as an unsatisfied mandatory argument.
 """
 
 import logging
+import os
+import pathlib
 
 import torch
 
@@ -205,13 +207,41 @@ while the arm is still carrying the can."""
 # ── The manipulated object -- one prop, every mode ────────────────────────────
 CAN_NAME = "can"
 
-CAN_USD_PATH = (
-    "/home/csl/Stanley_ws/IsaacLab/Isaac_task_asset/"
-    "Lightwheel_JJP7OOnKjX_chips_can_berkeley_meshes/chips_can_berkeley_meshes.usd"
+TASK_ASSET_DIR = os.environ.get(
+    "OPENARM_TASK_ASSET_DIR",
+    str(pathlib.Path(__file__).resolve().parents[8] / "Isaac_task_asset"),
+)
+"""Where the task props live -- the repo's top-level ``Isaac_task_asset/`` by default.
+
+Resolved off ``__file__`` rather than hardcoded, so a clone in any directory works. Override with
+``OPENARM_TASK_ASSET_DIR`` if the props are kept outside the repo -- which many setups need, since
+``.gitignore`` bans ``**/*.usd`` (an upstream rule: upstream serves its assets from Nucleus) and
+so the can's USD is NOT distributed with a clone even though its textures are."""
+
+CAN_USD_PATH = os.path.join(
+    TASK_ASSET_DIR, "Lightwheel_JJP7OOnKjX_chips_can_berkeley_meshes", "chips_can_berkeley_meshes.usd"
 )
 """Third-party (Lightwheel/Berkeley) prop. Unlike make_bottle_asset.py's hand-built bottle, this
 one ships its own RigidBodyAPI/MassAPI (0.205 kg), three convex-hull collision meshes and a PBR
 material -- nothing here re-authors physics or appearance, only where/how it's placed."""
+
+
+def _require_can_asset() -> str:
+    """Return :data:`CAN_USD_PATH`, failing loudly if the prop is not on disk.
+
+    Worth the four lines: a missing USD surfaces from deep inside the USD stage loader as an empty
+    prim rather than an error, so the run proceeds and the fault shows up much later as a task
+    whose object is simply absent -- the same class of silent-wrong-object failure that
+    :data:`CAN_TARGET_TASKS` exists to prevent.
+    """
+    if not os.path.isfile(CAN_USD_PATH):
+        raise FileNotFoundError(
+            f"Chips-can asset not found at {CAN_USD_PATH!r}.\n"
+            "`.gitignore` bans **/*.usd, so this prop is not distributed with a clone. Either copy "
+            "Isaac_task_asset/ in from a machine that has it, or point OPENARM_TASK_ASSET_DIR at "
+            "wherever you keep it."
+        )
+    return CAN_USD_PATH
 
 CAN_SCALE = 0.8
 """Uniform spawn scale, matching the Isaac Sim stage transform verified by hand (Scale
@@ -2142,7 +2172,7 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
         # overwrites x/y on every reset, and derives the same z from the pad itself.
         init_state=RigidObjectCfg.InitialStateCfg(pos=[0.55, 0.05, object_rest_z], rot=CAN_ROT),
         spawn=sim_utils.UsdFileCfg(
-            usd_path=CAN_USD_PATH,
+            usd_path=_require_can_asset(),
             scale=(CAN_SCALE, CAN_SCALE, CAN_SCALE),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
