@@ -183,33 +183,7 @@ cd ~/CSL/lerobot/ && conda activate lerobot
 GR00T n1.7
 
 ```
- lerobot-train \
-  --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
-  --dataset.image_transforms.enable=true \
-  --policy.type=groot \
-  --policy.device=cuda \
-  --policy.base_model_path=nvidia/GR00T-N1.7-3B \
-  --policy.embodiment_tag=new_embodiment \
-  --policy.chunk_size=16 \
-  --policy.n_action_steps=16 \
-  --policy.use_relative_actions=true \
-  --policy.relative_exclude_joints='["LJ8", "RJ8"]' \
-  --policy.use_bf16=true \
-  --policy.push_to_hub=true \
-  --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t \               
-  --seed=42 \                                                                         
-  --batch_size=64 \
-  --steps=20000 \
-  --save_checkpoint=true \
-  --save_freq=5000 \
-  --use_policy_training_preset=true \
-  --env_eval_freq=0 \
-  --eval_steps=0 \
-  --log_freq=10 \
-  --output_dir=outputs/trains/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t \    
-  --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
-  --wandb.enable=false \                                                  
-  --wandb.disable_artifact=false
+torchrun --nproc-per-node=2 $(which lerobot-train)    --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --dataset.image_transforms.enable=true   --policy.type=groot   --policy.device=cuda   --policy.base_model_path=nvidia/GR00T-N1.7-3B   --policy.embodiment_tag=new_embodiment   --policy.chunk_size=16   --policy.n_action_steps=16   --policy.use_relative_actions=true   --policy.relative_exclude_joints='["LJ8", "RJ8"]'   --policy.use_bf16=true   --policy.push_to_hub=true   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --seed=42   --batch_size=16   --steps=20000   --save_checkpoint=true   --save_freq=5000   --use_policy_training_preset=true   --env_eval_freq=0   --eval_steps=0   --log_freq=10   --output_dir=outputs/trains/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --wandb.enable=false   --wandb.disable_artifact=false 
 ```
 
 # Model Evaluation
