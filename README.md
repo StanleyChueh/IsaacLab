@@ -35,6 +35,13 @@ source .venv/bin/activate
 dora run dataflow-vr-mujoco-ros2.yaml --uv
 ```
 
+note:
+make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
+
+```
+sudo ip addr add 10.100.1.240/24 dev wlp7s0
+```
+
 Resume recording
 
 Add --resume to resume recording 
@@ -107,35 +114,12 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ```
 
 ## Generate augmented dataset
-<<<<<<< HEAD
-=======
-
-```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_pringles_annotated.hdf5 \
-    --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5 \
-    --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --task_mode handover
-```
-
-### Generate augemented dataset w domain randomization(lighting,camera angle...)
-
-```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_lighting_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handover
-```
-
-### Generate augemented dataset w domain randomization(pringles's size)
-
-Add "--randomize_object_size" to randomize pringles'size
->>>>>>> 9518901ee59af119d666a80308732e1c77d0484d
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
     --input_file logs/demos/pickup_pringles_annotated.hdf5 \
-<<<<<<< HEAD
     --output_file logs/demos/pickup_pringles_generated.hdf5 \
     --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras
@@ -156,30 +140,17 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
     --input_file logs/demos/pickup_pringles_annotated.hdf5 \
-=======
->>>>>>> 9518901ee59af119d666a80308732e1c77d0484d
     --output_file logs/demos/pickup_pringles_dr_size_generated.hdf5 \
-    --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --randomize_object_size
+    --randomize_object_size \
+    --task_mode handover 
 ```
 
 ### Generate augemented dataset w domain randomization(background changing)
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-<<<<<<< HEAD
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_V9_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5     --generation_num_trials 50 --num_envs 4 --enable_cameras     --enable_domain_randomization --task_mode handover
-=======
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_pringles_annotated.hdf5 \
-    --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5 \
-    --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --enable_domain_randomization
-    --domain_randomization_profile full
-    --randomize_object_size
->>>>>>> 9518901ee59af119d666a80308732e1c77d0484d
 ```
 
 # Convert HDF5 to LeRobot format 
