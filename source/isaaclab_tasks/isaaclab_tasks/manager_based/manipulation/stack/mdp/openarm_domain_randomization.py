@@ -448,12 +448,16 @@ def randomize_mounted_camera_pose(
     camera._view.set_local_poses(local_pos, local_quat_opengl, env_ids)
 
 
+_SKYBOX_SWAP_STATE_ATTR = "_openarm_dr_skybox_swap_state"
+
+
 def randomize_scene_lighting(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     intensity_range: tuple[float, float],
     color_range: tuple[float, float] = (0.6, 1.0),
     skybox_textures: list[str] | None = None,
+    skybox_swap_every: int = 8,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("light"),
 ):
     """Randomize the scene dome light's intensity, grayscale brightness, and (if
@@ -462,6 +466,22 @@ def randomize_scene_lighting(
     The dome light prim (`/World/light`) is spawned once outside the per-env namespace and
     shared by every cloned env, so there is exactly one prim to randomize regardless of
     `num_envs` -- this samples a single draw per call, not one per env id.
+
+    `skybox_swap_every` throttles ONLY the HDR skybox swap (intensity/color still re-roll on
+    every single call). This term runs in `mode="reset"`, which fires once per env per episode
+    -- across a `generate_dataset.py` run with several dozen trials, `num_envs 4`, and Mimic's
+    per-subtask retries, that is easily hundreds of calls. Writing `inputs:texture:file` is not
+    a cheap attribute set like intensity/color: it is a direct Sdf value authoring that bypasses
+    whatever reference-counted caching Kit's asset/texture pipeline normally relies on (unlike,
+    say, Replicator's dedicated texture randomizer -- itself avoided here for a different,
+    already-documented leak, see `randomize_visual_color`'s docstring), so each call forces the
+    RTX render delegate to load and GPU-upload a fresh copy of the chosen HDR, even when the
+    path is unchanged from what is already resident. Observed in practice: GPU memory climbed
+    continuously across a generation run rather than plateauing near "13 textures' worth" of
+    VRAM, and eventually OOM'd while allocating one of these exact configured files. Re-rolling
+    the skybox only every `skybox_swap_every`-th call (and skipping the write entirely when the
+    new draw happens to match what's already applied) cuts total texture uploads roughly
+    `skybox_swap_every`-fold for the same 13-way diversity across the generated dataset.
     """
     light_asset = env.scene[asset_cfg.name]
     light_prim = light_asset.prims[0]
@@ -473,5 +493,14 @@ def randomize_scene_lighting(
     light_prim.GetAttribute("inputs:color").Set((gray, gray, gray))
 
     if skybox_textures:
-        texture_file_attr = light_prim.GetAttribute("inputs:texture:file")
-        texture_file_attr.Set(random.choice(skybox_textures))
+        state = getattr(env, _SKYBOX_SWAP_STATE_ATTR, None)
+        if state is None:
+            state = {"calls": 0, "current": None}
+            setattr(env, _SKYBOX_SWAP_STATE_ATTR, state)
+        state["calls"] += 1
+
+        if state["calls"] % max(skybox_swap_every, 1) == 1:
+            choice = random.choice(skybox_textures)
+            if choice != state["current"]:
+                light_prim.GetAttribute("inputs:texture:file").Set(choice)
+                state["current"] = choice
