@@ -180,7 +180,7 @@ cd ~/CSL/lerobot/ && conda activate lerobot
   }'   --dataset.video_backend=pyav
 ```
 
-GR00T n1.7
+GR00T n1.7 (Testing, unstable)
 
 ```
 torchrun --nproc-per-node=2 $(which lerobot-train)    --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --dataset.image_transforms.enable=true   --policy.type=groot   --policy.device=cuda   --policy.base_model_path=nvidia/GR00T-N1.7-3B   --policy.embodiment_tag=new_embodiment   --policy.chunk_size=16   --policy.n_action_steps=16   --policy.use_relative_actions=true   --policy.relative_exclude_joints='["LJ8", "RJ8"]'   --policy.use_bf16=true   --policy.push_to_hub=true   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --seed=42   --batch_size=16   --steps=20000   --save_checkpoint=true   --save_freq=5000   --use_policy_training_preset=true   --env_eval_freq=0   --eval_steps=0   --log_freq=10   --output_dir=outputs/trains/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --wandb.enable=false   --wandb.disable_artifact=false 
@@ -189,6 +189,8 @@ torchrun --nproc-per-node=2 $(which lerobot-train)    --dataset.repo_id=ethanCSL
 # Model Evaluation
 
 ## Deploy in Isaac Sim
+
+### SmolVLA
 
 Launch SmolVLA Policy Server
 
@@ -205,6 +207,22 @@ Run Isaac Lab Eval
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
  ./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover
+```
+
+### GR00T N1.7 (Testing, unstable)
+
+Launch GR00T N1.7 Policy Server
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate lerobot-latest
+python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+```
+
+Run Isaac Lab Eval
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_groot_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover   
 ```
 
 ## Run Isaac Lab Eval, and send command to real robot
