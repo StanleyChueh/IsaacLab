@@ -39,7 +39,7 @@ note:
 make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
 
 ```
-sudo ip addr add 10.100.1.240/32 dev wlp7s0
+sudo ip addr add 10.100.1.240/24 dev wlp7s0
 ```
 
 Resume recording
@@ -141,9 +141,9 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
     --input_file logs/demos/pickup_pringles_annotated.hdf5 \
     --output_file logs/demos/pickup_pringles_dr_size_generated.hdf5 \
+    --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --randomize_object_size \
-    --task_mode handover 
+    --randomize_object_size
 ```
 
 ### Generate augemented dataset w domain randomization(background changing)
@@ -169,6 +169,8 @@ python scripts/push_to_hub.py
 
 # Train in LeRobot format
 
+### SmolVLA
+
 ```
 cd ~/CSL/lerobot/ && conda activate lerobot
  lerobot-train   --policy.path=lerobot/smolvla_base   --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_test   --batch_size=16   --steps=40000   --output_dir=outputs/train/openarm_visuomotor_VR_pringles_test   --job_name=my_smolvla_training   --policy.device=cuda   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_test  --wandb.enable=false   --rename_map='{
@@ -178,9 +180,59 @@ cd ~/CSL/lerobot/ && conda activate lerobot
   }'   --dataset.video_backend=pyav
 ```
 
+### GR00T N1.7 (Testing, unstable)
+
+For 2x RTX 4090(48GB VRAM)
+
+Multiple modules are frozen during training
+
+```
+torchrun --nproc-per-node=2 $(which lerobot-train)   --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --dataset.image_transforms.enable=true   --policy.type=groot   --policy.device=cuda   --policy.base_model_path=nvidia/GR00T-N1.7-3B   --policy.embodiment_tag=new_embodiment   --policy.chunk_size=16   --policy.n_action_steps=16   --policy.use_relative_actions=true   --policy.relative_exclude_joints='["LJ8", "RJ8"]'   --policy.use_bf16=true   --policy.push_to_hub=true   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --seed=42   --batch_size=16   --steps=20000   --save_checkpoint=true   --save_freq=5000   --use_policy_training_preset=true   --env_eval_freq=0   --eval_steps=0   --log_freq=10   --output_dir=outputs/trains/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --wandb.enable=false   --wandb.disable_artifact=false   --parallelism.dp_shard=2   --accelerator.mixed_precision=bf16   --accelerator.fsdp.wrap_modules='["Qwen3VLVisionBlock", "Qwen3VLTextDecoderLayer", "BasicTransformerBlock"]'
+```
+
+=> It takes around 46GB VRAM 
+
+For a single RTX Pro 6000(96GB VRAM)
+
+Standard fine-tuning
+
+```
+lerobot-train \
+  --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
+  --dataset.image_transforms.enable=true \
+  --policy.type=groot \
+  --policy.device=cuda \
+  --policy.base_model_path=nvidia/GR00T-N1.7-3B \
+  --policy.embodiment_tag=new_embodiment \
+  --policy.chunk_size=16 \
+  --policy.n_action_steps=16 \
+  --policy.use_relative_actions=true \
+  --policy.relative_exclude_joints='["LJ8", "RJ8"]' \
+  --policy.use_bf16=true \
+  --policy.push_to_hub=true \
+  --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
+  --seed=42 \
+  --batch_size=64 \
+  --steps=20000 \
+  --save_checkpoint=true \
+  --save_freq=20000 \
+  --use_policy_training_preset=true \
+  --env_eval_freq=0 \
+  --eval_steps=0 \
+  --log_freq=10 \
+  --output_dir=outputs/train/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
+  --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
+  --wandb.enable=false \
+  --wandb.disable_artifact=false
+```
+
+=> It takes around 47GB VRAM
+
 # Model Evaluation
 
 ## Deploy in Isaac Sim
+
+### SmolVLA
 
 Launch SmolVLA Policy Server
 
@@ -197,6 +249,22 @@ Run Isaac Lab Eval
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
  ./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover
+```
+
+### GR00T N1.7 (Testing, unstable)
+
+Launch GR00T N1.7 Policy Server
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate lerobot-latest
+python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+```
+
+Run Isaac Lab Eval
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_groot_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover   
 ```
 
 ## Run Isaac Lab Eval, and send command to real robot
