@@ -39,7 +39,11 @@ note:
 make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
 
 ```
+<<<<<<< HEAD
 sudo ip addr add 10.100.1.240/24 dev wlp7s0
+=======
+sudo ip addr add 10.100.1.240/32 dev wlp7s0
+>>>>>>> f59b2820388df3a6476440612ec6a49c48283366
 ```
 
 Resume recording
@@ -141,9 +145,9 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
     --input_file logs/demos/pickup_pringles_annotated.hdf5 \
     --output_file logs/demos/pickup_pringles_dr_size_generated.hdf5 \
-    --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --randomize_object_size
+    --randomize_object_size \
+    --task_mode handover 
 ```
 
 ### Generate augemented dataset w domain randomization(background changing)
