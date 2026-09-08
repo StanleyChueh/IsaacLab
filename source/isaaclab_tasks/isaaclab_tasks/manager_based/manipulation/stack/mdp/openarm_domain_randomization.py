@@ -13,6 +13,7 @@ and generation runs are unaffected unless a caller explicitly asks for randomiza
 from __future__ import annotations
 
 import colorsys
+import math
 import random
 from typing import TYPE_CHECKING
 
@@ -80,48 +81,6 @@ def randomize_static_asset_pose(
     asset.set_world_poses(positions, orientations, indices=env_ids.tolist())
 
 
-def _resolve_preview_surface_shaders(asset, env_ids: torch.Tensor) -> list:
-    """Find the `UsdPreviewSurface` Shader prim(s) created by a `PreviewSurfaceCfg` override,
-    one per requested env id.
-
-    `spawn_preview_surface` (`isaaclab.sim.spawners.materials.visual_materials`) creates the
-    material at a known, deterministic path and always names the shader child `"Shader"`:
-    `UsdShade.Material.Define(stage, prim_path)` then `CreateShaderPrimFromSdrCommand(...,
-    parent_path=prim_path, name="Shader")` -> shader lives at `f"{prim_path}/Shader"`.
-
-    The material's own path depends on which spawn function bound it (`visual_material_path`
-    defaults to `"material"` in both, but relative to a different base):
-    - `spawn_from_usd` (`cube_2`, a Nucleus block prop) binds directly on the asset root:
-      `f"{asset.cfg.prim_path}/material"` (`from_files.py:_spawn_from_usd_file`).
-    - `spawn_cuboid` (`workspace_pad`, a primitive shape) binds on the nested geometry prim,
-      never the root: `f"{asset.prim_paths[env_id]}/geometry/material"`
-      (`shapes.py:_spawn_geom_from_prim_type`).
-
-    `asset.cfg.prim_path` (used for the first case) is NOT a concrete per-env path -- it's the
-    env-regex TEMPLATE (`InteractiveScene` resolves `{ENV_REGEX_NS}` into the literal string
-    `/World/envs/env_.*` once at spawn time via `.format(...)`, and never substitutes it down to
-    a concrete `env_0`/`env_1`/... after that). Feeding that `"env_.*"` wildcard straight into
-    `stage.GetPrimAtPath(...)` produces an "Ill-formed SdfPath" USD warning (`GetPrimAtPath`
-    needs a literal path, not a regex) and always resolves to an invalid prim -- silently a
-    no-op every time, confirmed in practice: `cube_2`'s color never actually changed. Substitute
-    the real env index for each requested `env_id` instead of using the raw template.
-
-    Returns one Shader `Usd.Prim` per `env_id` (or `None` in that slot if it doesn't exist --
-    e.g. the asset was never given a `PreviewSurfaceCfg` visual_material override).
-    """
-    stage = get_current_stage()
-    shaders = []
-    for env_id in env_ids.tolist():
-        if hasattr(asset, "cfg"):
-            concrete_prim_path = asset.cfg.prim_path.replace("env_.*", f"env_{env_id}")
-            material_path = f"{concrete_prim_path}/material"
-        else:
-            material_path = f"{asset.prim_paths[env_id]}/geometry/material"
-        shader_prim = stage.GetPrimAtPath(f"{material_path}/Shader")
-        shaders.append(shader_prim if shader_prim.IsValid() else None)
-    return shaders
-
-
 def randomize_visual_color(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -129,8 +88,8 @@ def randomize_visual_color(
     colors: list[tuple[float, float, float]] | dict[str, tuple[float, float]],
     roughness_range: tuple[float, float] | None = None,
 ):
-    """Randomize an asset's `PreviewSurfaceCfg` material color (and optionally roughness) by
-    writing directly to its Shader prim's USD attributes -- independently per env id.
+    """Randomize an asset's material diffuse color (and optionally roughness) by writing directly
+    to its Shader prim's USD attributes -- independently per env id.
 
     Earlier versions of this function (and the equivalent core
     `isaaclab.envs.mdp.events.randomize_visual_color`) went through the Replicator API
@@ -139,28 +98,59 @@ def randomize_visual_color(
     leaves behind a growing pile of orphaned nodes -- observed in practice as repeated
     `UsdExpiredPrimAccessError: Used null prim` errors from `OgnSampleOmniPBR` once an older
     node's cached material/shader prim gets replaced by a newer call. Setting the existing
-    Shader prim's `inputs:diffuseColor`/`inputs:roughness` attributes directly (the same
-    approach `randomize_scene_lighting` already uses for the dome light, which never hit this
-    issue) has none of that: no new nodes, no growing pile, nothing to expire.
+    Shader prim's diffuse-color/roughness attributes directly (the same approach
+    `randomize_scene_lighting` already uses for the dome light, which never hit this issue) has
+    none of that: no new nodes, no growing pile, nothing to expire.
+
+    Uses the SAME broad shader search as `randomize_visual_saturation` (`_resolve_material_shaders`
+    + `_first_present_attr`) rather than the narrower "only a `PreviewSurfaceCfg`-override path"
+    lookup this function used to do directly. That narrower lookup silently does nothing for any
+    asset spawned straight from a USD file without a `visual_material` override -- which is
+    exactly what `apply_task_mode`'s can is (see `_resolve_material_shaders`'s docstring).
+    Concretely: under `--domain_randomization_profile full`, `randomize_cube_2_color` gets
+    retargeted onto the can (`_manipulated_object_name`), and with the old narrower lookup it was
+    a complete no-op there -- the pad's color varied every reset and the can's never did, with
+    nothing printed to say so. The broad resolver finds the can's own baked-in OmniPBR/MDL
+    material instead.
 
     `colors` is either a list of `(r, g, b)` tuples to sample from, or a dict
     `{"r": (low, high), "g": (low, high), "b": (low, high)}` to sample a uniform range from.
     """
     asset = env.scene[asset_cfg.name]
-    for shader_prim in _resolve_preview_surface_shaders(asset, env_ids):
-        if shader_prim is None:
-            continue
+    written = 0
+    for shader_prims in _resolve_material_shaders(asset, env_ids):
+        for shader_prim in shader_prims:
+            color_attr = _first_present_attr(shader_prim, _DIFFUSE_COLOR_ATTRS)
+            if color_attr is None:
+                continue
 
-        if isinstance(colors, dict):
-            r = random.uniform(*colors["r"])
-            g = random.uniform(*colors["g"])
-            b = random.uniform(*colors["b"])
-        else:
-            r, g, b = random.choice(list(colors))
-        shader_prim.GetAttribute("inputs:diffuseColor").Set((r, g, b))
+            if isinstance(colors, dict):
+                r = random.uniform(*colors["r"])
+                g = random.uniform(*colors["g"])
+                b = random.uniform(*colors["b"])
+            else:
+                r, g, b = random.choice(list(colors))
+            color_attr.Set((r, g, b))
+            written += 1
 
-        if roughness_range is not None:
-            shader_prim.GetAttribute("inputs:roughness").Set(random.uniform(*roughness_range))
+            if roughness_range is not None:
+                roughness_attr = _first_present_attr(shader_prim, _ROUGHNESS_ATTRS)
+                if roughness_attr is not None:
+                    roughness_attr.Set(random.uniform(*roughness_range))
+
+    # Same reasoning as randomize_visual_saturation's identical check: a randomization term that
+    # quietly does nothing produces a dataset that looks randomized and is not.
+    if written == 0:
+        warned = getattr(env, _NO_MATERIAL_WARNED_ATTR, None)
+        if warned is None:
+            warned = set()
+            setattr(env, _NO_MATERIAL_WARNED_ATTR, warned)
+        if asset_cfg.name not in warned:
+            warned.add(asset_cfg.name)
+            print(
+                f"[DR][WARNING] '{asset_cfg.name}' has no shader with any of {_DIFFUSE_COLOR_ATTRS};"
+                " its color is NOT being randomized."
+            )
 
 
 _DIFFUSE_COLOR_ATTRS = ("inputs:diffuseColor", "inputs:diffuse_color_constant", "inputs:diffuse_tint")
@@ -179,23 +169,39 @@ _NO_MATERIAL_WARNED_ATTR = "_openarm_dr_no_material_warned"
 
 
 def _asset_prim_path(asset, env_id: int) -> str:
-    """The concrete (non-regex) prim path of *asset* in env *env_id* -- see
-    :func:`_resolve_preview_surface_shaders` for why `asset.cfg.prim_path` needs substituting."""
+    """The concrete (non-regex) prim path of *asset* in env *env_id*.
+
+    `asset.cfg.prim_path` is NOT a concrete per-env path -- it's the env-regex TEMPLATE
+    (`InteractiveScene` resolves `{ENV_REGEX_NS}` into the literal string `/World/envs/env_.*`
+    once at spawn time via `.format(...)`, and never substitutes it down to a concrete
+    `env_0`/`env_1`/... after that). Feeding that `"env_.*"` wildcard straight into
+    `stage.GetPrimAtPath(...)` produces an "Ill-formed SdfPath" USD warning (`GetPrimAtPath` needs
+    a literal path, not a regex) and always resolves to an invalid prim -- silently a no-op every
+    time, confirmed in practice: `cube_2`'s color never actually changed. Substitute the real env
+    index for each requested `env_id` instead of using the raw template."""
     if hasattr(asset, "cfg"):
         return asset.cfg.prim_path.replace("env_.*", f"env_{env_id}")
     return asset.prim_paths[env_id]
 
 
 def _resolve_material_shaders(asset, env_ids: torch.Tensor) -> list[list]:
-    """Every Shader prim worth randomizing for each env id -- a superset of
-    :func:`_resolve_preview_surface_shaders`, which only ever finds a `PreviewSurfaceCfg` override.
+    """Every Shader prim worth randomizing for each env id.
 
-    That narrower resolver silently returns nothing for any asset spawned straight from a USD file
-    without a `visual_material` override, because `spawn_from_usd` only creates the `material` prim
-    when `cfg.visual_material is not None` (`from_files.py`). The can that `apply_task_mode`
-    substitutes for cube_2 is exactly such an asset -- so an appearance term pointed at it did
-    nothing at all, every reset, without a word. That is the worst possible failure for a
-    randomization term: the dataset looks randomized and isn't.
+    An asset's material can be bound at either of two paths, depending on which spawn function
+    created it (`visual_material_path` defaults to `"material"` in both, but relative to a
+    different base):
+    - `spawn_from_usd` (`cube_2`, a Nucleus block prop) binds directly on the asset root:
+      `f"{root}/material"` (`from_files.py:_spawn_from_usd_file`).
+    - `spawn_cuboid` (`workspace_pad`, a primitive shape) binds on the nested geometry prim,
+      never the root: `f"{root}/geometry/material"` (`shapes.py:_spawn_geom_from_prim_type`).
+
+    Checking only those two paths (an earlier, narrower version of this lookup) silently returns
+    nothing for any asset spawned straight from a USD file without a `visual_material` override,
+    because `spawn_from_usd` only creates the `material` prim when `cfg.visual_material is not
+    None` (`from_files.py`). The can that `apply_task_mode` substitutes for cube_2 is exactly such
+    an asset -- so an appearance term pointed at it did nothing at all, every reset, without a
+    word. That is the worst possible failure for a randomization term: the dataset looks
+    randomized and isn't.
 
     So: use the override's shader when there is one (it is the material actually bound, and the one
     whose authored colour the task cfg chose), and otherwise fall back to whatever shaders the
@@ -207,8 +213,8 @@ def _resolve_material_shaders(asset, env_ids: torch.Tensor) -> list[list]:
     resolved = []
     for env_id in env_ids.tolist():
         root = _asset_prim_path(asset, env_id)
-        # Both override locations spawn_preview_surface can bind at -- see
-        # _resolve_preview_surface_shaders' docstring for why they differ per spawn function.
+        # The two override locations a PreviewSurfaceCfg-driven spawn can bind at -- see this
+        # function's own docstring for why they differ per spawn function.
         override = next(
             (
                 prim
@@ -446,6 +452,99 @@ def randomize_mounted_camera_pose(
     # USD path in both Fabric and non-Fabric mode (see `XformPrimView._set_local_poses_fabric`),
     # writing the two xformOps the camera prim already carries.
     camera._view.set_local_poses(local_pos, local_quat_opengl, env_ids)
+
+
+_CAMERA_SHAKE_STATE_ATTR = "_openarm_dr_camera_shake_state"
+
+
+def init_camera_shake(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    freq_range: tuple[float, float] = (3.0, 9.0),
+):
+    """Draw this episode's per-env shake frequency and phase -- the "reset" half of
+    :func:`shake_mounted_camera_pose`, which must run first.
+
+    The sinusoid's shape has to be fixed for the whole episode, not redrawn every step: redrawing
+    it is exactly what the OLD approach did (attaching `randomize_mounted_camera_pose` itself to
+    "interval" mode) and exactly what looked wrong -- every trigger drew an independent uniform
+    sample, so the camera held at point A, jumped to an unrelated point B, held, jumped to an
+    unrelated point C, and so on. It never retraced its own path, because nothing tied one draw to
+    the next. A real vibrating mount does not do that: it oscillates back and forth around one
+    center. Fixing the frequency/phase per episode and then evaluating a sine of elapsed time (see
+    `shake_mounted_camera_pose`) is what actually produces that back-and-forth.
+
+    Separate x/y frequencies (not one shared value) so the path doesn't trace a straight line or a
+    fixed ellipse; a per-env random phase so the environments in a batched run don't shake in
+    lockstep, which is what a shared phase across `--num_envs` parallel cameras would otherwise
+    look like in the recorded data.
+
+    `freq_range` defaults to 3-9 Hz, deliberately kept under half the ~20 Hz control rate
+    (Nyquist): the recorded image only updates once per control step no matter how fast the "true"
+    vibration is, and sampling a sine faster than Nyquist aliases into a slower, still-periodic but
+    wrong-frequency wobble rather than reading as fast shake. 9 Hz is as fast as this can go before
+    that aliasing starts corrupting the apparent frequency.
+    """
+    state = getattr(env, _CAMERA_SHAKE_STATE_ATTR, None)
+    if state is None:
+        state = {}
+        setattr(env, _CAMERA_SHAKE_STATE_ATTR, state)
+    cam_state = state.get(asset_cfg.name)
+    if cam_state is None or cam_state["freq_x"].shape[0] != env.num_envs:
+        cam_state = {key: torch.zeros(env.num_envs, device=env.device) for key in ("freq_x", "freq_y", "phase_x", "phase_y")}
+        state[asset_cfg.name] = cam_state
+
+    n = len(env_ids)
+    cam_state["freq_x"][env_ids] = torch.empty(n, device=env.device).uniform_(*freq_range)
+    cam_state["freq_y"][env_ids] = torch.empty(n, device=env.device).uniform_(*freq_range)
+    cam_state["phase_x"][env_ids] = torch.empty(n, device=env.device).uniform_(0.0, 2.0 * math.pi)
+    cam_state["phase_y"][env_ids] = torch.empty(n, device=env.device).uniform_(0.0, 2.0 * math.pi)
+
+
+def shake_mounted_camera_pose(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    amplitude: dict[str, float],
+    asset_cfg: SceneEntityCfg,
+):
+    """Continuously oscillate a mounted camera's LOCAL x/y offset around its nominal mount pose --
+    real vibration, not a jump between independent random points. See :func:`init_camera_shake`
+    (must be attached as a "reset"-mode term on the same asset) for why the frequency/phase are
+    drawn once per episode rather than here.
+
+    Meant to be attached with `mode="interval"` and an `interval_range_s` of (0.0, 0.0) so it
+    fires on EVERY control step -- the fastest rate that can matter, since the recorded image only
+    updates once per step regardless of how much faster the interval is set. That is also higher
+    frequency than the old per-episode-jitter-only approach could reach at all: this one changes
+    every frame instead of every few.
+
+    `amplitude` is `{"x": metres, "y": metres}`, the sine's peak (not a min/max range like the
+    other pose-jitter terms take) -- missing axes default to 0. Rotation is deliberately not
+    shaken here: this only moves the camera laterally, matching what was asked for.
+    """
+    camera = env.scene[asset_cfg.name]
+    state = getattr(env, _CAMERA_SHAKE_STATE_ATTR, {}).get(asset_cfg.name)
+    if state is None:
+        return  # init_camera_shake has not run for this camera yet (e.g. the very first frame)
+
+    t = env.episode_length_buf[env_ids].to(torch.float32) * env.step_dt
+    dx = amplitude.get("x", 0.0) * torch.sin(2.0 * math.pi * state["freq_x"][env_ids] * t + state["phase_x"][env_ids])
+    dy = amplitude.get("y", 0.0) * torch.sin(2.0 * math.pi * state["freq_y"][env_ids] * t + state["phase_y"][env_ids])
+
+    offset_pos = torch.tensor(camera.cfg.offset.pos, device=env.device, dtype=torch.float32)
+    local_pos = offset_pos.unsqueeze(0).expand(len(env_ids), -1).clone()
+    local_pos[:, 0] += dx
+    local_pos[:, 1] += dy
+
+    # Orientation is unchanged from the nominal mount -- rewritten every call anyway because
+    # `set_local_poses` takes position and orientation together, not independently.
+    offset_quat_native = torch.tensor(camera.cfg.offset.rot, device=env.device, dtype=torch.float32).unsqueeze(0)
+    offset_quat_opengl = math_utils.convert_camera_frame_orientation_convention(
+        offset_quat_native, origin=camera.cfg.offset.convention, target="opengl"
+    ).expand(len(env_ids), -1)
+
+    camera._view.set_local_poses(local_pos, offset_quat_opengl, env_ids)
 
 
 _SKYBOX_SWAP_STATE_ATTR = "_openarm_dr_skybox_swap_state"

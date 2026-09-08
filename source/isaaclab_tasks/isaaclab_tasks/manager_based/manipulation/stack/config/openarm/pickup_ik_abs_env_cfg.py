@@ -170,10 +170,21 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         func=openarm_domain_randomization.randomize_static_asset_pose,
         mode="reset",
         params={
-            # Small in-plane jitter only. Orientation stays fixed, and height is owned by
+            # In-plane jitter only. Orientation stays fixed, and height is owned by
             # `randomize_pad_height` below -- hence keep_current_z, without which this term would
             # undo that one every reset (see randomize_static_asset_pose's docstring).
-            "pose_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
+            #
+            # +-4 cm (doubled from +-2 cm): real placement of the pad relative to the robot base
+            # is not going to be exact, and the policy should not be trained at one fixed offset.
+            # Checked against the handover mode's can-spawn box (the tightest-fitting mode, since
+            # its box -- _HANDOVER_X_RANGE/_HANDOVER_Y_RANGE in openarm_task_modes.py -- is
+            # absolute/world and does NOT move with the pad): pad x in [0.03, 0.51] nominal, can
+            # spawn x in [0.2029, 0.4217], leaving 8.8 cm clearance on the tightest (far) edge.
+            # +-4 cm leaves 4.8 cm of that even in the worst case (pad shifted -4 cm, i.e. TOWARD
+            # the robot); y has ~20 cm of clearance either way and is nowhere close to binding.
+            # Do not push this much past +-5 cm without re-deriving that number -- past it the can
+            # can spawn outside the pad's own footprint on the far edge.
+            "pose_range": {"x": (-0.04, 0.04), "y": (-0.04, 0.04)},
             # Overwritten at attach time from the pad's actual spawn position -- see
             # attach_domain_randomization. The value here is only a placeholder so the param
             # exists; a hardcoded literal was previously left behind when the pad geometry moved,
@@ -280,6 +291,70 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         params={
             "pos_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
+            "asset_cfg": SceneEntityCfg("body_cam"),
+        },
+    )
+
+    # ── Camera shake (continuous oscillation, not just one jitter per episode) ───────────────
+    # The pose terms above use mode="reset": one fixed offset drawn per episode, so a policy
+    # trained on them only ever sees a camera that is mounted slightly differently, never one that
+    # is actually vibrating while the arm moves -- which is what a real evaluation rig does,
+    # worst on body_cam (it hangs furthest out on the least rigid mount of the three).
+    #
+    # Each camera needs TWO terms: `init_*_shake` (mode="reset") draws that episode's frequency and
+    # phase, and `shake_*` (mode="interval", firing every control step -- see interval_range_s)
+    # evaluates the resulting sine of elapsed time. An earlier version tried to get this by
+    # attaching `randomize_mounted_camera_pose` itself to "interval" mode with a multi-step gap
+    # between triggers; that drew an independent uniform sample every time, so the camera held at
+    # one random point, jumped to an unrelated one, held, jumped again -- never oscillating back
+    # through a point it had already visited, and only changing every few steps rather than every
+    # frame. See `init_camera_shake`/`shake_mounted_camera_pose`'s docstrings for both fixes.
+    #
+    # x/y only, no z and no rotation -- matches what was asked for. Amplitude is well under the
+    # reset-mode jitter above (which already budgets for a worst-case static mount error) so the
+    # two compose into "mounted somewhere slightly off, AND vibrating" without either one alone
+    # risking pushing the gripper/can out of frame.
+    init_wrist_cam_shake = EventTerm(
+        func=openarm_domain_randomization.init_camera_shake,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("wrist_cam")},
+    )
+    shake_wrist_cam = EventTerm(
+        func=openarm_domain_randomization.shake_mounted_camera_pose,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),  # fires every control step, the fastest rate that can matter
+        params={
+            "amplitude": {"x": 0.003, "y": 0.003},
+            "asset_cfg": SceneEntityCfg("wrist_cam"),
+        },
+    )
+    init_right_wrist_cam_shake = EventTerm(
+        func=openarm_domain_randomization.init_camera_shake,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("right_wrist_cam")},
+    )
+    shake_right_wrist_cam = EventTerm(
+        func=openarm_domain_randomization.shake_mounted_camera_pose,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "amplitude": {"x": 0.003, "y": 0.003},
+            "asset_cfg": SceneEntityCfg("right_wrist_cam"),
+        },
+    )
+    init_body_cam_shake = EventTerm(
+        func=openarm_domain_randomization.init_camera_shake,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("body_cam")},
+    )
+    shake_body_cam = EventTerm(
+        func=openarm_domain_randomization.shake_mounted_camera_pose,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            # ~2.7x the wrist cams' amplitude -- body_cam is the one reported to shake the most
+            # in real evaluation.
+            "amplitude": {"x": 0.008, "y": 0.008},
             "asset_cfg": SceneEntityCfg("body_cam"),
         },
     )

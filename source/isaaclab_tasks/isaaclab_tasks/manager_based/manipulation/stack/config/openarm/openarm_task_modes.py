@@ -160,15 +160,14 @@ air travel further than jaws shut on a can. That is why the hand-over's completi
 two-sided :data:`HANDOVER_RECEIVER_APERTURE_RANGE` instead of this one -- see
 :func:`receiver_grip_confirmed`."""
 
-HANDOVER_RECEIVER_APERTURE_RANGE = (0.015, 0.055)
+HANDOVER_RECEIVER_APERTURE_RANGE = (0.015, 0.072)
 """(min, max) total jaw aperture (m, the two finger joints summed) at which the RECEIVING hand
 counts as having actually got hold of the can. Fully open is 0.088; fully shut is ~0.
 
-Two-sided on purpose, and that is the whole point of it. :func:`_gripper_is_closed` only asks
-whether the jaws left the open position, which a hand that closed on empty air passes just as
-well as one holding the can -- and empty air is the dominant failure of generated hand-overs, not
-a rare one. An aperture that settles near HALF of open means something roughly can-width is
-wedged between the jaws; an aperture near zero means they met, i.e. the can is not there.
+Two-sided, so a hand that closed on empty air (aperture near zero) does not pass: an aperture near
+zero means the jaws met, i.e. the can is not there. This used to carry the WHOLE burden of
+rejecting "closed on nothing" -- see :func:`_handover_tick`'s 2->3 comment for why it no longer
+does and for the ``~put_down`` height guard that now shares the job.
 
 Measured, over the frames after the pass:
 
@@ -177,14 +176,24 @@ Measured, over the frames after the pass:
 * Mimic-generated episodes that visibly end with the can in the left hand: 0.0447-0.0537.
 * generated episodes whose left hand shut on nothing: 0.0000-0.0054.
 * generated episodes whose left hand never really closed: 0.0651-0.0789.
+* a second real teleop operator, 8 otherwise-good hand-overs annotate_demos.py had rejected
+  (logs/demos/pickup_pringles_stanley.hdf5, demo_0/6/11/14/20/21/23/27): 0.0544-0.0667 -- a looser
+  grip style than the V6 operator's. Position-verified in every one (hand_on_object's radial/axial
+  bounds comfortably met) and, for demo_23 specifically (the widest, at 0.0667 -- squarely inside
+  the "never really closed" band above), height-verified too: the can never dropped below 0.4094 m
+  against a 0.385 m put-down cutoff for the whole tail after the right hand released it. That is
+  not something an unheld can does.
 
-So the two failure modes sit on OPPOSITE sides of the real grasps, and both bounds are needed.
-0.055 clears the widest real grasp (0.0538) and still rejects the 0.0651 near-miss; 0.015 is well
-clear of the 0.0267 low outlier above and of the ~0.005 shut-on-air band below.
+So the upper bound moved from 0.055 (tuned against one operator's grip alone) to 0.072: it now
+clears every real grasp measured across both operators (widest is 0.0667) with a small margin,
+reaching INTO the "never really closed" band above rather than staying clear of it -- safe to do
+now only because :func:`_handover_tick` no longer relies on this range alone to catch a can shut on
+nothing. 0.015 is unchanged -- well clear of the 0.0267 low outlier above and of the ~0.005
+shut-on-air band below.
 
-The can's diameter is what pins this: post-scale it is ~60 mm (:data:`CAN_SCALE`), so the jaws
-physically cannot go much past half-closed while it is between them. Do not "tighten" the upper
-bound to exactly half (0.044) on the theory that a firm grip closes further -- measured, that
+The can's diameter is what pins the upper end: post-scale it is ~60 mm (:data:`CAN_SCALE`), so the
+jaws physically cannot go much past half-closed while it is between them. Do not "tighten" the
+upper bound to exactly half (0.044) on the theory that a firm grip closes further -- measured, that
 rejects 10 real hand-overs out of 10."""
 
 HANDOVER_RECEIVER_HOLD_STEPS = 20
@@ -1205,11 +1214,23 @@ def _handover_tick(
     #     every step of the episode, so one lucky frame is permanent and a later drop cannot
     #     retract it.
     #
-    # What the can does after that is still deliberately not required. An earlier version demanded
-    # it be released by both hands and back down near its resting height, to match "and then it is
-    # put down" -- but that tail is often not in the recording at all: with manual saving the
-    # operator stops the episode while still holding the can, and 3 of 10 measured demos end with
-    # it at 0.408-0.413, mid-air. Gating success on it discards good hand-overs for want of a coda.
+    # What the can does after that is still deliberately not required to be any PARTICULAR thing --
+    # an earlier version demanded it be released by both hands and back down near its resting
+    # height, to match "and then it is put down", but that tail is often not in the recording at
+    # all: with manual saving the operator stops the episode while still holding the can, and 3 of
+    # 10 measured demos end with it at 0.408-0.413, mid-air. Gating success on a specific coda
+    # discards good hand-overs for want of one.
+    #
+    # It DOES have to still be up, though -- reusing `put_down` from the 1->2 section above rather
+    # than trusting the aperture band alone. Two real operators' teleop hand-overs
+    # (pickup_pringle_annotated_V6.hdf5 and pickup_pringles_stanley.hdf5) between them measure
+    # receiver aperture from 0.0441 up to 0.0667, which reaches into the same 0.0651-0.0789 window
+    # separately measured on GENERATED episodes whose left hand shut on nothing -- so past a point,
+    # aperture stops being able to tell "loose real grip" from "closed on empty air" at all. Gravity
+    # can: an unheld can does not hang at 0.41 m for HANDOVER_RECEIVER_HOLD_STEPS running, whatever
+    # the jaws read. `demo_23` of pickup_pringles_stanley.hdf5 is the case this closes -- aperture
+    # 0.0667 (inside the "shut on nothing" band above), can never below 0.4094 m against a 0.385 m
+    # put-down cutoff for the whole tail after the right hand released it.
     receiver_firm = receiver_grip_confirmed(
         env,
         ee_frame_cfg=left_ee_frame_cfg,
@@ -1218,7 +1239,7 @@ def _handover_tick(
         robot_cfg=robot_cfg,
         diff_threshold=diff_threshold,
     )
-    carrying = (stage >= HANDOVER_STAGE_PASSED_TO_LEFT) & receiver_firm & ~right_holds
+    carrying = (stage >= HANDOVER_STAGE_PASSED_TO_LEFT) & receiver_firm & ~right_holds & ~put_down
     grip_steps = memory["receiver_grip_steps"]
     grip_steps += 1
     grip_steps[~carrying] = 0
