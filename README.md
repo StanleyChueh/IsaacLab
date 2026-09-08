@@ -39,11 +39,7 @@ note:
 make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
 
 ```
-<<<<<<< HEAD
 sudo ip addr add 10.100.1.240/24 dev wlp7s0
-=======
-sudo ip addr add 10.100.1.240/32 dev wlp7s0
->>>>>>> f59b2820388df3a6476440612ec6a49c48283366
 ```
 
 Resume recording
@@ -145,9 +141,9 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
     --input_file logs/demos/pickup_pringles_annotated.hdf5 \
     --output_file logs/demos/pickup_pringles_dr_size_generated.hdf5 \
+    --task_mode handover \
     --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --randomize_object_size \
-    --task_mode handover 
+    --randomize_object_size
 ```
 
 ### Generate augemented dataset w domain randomization(background changing)
@@ -335,7 +331,6 @@ uv sync
 source .venv/bin/activate
 env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 30 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20
 ```
-
 
 
 
