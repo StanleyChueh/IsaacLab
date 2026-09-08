@@ -39,7 +39,7 @@ note:
 make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
 
 ```
-sudo ip addr add 10.100.1.240/24 dev wlp7s0
+sudo ip addr add 10.100.1.240/32 dev wlp7s0
 ```
 
 Resume recording
