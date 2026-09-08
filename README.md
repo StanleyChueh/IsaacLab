@@ -163,7 +163,7 @@ python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_
 # Push dataset to the Hub
 
 ```
-conda activate lerobot
+conda activate env_isaaclab && cd ~/Stanley_ws/IsaacLab
 python scripts/push_to_hub.py
 ```
 
