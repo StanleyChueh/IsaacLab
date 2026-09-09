@@ -28,17 +28,17 @@ parser.add_argument(
     help="File path to export recorded and generated episodes.",
 )
 parser.add_argument(
-    "--discard_failed_episodes",
+    "--keep_failed_episodes",
     action="store_true",
-    default=True,
+    default=False,
     help=(
-        "Do not export failed generation trials at all. Off by default, in which case the task's"
-        " own generation_keep_failed setting decides (True for the OpenArm pick-up family), which"
-        " writes every failed trial to a '<output_file>_failed.hdf5' companion -- useful for"
-        " debugging a low success rate, but it can dwarf the main output in size (each failed trial"
-        " still carries full camera data) since generation_guarantee retries a failing trial up to"
-        " max_num_failures times before giving up. Pass this once you don't need that companion file"
-        " and want the disk space back; the main output only ever contains successes either way."
+        "Also export failed generation trials, to a '<output_file>_failed.hdf5' companion file."
+        " Off by default: only successful trials are ever exported (the main output file only"
+        " ever contained successes anyway -- this only controls the companion file). Useful for"
+        " debugging a low success rate, but it can dwarf the main output in size, since each"
+        " failed trial still carries full camera data and generation_guarantee retries a failing"
+        " trial up to max_num_failures times before giving up. Pass this only when you actually"
+        " want to inspect why trials failed."
     ),
 )
 parser.add_argument(
@@ -209,13 +209,17 @@ def main():
     )
 
     # setup_env_config already picked env_cfg.recorders.dataset_export_mode from the task's own
-    # datagen_config.generation_keep_failed (True for the OpenArm pick-up family), so overriding
-    # THAT export mode directly here -- rather than flipping generation_keep_failed and hoping it
-    # gets re-read -- is what actually takes effect; generation_keep_failed itself is not consulted
-    # again after this point.
-    if args_cli.discard_failed_episodes:
+    # datagen_config.generation_keep_failed (True for the OpenArm pick-up family, which is why
+    # success-only needs an explicit override here rather than nothing at all: left alone, every
+    # run pays for a '_failed.hdf5' companion whether or not anyone asked for it). Overriding THAT
+    # export mode directly -- rather than flipping generation_keep_failed and hoping it gets
+    # re-read -- is what actually takes effect; generation_keep_failed itself is not consulted
+    # again after this point. Success-only is the default; --keep_failed_episodes opts back into
+    # the companion file for when a low success rate needs debugging.
+    if not args_cli.keep_failed_episodes:
         env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
-        print("[GEN] --discard_failed_episodes: failed trials will not be exported (no '_failed.hdf5' file).")
+    else:
+        print("[GEN] --keep_failed_episodes: failed trials will also be exported to a '_failed.hdf5' file.")
 
     # Optional domain randomization -- opt-in via --enable_domain_randomization, off by default,
     # with --domain_randomization_profile choosing how strong it is.
