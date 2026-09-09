@@ -332,6 +332,17 @@ source .venv/bin/activate
 env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 30 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20
 ```
 
+Deploy in async evaluation(GR00T N1.7)
 
-
+```
+cd ~/Stanley_ws/lerobot_openarm
+uv sync
+source .venv/bin/activate
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_gr00t_async.py \
+  --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
+  --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right \
+  --calibration calibration.json \
+  --control-hz 30 --max-joint-speed 1.5 --chunk-size-threshold 0.8 \
+  --max-episode-seconds 25 --max-episodes 20
+```
 
