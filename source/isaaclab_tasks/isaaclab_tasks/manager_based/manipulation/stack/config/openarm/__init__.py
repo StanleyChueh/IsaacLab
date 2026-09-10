@@ -25,6 +25,7 @@ import gymnasium as gym
 from . import (
     pickup_ik_abs_cammount_env_cfg,
     pickup_ik_abs_env_cfg,
+    plate_wipe_ik_abs_env_cfg,
 )
 
 gym.register(
@@ -43,5 +44,17 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": pickup_ik_abs_cammount_env_cfg.OpenarmPickUpRedCubeCamMountEnvCfg,
+    },
+)
+
+# Bimanual plate-wiping task: right arm picks the plate off a dish rack, left arm wipes it with
+# a rag, left arm drops the rag, right arm returns the plate. Raw teleop recording only for now
+# -- not in openarm_task_modes.CAN_TARGET_TASKS, so --task_mode stays optional/unused for it.
+gym.register(
+    id="Isaac-PlateWipe-OpenArm-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": plate_wipe_ik_abs_env_cfg.OpenarmPlateWipeEnvCfg,
     },
 )
