@@ -4,7 +4,8 @@
 
 # Demo: 
 
-<img width="1280" height="480" alt="rag_real_task_dual_view" src="https://github.com/user-attachments/assets/eb7fb4f6-7cfa-47f8-a592-3c2863c167c4" />
+<img width="1858" height="1053" alt="image" src="https://github.com/user-attachments/assets/c82d8a0c-d545-45c4-acc3-1fc701660a3b" />
+
 
 
 video: https://youtu.be/4DKriauQ05g?si=INIHtNN7Frs6Tbzm
