@@ -100,6 +100,19 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--enable_camera_shake",
+    action="store_true",
+    default=False,
+    help=(
+        "OpenArm pick-up tasks only (needs --enable_domain_randomization): also attach the"
+        " continuous camera-shake terms (per-control-step oscillation on wrist/right_wrist/body"
+        " cams), on top of whatever --domain_randomization_profile already enables. Off by"
+        " default -- both the 'full' and 'visual' profiles otherwise carried this unconditionally,"
+        " which made it impossible to get either profile's other randomization without also"
+        " paying for the shake."
+    ),
+)
+parser.add_argument(
     "--randomize_object_size",
     action="store_true",
     default=False,
@@ -234,8 +247,12 @@ def main():
             # already patched that object, and a fresh instance would throw those patches away
             # (see attach_domain_randomization's docstring for what exactly breaks).
             profile = args_cli.domain_randomization_profile
-            attached = attach_domain_randomization(env_cfg, profile)
+            attached = attach_domain_randomization(env_cfg, profile, args_cli.enable_camera_shake)
             print(f"[DR] Domain randomization enabled (profile '{profile}'): {', '.join(attached)}")
+            print(
+                "[DR] Camera shake (continuous oscillation) is "
+                + ("ENABLED." if args_cli.enable_camera_shake else "disabled by default -- pass --enable_camera_shake to turn it on.")
+            )
             if profile == "visual":
                 print(
                     "[DR] Lighting varies WITHOUT a background/skybox swap; object and pad vary in"
