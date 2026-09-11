@@ -14,8 +14,9 @@ Action space (14D flat) -- identical layout to the pick-up task, inherited uncha
 Scene: cube_1/cube_2/cube_3 are all removed. Three new props replace them:
   * ``dish_rack``  -- dynamic RigidObject, kinematic (PhysxRigidBodyAPI with kinematicEnabled=True
     on dish_rack_kinematic.usdc's ``/root/dish_rack`` -- see this module's docstring below on why
-    it needed a RigidBodyAPI at all). Sits in the middle-front of the pad (see RACK_POS above) --
-    NOT tucked against the right arm's base the way it originally was; that put it close enough
+    it needed a RigidBodyAPI at all). Sits toward the pad's FAR edge, centered in y between the
+    two arms (see RACK_POS above) -- NOT tucked against the right arm's base the way it originally
+    was, and NOT in the more central position tried after that either: both put it close enough
     for the arm's own links to clip it during normal motion (see the docstring for
     ``randomize_dish_rack_and_plate`` below).
     dish_rack_kinematic.usdc's 7 collision sub-meshes were ALSO reauthored from
@@ -135,16 +136,23 @@ RACK_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "dish_rack_kinematic.usdc")
 PLATE_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "plate.usd")
 RAG_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "blue_rag", "blue_rag_deformable.usdc")
 
-# Middle-front of the pad (pad spans x:[0.03,0.51], y:[-0.285,0.285] -- see
-# stack_joint_pos_env_cfg.py's PAD_NEAR_EDGE_X/PAD_SIZE_X/PAD_SIZE_Y), NOT off to the right
-# side any more. The original RACK_POS = (0.30, -0.15, 0.28) sat close enough to the right arm's
-# own base that its own links could clip the rack during normal motion (reported after actually
-# teleoperating -- not something the earlier xy-only, +-0.03m randomization would have caught,
-# since it never moved the rack far from that same trouble spot). x=0.24 matches the pick-up
-# task's own proven-reachable cube_2 band (x:[0.20,0.27], see PickUpEventCfg's docstring); y=0.0
-# is centered between both arms rather than tucked under either one's shoulder. Same PAD_HEIGHT
-# (0.28m) top the plate-drop measurement sim used.
-RACK_POS = (0.24, 0.0, 0.28)
+# Toward the pad's far side (pad spans x:[0.03,0.51], y:[-0.285,0.285] -- see
+# stack_joint_pos_env_cfg.py's PAD_NEAR_EDGE_X/PAD_SIZE_X/PAD_SIZE_Y), not off to the right side,
+# and not near-edge either. History: RACK_POS = (0.30, -0.15, 0.28) sat close enough to the right
+# arm's own base that its own links could clip the rack during normal motion (reported after
+# actually teleoperating) -> (0.24, 0.0) still let the rack's pose_range wander close enough to
+# x=0 (the robot's own base, at the pad's NEAR edge) and to either arm's shoulder in y to cause the
+# same problem again (reported again, this time as the rack visibly under the arms' own workspace)
+# -> (0.40, 0.0) pushed far enough out that with pose_range's x reaching 0.48, only ~3cm short of
+# the ACTUAL far edge (0.51), the plate's own lean+physics-drop (see
+# randomize_dish_rack_and_plate) could tip it (and, separately, the rag -- see
+# randomize_rag_drop's rack-avoidance push) clean off the pad onto the floor below (verified:
+# both landed at z~0, plate's x around 0.70 -- nowhere near the pad any more). 0.36 keeps real
+# margin from BOTH the robot-side near edge and the far edge (pose_range keeps x within
+# [0.30,0.42], i.e. ~9cm clear of the far edge at 0.51, not ~3cm) while still being clearly out
+# past where the robot's own base sat. Same PAD_HEIGHT (0.28m) top the plate-drop measurement sim
+# used.
+RACK_POS = (0.36, 0.0, 0.28)
 
 # Measured by dropping the plate onto the rack under gravity and reading its settled pose, with
 # the rack at its OLD position (0.30, -0.15, 0.28) -- see this module's docstring. Re-expressed
@@ -209,6 +217,7 @@ def randomize_dish_rack_and_plate(
     plate_lean_jitter_deg: dict[str, tuple[float, float]],
     plate_drop_height: float,
     plate_height_tolerance: float,
+    plate_xy_tolerance: float,
     settle_steps: int,
     max_attempts: int,
     rack_cfg: SceneEntityCfg,
@@ -303,10 +312,18 @@ def randomize_dish_rack_and_plate(
 
         # z doesn't change under a pure yaw-about-z rotation of offset_local, so the expected
         # height is just the rack's height plus the constant offset -- no need to re-derive it via
-        # quat_apply.
-        expected_z = rack_pos_now[:, 2] + RACK_TO_PLATE_OFFSET[2]
-        actual_z = plate.data.root_pos_w[pending_ids, 2]
-        needs_retry = (actual_z - expected_z).abs() > plate_height_tolerance
+        # quat_apply. xy DOES change under that rotation, so it's derived the same way start_pos
+        # was above.
+        expected_pos = rack_pos_now + math_utils.quat_apply(rack_rot_now, offset_local.expand(m, 3))
+        actual_pos = plate.data.root_pos_w[pending_ids]
+        height_bad = (actual_pos[:, 2] - expected_pos[:, 2]).abs() > plate_height_tolerance
+        # z-only was NOT enough: verified (screenshots from the plate_wiping asset-fix
+        # conversation) that a plate can tip sideways out of the rack and land elsewhere on the
+        # pad while still settling at a height that happened to fall inside plate_height_tolerance
+        # -- e.g. leaning against the rack's OUTSIDE instead of sitting IN it. xy distance from the
+        # expected in-rack position catches that the height check alone missed.
+        xy_bad = (actual_pos[:, 0:2] - expected_pos[:, 0:2]).norm(dim=-1) > plate_xy_tolerance
+        needs_retry = height_bad | xy_bad
         if not needs_retry.any() or attempt == max_attempts - 1:
             break
         pending_ids = pending_ids[needs_retry]
@@ -320,6 +337,9 @@ def _toss_and_settle_rag(
     tilt_range_deg: dict[str, tuple[float, float]],
     spin_rate_range: tuple[float, float],
     settle_steps: int,
+    rack=None,
+    min_rack_separation: float = 0.0,
+    rack_avoid_margin: float = 0.05,
 ):
     """One toss-and-settle pass for the given (sub)set of env ids. Factored out of
     ``randomize_rag_drop`` so that function can call this again, on just the envs that are still
@@ -334,6 +354,19 @@ def _toss_and_settle_rag(
     threshold isn't guaranteed to trip before ``settle_steps`` runs out. A hard zero-velocity write
     is a stronger guarantee than tuning damping/sleep parameters further: whatever state the mesh
     is in when this returns, it starts the episode with zero momentum, full stop.
+
+    If ``rack`` is given, this ACTIVELY pushes the landing target's xy away from the rack's current
+    position -- by exactly enough to clear ``min_rack_separation`` (plus ``rack_avoid_margin``),
+    not just resampled and hoped for. This exists because a purely-random retry (draw a fresh
+    ``position_range`` offset, check the result, retry if still too close) turned out not to be
+    enough on its own: randomize_dish_rack_and_plate can now place the rack almost anywhere on the
+    pad, so its placement range can fully swallow the rag's own (much narrower) landing region --
+    verified across 15 resets, ~47% still ended up under min_rack_separation even with
+    position_range widened and max_attempts raised, because for those draws NO offset within
+    position_range could have cleared the requirement; it wasn't a matter of bad luck to retry
+    past. Deterministically pushing the target away from wherever the rack actually is fixes that
+    at the source, and randomization is preserved: the underlying jitter is still random, this just
+    guarantees the result clears the rack regardless of which way that jitter happened to point.
     """
     nodal_state = rag.data.default_nodal_state_w[ids].clone()
     n = len(ids)
@@ -341,6 +374,32 @@ def _toss_and_settle_rag(
     pos_range_list = [position_range.get(key, (0.0, 0.0)) for key in ("x", "y", "z")]
     pos_ranges = torch.tensor(pos_range_list, device=rag.device)
     pos_offset = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (n, 3), device=rag.device)
+
+    if rack is not None and min_rack_separation > 0.0:
+        # the rest shape's own centroid (nodal_state hasn't been transformed yet at this point),
+        # since transform_nodal_pos below applies pos_offset as an ADDITIVE offset on top of
+        # exactly this centroid -- see its docstring in deformable_object.py.
+        nominal_xy = nodal_state[..., 0:2].mean(dim=1)
+        rack_xy = rack.data.root_pos_w[ids, 0:2]
+        target_xy = nominal_xy + pos_offset[:, 0:2]
+        delta = target_xy - rack_xy
+        dist = delta.norm(dim=-1).clamp_min(1e-6)
+        required = min_rack_separation + rack_avoid_margin
+        push = (required - dist).clamp_min(0.0)
+        direction = delta / dist.unsqueeze(-1)
+        target_xy = target_xy + direction * push.unsqueeze(-1)
+        # Clamp to a safe pad-interior box regardless of how far the push above needed to go.
+        # Verified: an unclamped push could land the rag off the pad entirely (one case pushed to
+        # y=0.42, past the pad's actual y limit of 0.285) when the rack happened to sit right
+        # where the push had to send it -- landed on the floor below, z~0. Bounds leave margin for
+        # the rag's own ~0.3x0.3m extent plus tumble drift, not just its centroid. This can, in
+        # rare cases, mean the clamped landing ends up closer to the rack than
+        # min_rack_separation asked for -- accepted, since "off the pad entirely" is a worse
+        # failure than "separation margin a bit tighter than intended" and the retry loop below
+        # still gets a chance to reject it either way.
+        target_xy[:, 0] = target_xy[:, 0].clamp(0.13, 0.45)
+        target_xy[:, 1] = target_xy[:, 1].clamp(-0.22, 0.22)
+        pos_offset[:, 0:2] = target_xy - nominal_xy
 
     tilt_range_list = [tilt_range_deg.get(key, (0.0, 0.0)) for key in ("roll", "pitch", "yaw")]
     tilt_ranges = torch.deg2rad(torch.tensor(tilt_range_list, device=rag.device))
@@ -391,9 +450,11 @@ def randomize_rag_drop(
     min_wrinkle_spread: float,
     max_safe_z: float,
     min_safe_z: float,
+    min_rack_separation: float,
     max_attempts: int,
     asset_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    rack_cfg: SceneEntityCfg = SceneEntityCfg("dish_rack"),
 ):
     """Toss the rag -- height, tilt, AND a real tumble -- above its rest pose and physically settle
     it for a few steps before the episode starts, instead of teleporting it into the exact same
@@ -443,6 +504,12 @@ def randomize_rag_drop(
     wrong reason. ``min_safe_z`` should sit a few cm below the pad's actual top (RAG_REST_POS'
     z, i.e. some settling/penetration tolerance) but well above the ground plane.
 
+    A third rejection reason, orthogonal to both of the above: the rag's landing centroid ending
+    up within ``min_rack_separation`` of the rack's CURRENT position (``rack_cfg`` -- read live,
+    not RACK_POS, since randomize_dish_rack_and_plate -- which runs first -- can now place the
+    rack almost anywhere on the pad). Without this, a rack that happened to land near the rag's
+    own spawn area had nothing stopping the two from visibly overlapping/interpenetrating.
+
     This event function does something PickUpEventCfg's/this file's other event terms don't: it
     steps physics itself (``env.sim.step()``, via ``_toss_and_settle_rag``), rather than just
     writing a state once. That's safe here because ``_reset_idx`` (manager_based_env.py) applies
@@ -460,19 +527,42 @@ def randomize_rag_drop(
     """
     rag: DeformableObject = env.scene[asset_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
+    rack = env.scene[rack_cfg.name]
 
     # hold the robot still through the settle steps below -- see docstring
     robot.set_joint_position_target(robot.data.default_joint_pos[env_ids], env_ids=env_ids)
 
     pending_ids = env_ids
     for attempt in range(max_attempts):
-        _toss_and_settle_rag(env, rag, pending_ids, position_range, tilt_range_deg, spin_rate_range, settle_steps)
+        _toss_and_settle_rag(
+            env,
+            rag,
+            pending_ids,
+            position_range,
+            tilt_range_deg,
+            spin_rate_range,
+            settle_steps,
+            rack=rack,
+            min_rack_separation=min_rack_separation,
+        )
 
         nodal = rag.data.nodal_pos_w[pending_ids]
         zmax = nodal[..., 2].amax(dim=1)
         zmin = nodal[..., 2].amin(dim=1)
         spread = zmax - zmin
-        needs_retry = (spread < min_wrinkle_spread) | (zmax > max_safe_z) | (zmin < min_safe_z)
+        out_of_bounds = (spread < min_wrinkle_spread) | (zmax > max_safe_z) | (zmin < min_safe_z)
+
+        # this task's env cfg now lets randomize_dish_rack_and_plate place the rack ANYWHERE
+        # across most of the pad (and at any rotation) -- it's no longer safe to assume the rag's
+        # own position_range keeps it clear of wherever the rack+plate happened to land this
+        # episode. Reject (and re-toss) any landing whose centroid ends up too close to the
+        # rack's CURRENT position, rather than relying on the two objects' nominal positions
+        # having been far enough apart by construction.
+        rag_centroid_xy = nodal[..., 0:2].mean(dim=1)
+        rack_xy = rack.data.root_pos_w[pending_ids, 0:2]
+        too_close_to_rack = (rag_centroid_xy - rack_xy).norm(dim=-1) < min_rack_separation
+
+        needs_retry = out_of_bounds | too_close_to_rack
         if not needs_retry.any() or attempt == max_attempts - 1:
             break
         pending_ids = pending_ids[needs_retry]
@@ -581,11 +671,18 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
             func=randomize_dish_rack_and_plate,
             mode="reset",
             params={
-                # Kept modest now that RACK_POS itself sits mid-pad rather than tucked against
-                # the right arm's base -- x stays within the pick-up task's proven cube_2 band,
-                # y stays close enough to center that it can't drift under either arm's shoulder.
-                "pose_range": {"x": (-0.03, 0.03), "y": (-0.06, 0.06)},
-                "yaw_range_deg": (-20.0, 20.0),
+                # x=0.06 (was 0.08, alongside RACK_POS moving from 0.40 to 0.36): a wider range
+                # let the rack land within ~3cm of the pad's actual far edge, which combined with
+                # its now-unrestricted yaw was enough for the plate's lean+physics-drop to
+                # occasionally tip it (and, separately, the rag) clean off the pad onto the floor
+                # -- verified both landing at z~0. See RACK_POS's own comment for the full history.
+                # x now stays within [0.30,0.42] (~9cm clear of the far edge at 0.51), y stays
+                # within [-0.08,0.08] (tight around center, well clear of either arm's own
+                # shoulder, which sits out around +-0.15 -- see the left arm's rest ee_tcp
+                # position measured during the gripper-height check for the rag's max_safe_z).
+                "pose_range": {"x": (-0.06, 0.06), "y": (-0.08, 0.08)},
+                # No angle limit, per direct instruction -- full turn.
+                "yaw_range_deg": (-180.0, 180.0),
                 # roll/pitch jitter on the plate's lean, applied in the rack's own local frame
                 # (see randomize_dish_rack_and_plate's docstring) -- how much it tips and which
                 # way, while a physics drop (not a teleport) finds the actual valid resting
@@ -596,13 +693,20 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # "tipped out of the rack onto the pad" (pad top is ~9cm below the nominal plate
                 # height -- see RACK_TO_PLATE_OFFSET's z component).
                 "plate_height_tolerance": 0.05,
-                # Verified directly (root_lin_vel_w read right after a reset) that 90 steps
-                # sometimes wasn't enough for a plate mid-lean-adjustment to actually reach
-                # equilibrium (residual velocity up to ~0.5 m/s) before _settle_plate's hard
-                # velocity freeze kicked in -- raised for more headroom, same reasoning as
-                # randomize_rag_drop's settle_steps.
-                "settle_steps": 150,
-                "max_attempts": 10,
+                # z-only wasn't enough to confirm the plate actually stayed IN the rack -- see
+                # randomize_dish_rack_and_plate's docstring for the failure this catches (tipped
+                # sideways out of the rack, landed elsewhere on the pad, but at a height that
+                # coincidentally still passed plate_height_tolerance).
+                "plate_xy_tolerance": 0.05,
+                # Measured reset() wall time end-to-end (all three events together) at 3-20s with
+                # settle_steps=150/max_attempts=10 here and 150/20 on randomize_rag below -- a real
+                # problem for interactive teleop (pressing the reset key), not a GPU-memory limit.
+                # freeze_dynamic_props (runs last, after randomize_rag too) is what actually makes
+                # settle_steps safe to trim back down here: the plate keeps getting "free" extra
+                # settling from randomize_rag's own steps regardless, and gets a final hard freeze
+                # either way, so this doesn't need to fully converge entirely on its own anymore.
+                "settle_steps": 80,
+                "max_attempts": 6,
                 "rack_cfg": SceneEntityCfg("dish_rack"),
                 "plate_cfg": SceneEntityCfg("plate"),
             },
@@ -616,10 +720,20 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # (one that reaches the gripper) safe: it gets detected and re-tossed like any
                 # other rejected attempt, same as a too-flat one, rather than needing the toss
                 # itself to be weak enough to never reach that high.
-                "position_range": {"x": (-0.04, 0.04), "y": (-0.04, 0.04), "z": (0.08, 0.16)},
+                # x/y widened from +-0.04 -- now that the rack can land almost anywhere on the pad
+                # (see randomize_dish_rack_and_plate's pose_range), the rag needs more room to
+                # actually find a landing spot that clears min_rack_separation below when the rack
+                # happens to come down near its nominal spawn area, not just a narrow band to
+                # sample within.
+                "position_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08), "z": (0.08, 0.16)},
                 "tilt_range_deg": {"roll": (-20.0, 20.0), "pitch": (-20.0, 20.0), "yaw": (-180.0, 180.0)},
                 "spin_rate_range": (12.0, 24.0),
-                "settle_steps": 150,
+                # See randomize_dish_rack_and_plate's settle_steps comment -- measured reset()
+                # taking 3-20s with this at 150/max_attempts=20; trimmed down for interactive
+                # teleop use. The final freeze_dynamic_props pass (this task's actual LAST reset
+                # event) means the hard velocity zero at the end of every toss-and-settle attempt
+                # doesn't need to be the last word on its own either.
+                "settle_steps": 100,
                 # Raised from an earlier 10mm (which only rejected outright-flat landings, ~3-7mm)
                 # to 30mm -- verified (plate_wiping asset-fix conversation, the "flat to me"
                 # follow-up) that a merely-non-flat crease around 10-20mm still reads as close to
@@ -634,12 +748,29 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # tolerance while still catching the "flew off the pad onto the ground plane"
                 # failure (z near 0) the higher spin_rate_range surfaced -- see docstring.
                 "min_safe_z": 0.25,
-                # Raised alongside min_wrinkle_spread, and again after verification showed 12 was
-                # occasionally not enough headroom to clear 30mm AND stay clear of both the
-                # gripper and the pad edge within a bounded number of tosses -- retries are cheap
-                # (no rendering, ~1.5s of sim time each), so there's little cost to a larger budget.
-                "max_attempts": 20,
+                # Now that randomize_dish_rack_and_plate can place the rack almost anywhere on the
+                # pad (see that event's pose_range), the rack and rag can no longer be assumed far
+                # apart just because their nominal positions are -- this is the check that
+                # actually enforces it, against wherever the rack ACTUALLY ended up this episode
+                # (rack_cfg below), not a fixed position. Deliberately modest (not a big personal-
+                # space buffer): the rag's own position_range is much narrower than the rack's, so
+                # it has limited room to "dodge" a rack that landed nearby -- set too large, this
+                # would mostly just burn through max_attempts without ever finding a satisfying
+                # offset. Tuned to stop literal overlap, not to guarantee generous clearance.
+                "min_rack_separation": 0.22,
+                # History: 20 -> 8 (reset() wall time was 3-20s, a real interactive-teleop
+                # problem, not GPU memory) -> 14 (8 wasn't enough headroom when clearing
+                # min_rack_separation was still partly down to retry-luck) -> 10 (the deterministic
+                # rack-avoidance push meant separation was mostly solved on the first attempt, so
+                # 10 seemed enough) -> 12: verified with 15 resets that 10 still left ~27% of
+                # resets with a z-bounds violation (mostly from the SAME rack-proximity cause,
+                # since the pad-boundary clamp on that push -- see _toss_and_settle_rag's docstring
+                # -- can trade away some separation margin when the rack sits close to the rag's
+                # own zone). Not fully eliminated by construction the way the basic case is, so
+                # retries still matter here more than the comment this replaces assumed.
+                "max_attempts": 12,
                 "asset_cfg": SceneEntityCfg("rag"),
+                "rack_cfg": SceneEntityCfg("dish_rack"),
             },
         )
         # Must run AFTER both events above -- see freeze_dynamic_props' docstring for why an
