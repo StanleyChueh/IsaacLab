@@ -479,8 +479,20 @@ DOMAIN_RANDOMIZATION_PROFILES = {
 }
 """Selectable randomization strengths -- see generate_dataset.py's --domain_randomization_profile."""
 
+_CAMERA_SHAKE_TERM_NAMES = (
+    "init_wrist_cam_shake",
+    "shake_wrist_cam",
+    "init_right_wrist_cam_shake",
+    "shake_right_wrist_cam",
+    "init_body_cam_shake",
+    "shake_body_cam",
+)
+"""Event term names for the continuous camera-shake terms defined on
+`PickUpDomainRandomizationEventCfg` -- see :func:`attach_domain_randomization`'s
+`enable_camera_shake` argument."""
 
-def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
+
+def attach_domain_randomization(env_cfg, profile: str = "full", enable_camera_shake: bool = False) -> list[str]:
     """Add *profile*'s randomization terms to `env_cfg.events` IN PLACE, and return their names.
 
     Deliberately NOT `env_cfg.events = PickUpDomainRandomizationEventCfg()`. That was the original
@@ -501,6 +513,13 @@ def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
     that untouched. Terms aimed at cube_2 are retargeted onto whatever object the task really has
     (see :func:`_manipulated_object_name`) for the same reason: the appearance terms were written
     against the pre-task-mode scene.
+
+    `enable_camera_shake` gates the six continuous camera-shake terms (see
+    :data:`_CAMERA_SHAKE_TERM_NAMES`) separately from *profile*: they are defined on the 'full'
+    profile and inherited unchanged by 'visual', so without this switch there was no way to get
+    either profile's other randomization without also paying for the shake's per-step interval
+    events. Off by default -- callers (e.g. generate_dataset.py's --enable_camera_shake) opt in
+    explicitly.
     """
     if profile not in DOMAIN_RANDOMIZATION_PROFILES:
         raise ValueError(
@@ -522,6 +541,8 @@ def attach_domain_randomization(env_cfg, profile: str = "full") -> list[str]:
     for term_name, term in vars(dr_cfg).items():
         if term_name in base_term_names:
             continue  # a base term -- whatever apply_task_mode left there is the correct version
+        if term_name in _CAMERA_SHAKE_TERM_NAMES and not enable_camera_shake:
+            term = None  # opt-in only -- see enable_camera_shake in this function's docstring
         if term is not None:
             asset_cfg = term.params.get("asset_cfg")
             if asset_cfg is not None and asset_cfg.name == "cube_2":
