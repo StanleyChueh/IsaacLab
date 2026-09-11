@@ -154,19 +154,148 @@ RAG_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "blue_rag", "blue_rag_deform
 # used.
 RACK_POS = (0.36, 0.0, 0.28)
 
-# Measured by dropping the plate onto the rack under gravity and reading its settled pose, with
-# the rack at its OLD position (0.30, -0.15, 0.28) -- see this module's docstring. Re-expressed
-# below as an offset from RACK_POS instead of an absolute world pose, so it (and the
-# per-episode rack-relative math in randomize_dish_rack_and_plate) transfers correctly now that
-# RACK_POS has moved: RACK_TO_PLATE_OFFSET is a property of how the plate leans in the rack, not
-# of where the rack happens to sit in the world, so it's unaffected by relocating RACK_POS.
-RACK_TO_PLATE_OFFSET = (-0.04500742554664611, 0.05543225407600402, 0.09341415882110593)
-PLATE_REST_POS = (
-    RACK_POS[0] + RACK_TO_PLATE_OFFSET[0],
-    RACK_POS[1] + RACK_TO_PLATE_OFFSET[1],
-    RACK_POS[2] + RACK_TO_PLATE_OFFSET[2],
-)
-PLATE_REST_ROT = (0.864859938621521, 0.48673415184020996, -0.07166199386119843, 0.09985882043838501)
+# The plate comes in two sizes -- see PLATE_SIZE_CONFIGS below for the full explanation of why
+# each size needs its OWN measured rest pose, not just a scaled copy of the other's.
+#
+# "large" is plate.usd at its native scale: measured outline (see the plate_wiping asset-fix
+# conversation) is a 26cm outer diameter, ~19cm inner (well) diameter.
+PLATE_SCALE_LARGE = 1.0
+#
+# REVISED (user feedback, screenshot + reference photo of a real dish rack): the original
+# far-off-center recipe here (offset magnitude ~7.1cm, rotation a steep ~55-70deg lean) made the
+# plate hang mostly OUTSIDE the peg cluster, leaning against a single corner peg -- real contact,
+# no penetration, but clearly NOT "seated in the middle, between the pegs" the way every plate in
+# a real rack sits.
+#
+# REVISED AGAIN: the "much smaller off-center offset, same 55deg-roll/-25deg-yaw lean" recipe that
+# used to be here (and the shallow-lean small-plate recipe it was copied from) was never actually
+# verified by watching the real task settle it -- checked now the same way RACK_TO_PLATE_OFFSET_SMALL
+# was re-verified (gym.make + real env.reset() through THIS task's own default
+# pose_range/yaw_range/tolerances, root pose logged AND body_cam rendered every reset, not a solo
+# hand-derived drop test): it passes its own height/xy tolerance while visibly floating disconnected
+# above/beside the rack in every rendered frame, for the same reason the small-plate one did -- the
+# shallow off-center start pose barely falls under gravity at all, so "within tolerance of the
+# nominal target" just means "still near where it was dropped," not "resting against anything."
+#
+# What actually produces a genuine, repeatable rest against the peg cluster (confirmed the same way,
+# 15+ resets, mixed solo-controlled and full randomize_dish_rack_and_plate calls through real
+# env.reset()): a CENTERED xy offset (0, 0) with a NEARLY-upright lean, 85deg roll about the rack's
+# local x-axis -- not a full 90deg. Exactly 90deg (verified separately) is a knife-edge unstable
+# balance that settles flat about as often as it settles leaning, in either yaw direction, since
+# nothing breaks the left/right symmetry; 85deg is enough asymmetry to consistently fall (and stay)
+# leaning the same way every time, while still reading as "upright, resting in the middle of the
+# slot" rather than the old shallow far-off-center lean. The settled root height above the rack ends
+# up close to the plate's own outer radius (0.13m here) regardless of the rack's own randomized
+# xy/yaw and the plate's own lean jitter -- consistent with the plate's bottom rim resting on the
+# rack's tray floor while the rest of the disc leans against a peg for lateral support, the same
+# relationship RACK_TO_PLATE_OFFSET_SMALL's docstring found for the small plate at its own radius.
+RACK_TO_PLATE_OFFSET_LARGE = (0.0, 0.0, 0.13)
+PLATE_REST_ROT_LARGE = (0.7372773289680481, 0.6755901575088501, 0.0, 0.0)
+
+# "small": requested as an exact 19cm outer / 14cm inner diameter plate. No separate small-plate
+# asset exists, but plate.usd's own inner:outer ratio (19cm:26cm, measured above) already lands
+# almost exactly on the requested numbers under a uniform scale: 0.19 * (19/26) = 13.88cm inner,
+# ~1mm off the requested 14cm -- close enough that authoring a whole second mesh wasn't worth it.
+# So "small" is the SAME plate.usd, spawned with UsdFileCfg.scale = (PLATE_SCALE_SMALL,)*3, not a
+# different file.
+PLATE_SCALE_SMALL = 19.0 / 26.0
+# Measured the SAME "drop it and read where it settles" way as the large plate, dropped onto
+# dish_rack_kinematic.usdc at its own RACK_POS -- NOT just RACK_TO_PLATE_OFFSET_LARGE /
+# PLATE_REST_ROT_LARGE rescaled by PLATE_SCALE_SMALL. This matters because the rack's peg spacing
+# is fixed geometry sized around the LARGE plate's 26cm rim; a scaled offset/rotation assumes the
+# smaller plate leans against those same pegs the same way, and it does not automatically.
+#
+# An earlier measurement dropped the small plate CENTERED and FLAT above the rack -- its own
+# inner hole (7cm radius) is bigger than the whole peg cluster's half-diagonal (3.6cm), so a
+# centered flat drop just lowers the hole over all 4 pegs and rests flat on their tops, never
+# actually caught by the rack at all. A second attempt (steep lean, offset ~7.9cm off-center)
+# fixed the "not caught at all" problem but over-corrected into "hangs off to one side against a
+# single peg" -- exactly the same not-centered failure mode as the large plate's original recipe,
+# per the user's follow-up correction (screenshot + a real dish rack reference photo showing every
+# plate centered in its slot, not leaning to one side).
+#
+# REVISED (second correction -- the "half offset, same 55deg-roll/-25deg-yaw lean" values that used
+# to be here, verified against ``record_demos_openarm.py``'s ACTUAL reset path in-process (gym.make
+# + repeated env.reset(), not a solo hand-derived drop test): logged the plate's settled root pose
+# every reset and rendered body_cam to actually LOOK at it (see the plate_wiping asset-fix
+# conversation's follow-up -- this file's own uncommitted history had the "half offset"
+# numbers passing their OWN height/xy tolerance check yet visibly floating disconnected above/beside
+# the rack in every rendered frame: the recipe's start pose barely moved under gravity at all, i.e.
+# it was resting on nothing, just frozen near its spawn height by the reset event's own hard
+# zero-velocity freeze -- tolerance passing is not proof of actual contact). A perfectly centered,
+# NEARLY-UPRIGHT drop (no xy offset at all, ~85deg roll about the rack's local x-axis rather than a
+# shallow ~55deg lean) is what actually produces a genuine, repeatable rest against the peg cluster
+# for THIS plate/rack pair at this scale: confirmed over 20+ resets (mixed: solo controlled calls
+# with the rack held fixed, and full ``randomize_dish_rack_and_plate`` calls through real
+# ``env.reset()`` with the task's own default pose_range/yaw_range/tolerances/settle_steps/
+# plate_drop_height, i.e. no test-only loosening) that it settles to the same root height/offset
+# from the rack (root pos ~9.1cm above rack root in z, ~3.0cm off in xy) regardless of the rack's
+# own randomized xy/yaw and the plate's own +-8deg lean jitter -- and body_cam renders across many
+# of those confirm it visually as a plate genuinely leaning IN the peg cluster (one edge caught,
+# other side clear of the rack), not floating apart from it or perched flat on the peg tips (the
+# centered-and-shallow failure mode above).
+RACK_TO_PLATE_OFFSET_SMALL = (0.0, 0.0, 0.095)
+PLATE_REST_ROT_SMALL = (0.7372773289680481, 0.6755901575088501, 0.0, 0.0)
+
+# Outer radius of the plate disc itself (native mesh measured at 26cm outer diameter -> 13cm
+# radius, scaled the same way as the spawn scale). Needed so randomize_dish_rack_and_plate can
+# keep the whole disc -- not just its root point -- clear of the arms: a root-position-only check
+# missed exactly this class of bug (see this module's `apply_plate_size`/arm-avoidance comments).
+PLATE_RADIUS_LARGE = 0.13
+PLATE_RADIUS_SMALL = 0.095
+
+PLATE_SIZE_CONFIGS = {
+    "small": {
+        "scale": PLATE_SCALE_SMALL,
+        "offset": RACK_TO_PLATE_OFFSET_SMALL,
+        "rot": PLATE_REST_ROT_SMALL,
+        "radius": PLATE_RADIUS_SMALL,
+    },
+    "large": {
+        "scale": PLATE_SCALE_LARGE,
+        "offset": RACK_TO_PLATE_OFFSET_LARGE,
+        "rot": PLATE_REST_ROT_LARGE,
+        "radius": PLATE_RADIUS_LARGE,
+    },
+}
+# Default per direct instruction ("small plate is in default setting").
+DEFAULT_PLATE_SIZE = "small"
+
+# Left/right arm gripper+camera cluster, projected to XY, measured directly (robot.data.body_pos_w
+# at the default reset pose -- see the plate_wiping asset-fix conversation's diag_arm_links.py) as
+# the centroid of link6/link7/ee_tcp/camera_link/both fingers. Symmetric about y=0. Used to keep
+# the plate's full disc (not just its root point) clear of the arms -- verified necessary: a plate
+# whose ROOT stayed within the rack's own randomization range still let the disc's rim swing to
+# within ~4mm of the left camera-link housing under some yaw draws (rigorous mesh-vs-body-point
+# clearance check, not just centroid distance).
+# NOTE: with either plate's own radius already close to half the ~30.6cm arm-to-arm spacing, an
+# overly generous cluster radius here makes required_dist (see randomize_dish_rack_and_plate)
+# exceed half that spacing and the two keepout circles overlap, leaving no valid position near the
+# pad's actual center -- keep this at the housing/finger's own rough half-width, not a padded
+# whole-cluster radius, and let plate_radius (already the dominant term) carry the real margin.
+ARM_KEEPOUT_XY_LEFT = (0.26, 0.153)
+ARM_KEEPOUT_XY_RIGHT = (0.26, -0.153)
+ARM_KEEPOUT_RADIUS = 0.02
+# Extra padding vs. the bare housing/finger half-width: the keepout check below is XY-only (rack
+# xy + yaw), but plate_lean_jitter_deg can stand the plate up steeply enough that its TOP edge
+# reaches noticeably higher in z than a flat disc would, closing some of the gap to the camera-link
+# housing that a pure top-down xy distance doesn't see -- verified directly (a rare steep-lean
+# trial still showed ~1cm of real plate/camera-link overlap at margin=0.01). 0.03 covers that
+# without rejecting so much of the pad that resampling stops converging.
+ARM_KEEPOUT_MARGIN = 0.03
+
+
+def _plate_rest_pos(offset: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (RACK_POS[0] + offset[0], RACK_POS[1] + offset[1], RACK_POS[2] + offset[2])
+
+
+# Kept as the names the rest of this module (and its docstring) already refers to -- resolve to
+# whichever size is DEFAULT_PLATE_SIZE. apply_plate_size() below overrides all of this on an
+# already-constructed env_cfg for the non-default choice; these are just what the scene/event
+# params are initially built with in __post_init__.
+RACK_TO_PLATE_OFFSET = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["offset"]
+PLATE_REST_ROT = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["rot"]
+PLATE_REST_POS = _plate_rest_pos(RACK_TO_PLATE_OFFSET)
 
 # Measured the same way: dropped flat onto the pad (as a PhysX deformable body, not a rigid
 # collider -- see this module's docstring) and read back its settled nodal centroid.
@@ -222,6 +351,9 @@ def randomize_dish_rack_and_plate(
     max_attempts: int,
     rack_cfg: SceneEntityCfg,
     plate_cfg: SceneEntityCfg,
+    rack_to_plate_offset: tuple[float, float, float] = RACK_TO_PLATE_OFFSET,
+    plate_rest_rot: tuple[float, float, float, float] = PLATE_REST_ROT,
+    plate_radius: float = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["radius"],
 ):
     """Place ``dish_rack`` and ``plate`` as one rigid group (shared xy offset AND shared yaw
     rotation about the rack's own pivot), then separately re-settle the plate's lean within the
@@ -229,15 +361,21 @@ def randomize_dish_rack_and_plate(
     always-identical relative pose the way this task did before.
 
     Why the rack and plate move together: the plate rests leaning IN the rack (see
-    RACK_TO_PLATE_OFFSET above); randomizing either one independently would drift the plate out of
+    ``rack_to_plate_offset``); randomizing either one independently would drift the plate out of
     the rack -- floating next to it or clipped through a wall, depending on which way two
     independent draws happened to point. Both effects (xy translation, yaw rotation) are applied to
     dish_rack's actual root pose, and to the plate's TARGET pose via the same rigid transform
-    (RACK_TO_PLATE_OFFSET rotated by the same yaw, PLATE_REST_ROT composed with the same yaw) --
-    so the plate's target always sits correctly relative to wherever the rack ends up, not just
-    the original RACK_POS/PLATE_REST_POS. dish_rack is written directly (kinematic, no settling
-    needed -- see the parent docstring on why it's a RigidObject at all); the plate's target is a
-    STARTING point for a physics drop, not a final write, so its lean can vary.
+    (``rack_to_plate_offset`` rotated by the same yaw, ``plate_rest_rot`` composed with the same
+    yaw) -- so the plate's target always sits correctly relative to wherever the rack ends up, not
+    just the original RACK_POS/PLATE_REST_POS. dish_rack is written directly (kinematic, no
+    settling needed -- see the parent docstring on why it's a RigidObject at all); the plate's
+    target is a STARTING point for a physics drop, not a final write, so its lean can vary.
+
+    ``rack_to_plate_offset``/``plate_rest_rot`` default to the module-level constants (which
+    resolve to whichever size DEFAULT_PLATE_SIZE names), but are real parameters, not just
+    module-global reads, specifically so ``apply_plate_size`` can override them per env_cfg
+    instance for the OTHER plate size -- see PLATE_SIZE_CONFIGS' docstring for why the small and
+    large plates need genuinely different measured values here, not a scaled copy of one offset.
 
     Plate leaning direction: rather than trust an arbitrary rotation jitter to still be a physically
     valid "resting in the rack" configuration (a plate is thin and rigid -- a rotation that isn't
@@ -275,6 +413,41 @@ def randomize_dish_rack_and_plate(
     # composing with yaw_quat here is equivalent to just using yaw_quat directly -- written this
     # way (rather than assuming that) so it stays correct if that default ever changes.
     rack_rot = math_utils.quat_mul(yaw_quat, rack_default[:, 3:7])
+
+    # ── keep the plate's full disc clear of the arm gripper/camera clusters ────────────
+    # The plate's world center is rack_pos + (rack_rot-rotated) rack_to_plate_offset. Rather than
+    # PUSH a violating draw away from the nearest keepout circle (tried first, reverted: with the
+    # plate's own radius already more than a third of the arm-to-arm spacing, the two keepout
+    # circles overlap, so a push satisfying one side can drive the plate into the other -- observed
+    # directly as a runaway multi-meter "correction" that then made the plate's physics drop start
+    # deep inside the rack and explode away on contact resolution), just REDRAW a fresh (offset_xy,
+    # yaw) for whichever envs violate and recheck -- independent fresh samples can't compound into
+    # an out-of-range position the way an iterative push can, since every candidate is still drawn
+    # from the exact same validated pose_range/yaw_range as everyone else.
+    offset_local_const = torch.tensor(rack_to_plate_offset, device=device)
+    keepout_left = torch.tensor(ARM_KEEPOUT_XY_LEFT, device=device)
+    keepout_right = torch.tensor(ARM_KEEPOUT_XY_RIGHT, device=device)
+    required_dist = ARM_KEEPOUT_RADIUS + plate_radius + ARM_KEEPOUT_MARGIN
+
+    def _violates_arm_keepout(pos_xy: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
+        plate_xy = pos_xy + math_utils.quat_apply(rot, offset_local_const.expand(pos_xy.shape[0], 3))[:, 0:2]
+        d_left = (plate_xy - keepout_left).norm(dim=-1)
+        d_right = (plate_xy - keepout_right).norm(dim=-1)
+        return (d_left < required_dist) | (d_right < required_dist)
+
+    rack_base_xy = rack_default[:, 0:2] + env.scene.env_origins[env_ids][:, 0:2]
+    bad = _violates_arm_keepout(rack_pos[:, 0:2], rack_rot)
+    for _ in range(6):
+        if not bool(bad.any()):
+            break
+        m = int(bad.sum().item())
+        redraw_xy = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (m, 2), device=device)
+        redraw_yaw = yaw_lo + (yaw_hi - yaw_lo) * torch.rand(m, device=device)
+        redraw_yaw_quat = math_utils.quat_from_angle_axis(redraw_yaw, z_axis[bad])
+        rack_pos[bad, 0:2] = rack_base_xy[bad] + redraw_xy
+        rack_rot[bad] = math_utils.quat_mul(redraw_yaw_quat, rack_default[bad, 3:7])
+        bad = _violates_arm_keepout(rack_pos[:, 0:2], rack_rot)
+
     rack.write_root_pose_to_sim(torch.cat([rack_pos, rack_rot], dim=-1), env_ids=env_ids)
     rack.write_root_velocity_to_sim(torch.zeros_like(rack_default[:, 7:13]), env_ids=env_ids)
     # refresh rack.data so root_pos_w/root_quat_w below reflect the write just made, not last
@@ -284,8 +457,8 @@ def randomize_dish_rack_and_plate(
 
     # ── drop the plate into the now-placed rack, with a random lean, and retry on a bad
     # landing ──────────────────────────────────────────────────────────────────────────
-    offset_local = torch.tensor(RACK_TO_PLATE_OFFSET, device=device)
-    plate_local_rot_const = torch.tensor(PLATE_REST_ROT, device=device)
+    offset_local = torch.tensor(rack_to_plate_offset, device=device)
+    plate_local_rot_const = torch.tensor(plate_rest_rot, device=device)
     lean_range_list = [plate_lean_jitter_deg.get(key, (0.0, 0.0)) for key in ("roll", "pitch")]
     lean_ranges = torch.deg2rad(torch.tensor(lean_range_list, device=device))
     drop_offset = torch.tensor([0.0, 0.0, plate_drop_height], device=device)
@@ -382,23 +555,32 @@ def _toss_and_settle_rag(
         nominal_xy = nodal_state[..., 0:2].mean(dim=1)
         rack_xy = rack.data.root_pos_w[ids, 0:2]
         target_xy = nominal_xy + pos_offset[:, 0:2]
-        delta = target_xy - rack_xy
-        dist = delta.norm(dim=-1).clamp_min(1e-6)
         required = min_rack_separation + rack_avoid_margin
-        push = (required - dist).clamp_min(0.0)
-        direction = delta / dist.unsqueeze(-1)
-        target_xy = target_xy + direction * push.unsqueeze(-1)
-        # Clamp to a safe pad-interior box regardless of how far the push above needed to go.
-        # Verified: an unclamped push could land the rag off the pad entirely (one case pushed to
-        # y=0.42, past the pad's actual y limit of 0.285) when the rack happened to sit right
-        # where the push had to send it -- landed on the floor below, z~0. Bounds leave margin for
-        # the rag's own ~0.3x0.3m extent plus tumble drift, not just its centroid. This can, in
-        # rare cases, mean the clamped landing ends up closer to the rack than
-        # min_rack_separation asked for -- accepted, since "off the pad entirely" is a worse
-        # failure than "separation margin a bit tighter than intended" and the retry loop below
-        # still gets a chance to reject it either way.
-        target_xy[:, 0] = target_xy[:, 0].clamp(0.13, 0.45)
-        target_xy[:, 1] = target_xy[:, 1].clamp(-0.22, 0.22)
+        # Push-then-clamp, iterated: verified (10-trial visual check, plate_wiping asset-fix
+        # conversation) that a SINGLE push-then-clamp pass could still leave the rag visibly
+        # touching the rack/gripper in ~30-40% of resets. Root cause -- the push moves straight
+        # away from the rack along whatever direction the (random) pre-push target happened to be
+        # in; if that direction points at a nearby pad-boundary wall, clamping cuts the push short
+        # RIGHT THERE, even when a different direction (e.g. straight down in y) would have had
+        # plenty of room inside the same box to satisfy `required`. Re-deriving the push direction
+        # from the just-clamped position and repeating converges toward a corner/edge of the box
+        # that actually clears the rack, in the many cases where the box does contain one -- one
+        # push along a fixed, possibly-unlucky direction does not.
+        for _ in range(4):
+            delta = target_xy - rack_xy
+            dist = delta.norm(dim=-1).clamp_min(1e-6)
+            push = (required - dist).clamp_min(0.0)
+            if not bool((push > 0.0).any()):
+                break
+            direction = delta / dist.unsqueeze(-1)
+            target_xy = target_xy + direction * push.unsqueeze(-1)
+            # Clamp to a safe pad-interior box every iteration, not just at the end -- verified
+            # separately that an unclamped push could land the rag off the pad entirely (one case
+            # pushed to y=0.42, past the pad's actual y limit of 0.285), landing on the floor
+            # below (z~0). Bounds leave margin for the rag's own ~0.3x0.3m extent plus tumble
+            # drift, not just its centroid.
+            target_xy[:, 0] = target_xy[:, 0].clamp(0.13, 0.45)
+            target_xy[:, 1] = target_xy[:, 1].clamp(-0.22, 0.22)
         pos_offset[:, 0:2] = target_xy - nominal_xy
 
     tilt_range_list = [tilt_range_deg.get(key, (0.0, 0.0)) for key in ("roll", "pitch", "yaw")]
@@ -600,6 +782,65 @@ def freeze_dynamic_props(
             asset.write_root_velocity_to_sim(torch.zeros((len(env_ids), 6), device=asset.device), env_ids=env_ids)
 
 
+def apply_plate_size(env_cfg, size: str) -> str:
+    """Switch an already-constructed ``OpenarmPlateWipeEnvCfg`` between the "small" (default) and
+    "large" plate -- same post-hoc-mutation pattern ``record_demos_openarm.py`` already uses for
+    the pick-up task's ``--randomize_object_size`` (``openarm_task_modes.attach_object_size_randomization``):
+    called on the ``env_cfg`` returned by ``parse_env_cfg`` before ``gym.make``, not a constructor
+    argument, since gym's task registry only takes an env cfg INSTANCE, not extra kwargs to build
+    one with.
+
+    Mutates three things, all needed together -- setting only the spawn scale would leave the
+    plate visually resized but still targeting the OTHER size's measured rest pose, landing it
+    wrong every reset (or failing ``plate_height_tolerance``/``plate_xy_tolerance`` every attempt):
+      1. ``env_cfg.scene.plate.spawn.scale`` -- the actual mesh scale.
+      2. ``env_cfg.scene.plate.init_state.pos``/``rot`` -- the pose the plate first spawns at,
+         before any reset event has run once.
+      3. ``env_cfg.events.randomize_dish_rack_and_plate.params["rack_to_plate_offset"``/
+         ``"plate_rest_rot"]`` -- what every SUBSEQUENT reset targets. See ``PLATE_SIZE_CONFIGS``'
+         docstring for why these three must be looked up together per size rather than the small
+         plate's rest pose being derived by rescaling the large plate's.
+
+    Args:
+        env_cfg: An ``OpenarmPlateWipeEnvCfg`` instance (or any cfg with a ``scene.plate`` and an
+            ``events.randomize_dish_rack_and_plate`` event term shaped like this task's).
+        size: ``"small"`` or ``"large"``.
+
+    Returns:
+        A one-line summary suitable for printing, matching the
+        ``attach_object_size_randomization`` convention.
+
+    Raises:
+        ValueError: ``size`` isn't a known key of ``PLATE_SIZE_CONFIGS``, or ``env_cfg`` doesn't
+            look like this task's config (no ``scene.plate``) -- e.g. called against a task other
+            than the plate-wiping one.
+    """
+    if size not in PLATE_SIZE_CONFIGS:
+        raise ValueError(f"Unknown plate size '{size}'. Valid options: {list(PLATE_SIZE_CONFIGS)}.")
+    if getattr(env_cfg.scene, "plate", None) is None:
+        raise ValueError(
+            "apply_plate_size: env_cfg.scene has no 'plate' entity -- is this the plate-wiping task?"
+        )
+
+    cfg = PLATE_SIZE_CONFIGS[size]
+    scale = cfg["scale"]
+    offset = cfg["offset"]
+    rot = cfg["rot"]
+    pos = _plate_rest_pos(offset)
+
+    env_cfg.scene.plate.spawn.scale = (scale, scale, scale)
+    env_cfg.scene.plate.init_state.pos = pos
+    env_cfg.scene.plate.init_state.rot = rot
+
+    rack_plate_event = env_cfg.events.randomize_dish_rack_and_plate
+    rack_plate_event.params["rack_to_plate_offset"] = offset
+    rack_plate_event.params["plate_rest_rot"] = rot
+    rack_plate_event.params["plate_radius"] = cfg["radius"]
+
+    outer_cm = 26.0 * scale
+    return f"plate size = '{size}' (outer diameter ~{outer_cm:.1f}cm, spawn scale {scale:.4f})"
+
+
 @configclass
 class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
     """Raw-teleop plate-wiping scene: dish rack + plate + rag, no auto subtask/success signals.
@@ -645,11 +886,18 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
             spawn=sim_utils.UsdFileCfg(usd_path=RACK_USD_PATH),
         )
 
-        # ── Plate: dynamic, spawned already resting in the rack ─────────────
+        # ── Plate: dynamic, spawned already resting in the rack. Defaults to the SMALL size
+        # (DEFAULT_PLATE_SIZE) -- call apply_plate_size(env_cfg, "large") after construction to
+        # switch, same post-hoc-mutation pattern record_demos_openarm.py already uses for the
+        # pick-up task's --randomize_object_size. See PLATE_SIZE_CONFIGS' docstring for why the
+        # small/large variants need their own measured offset/rotation, not just a rescaled copy.
         self.scene.plate = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Plate",
             init_state=RigidObjectCfg.InitialStateCfg(pos=PLATE_REST_POS, rot=PLATE_REST_ROT),
-            spawn=sim_utils.UsdFileCfg(usd_path=PLATE_USD_PATH),
+            spawn=sim_utils.UsdFileCfg(
+                usd_path=PLATE_USD_PATH,
+                scale=(PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["scale"],) * 3,
+            ),
         )
 
         # ── Rag: dynamic PhysX deformable (soft) body, spawned flat on the pad's left side
@@ -705,10 +953,15 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # settle_steps safe to trim back down here: the plate keeps getting "free" extra
                 # settling from randomize_rag's own steps regardless, and gets a final hard freeze
                 # either way, so this doesn't need to fully converge entirely on its own anymore.
-                "settle_steps": 80,
+                "settle_steps": 150,
                 "max_attempts": 6,
                 "rack_cfg": SceneEntityCfg("dish_rack"),
                 "plate_cfg": SceneEntityCfg("plate"),
+                # Explicit (not just relying on the function's own defaults) so apply_plate_size
+                # has a guaranteed key to overwrite in this dict for the non-default plate size.
+                "rack_to_plate_offset": PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["offset"],
+                "plate_rest_rot": PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["rot"],
+                "plate_radius": PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["radius"],
             },
         )
         self.events.randomize_rag = EventTerm(

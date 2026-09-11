@@ -139,6 +139,26 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--plate_size",
+    type=str,
+    default="small",
+    choices=["small", "large"],
+    help=(
+        "Isaac-PlateWipe-OpenArm-IK-Abs-v0 only: which plate to spawn. 'small' (the default) is"
+        " the same plate.usd mesh uniformly scaled down to a ~19cm outer / ~14cm inner diameter"
+        " (plate.usd's own inner:outer ratio already lands almost exactly on those numbers under"
+        " that scale -- no separate small-plate asset was needed). 'large' is plate.usd at its"
+        " native ~26cm outer / ~19cm inner diameter. The two are NOT just a rescaled copy of the"
+        " same resting pose: dish_rack_kinematic.usdc's peg spacing is fixed geometry sized around"
+        " the large plate's rim, and the small plate is small enough to just settle nearly flat"
+        " across the tops of the pegs instead of leaning against them the way the large plate"
+        " does -- each size's rest-in-rack pose (used both for the initial spawn and for what every"
+        " reset's physics-drop targets) was measured separately by actually dropping that size"
+        " onto the rack and reading back where it settled. See"
+        " isaaclab_tasks/.../config/openarm/plate_wipe_ik_abs_env_cfg.py's PLATE_SIZE_CONFIGS."
+    ),
+)
+parser.add_argument(
     "--object_length_range",
     type=float,
     nargs=2,
@@ -552,6 +572,9 @@ from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task
     CAN_TARGET_TASKS,
     CONTROLLED_ARMS,
     apply_task_mode,
+)
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.plate_wipe_ik_abs_env_cfg import (
+    apply_plate_size,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -2252,6 +2275,13 @@ def main():
             logger.error(str(e))
             return
         print(f"[OBJ SIZE] {summary}")
+
+    # Plate size: gated on the env actually having a "plate" scene entity (only
+    # Isaac-PlateWipe-OpenArm-IK-Abs-v0 does) so --plate_size's "small" default doesn't force
+    # every other task to care about it or hit apply_plate_size's "no such entity" ValueError.
+    if getattr(env_cfg.scene, "plate", None) is not None:
+        summary = apply_plate_size(env_cfg, args_cli.plate_size)
+        print(f"[PLATE SIZE] {summary}")
 
     if args_cli.teleop_device == "vr_joint_ros2":
         try:
