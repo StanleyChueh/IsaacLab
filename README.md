@@ -153,6 +153,22 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_V9_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5     --generation_num_trials 50 --num_envs 4 --enable_cameras     --enable_domain_randomization --task_mode handover --domain_randomization_profile full --randomize_object_size
 ```
 
+### Generate augemented dataset w domain randomization(background changing and camera shaking)
+
+with --enable_camera_shake
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
+    --input_file logs/demos/pickup_pringles_V9_annotated.hdf5 \
+    --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5 \
+    --generation_num_trials 50 --num_envs 4 --enable_cameras \
+    --enable_domain_randomization --task_mode handover --domain_randomization_profile full \
+    --randomize_object_size --enable_camera_shake
+```
+
+
 # Convert HDF5 to LeRobot format 
 
 ```
