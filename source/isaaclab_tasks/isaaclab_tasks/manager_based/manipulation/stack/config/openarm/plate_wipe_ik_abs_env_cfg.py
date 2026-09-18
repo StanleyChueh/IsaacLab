@@ -115,9 +115,11 @@ stage-machine / subtask-signal layer against real measurements the same way the 
 was, instead of guessing thresholds blind.
 """
 
+import glob
 import math
 import os
 
+import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -136,6 +138,13 @@ RACK_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "dish_rack_kinematic.usdc")
 PLATE_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "plate.usd")
 RAG_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "blue_rag", "blue_rag_deformable.usdc")
 
+# See stack_joint_pos_env_cfg.py's PAD_NEAR_EDGE_X/PAD_SIZE_X/PAD_SIZE_Y for where these come from.
+# Named here (not just inlined as literals) because _place_rag_crumpled derives its PER-ENV,
+# radius-aware placement box from them -- see that function's docstring for why a fixed box that
+# doesn't account for the object's own radius let the rag hang off the real pad edge.
+PAD_X_RANGE = (0.03, 0.51)
+PAD_Y_RANGE = (-0.285, 0.285)
+
 # Toward the pad's far side (pad spans x:[0.03,0.51], y:[-0.285,0.285] -- see
 # stack_joint_pos_env_cfg.py's PAD_NEAR_EDGE_X/PAD_SIZE_X/PAD_SIZE_Y), not off to the right side,
 # and not near-edge either. History: RACK_POS = (0.30, -0.15, 0.28) sat close enough to the right
@@ -152,7 +161,40 @@ RAG_USD_PATH = os.path.join(PLATE_WIPING_ASSET_DIR, "blue_rag", "blue_rag_deform
 # [0.30,0.42], i.e. ~9cm clear of the far edge at 0.51, not ~3cm) while still being clearly out
 # past where the robot's own base sat. Same PAD_HEIGHT (0.28m) top the plate-drop measurement sim
 # used.
-RACK_POS = (0.36, 0.0, 0.28)
+#
+# REVISED (user feedback: the rack/plate group's full 360deg yaw + wide xy range squeezed the rag's
+# own placement channel between the robot and the rack, and occasionally left the plate visibly
+# NOT seated in the rack -- both traced to the same cause, the rack's own randomization being wider
+# than it needs to be for this task's actual requirement. Per direct instruction: the rack now
+# spawns in only ONE fixed orientation -- the same one RACK_TO_PLATE_OFFSET/PLATE_REST_ROT were
+# measured against in the first place (see those constants' docstrings) -- rather than a random yaw
+# every reset; a wrong-looking plate-on-rack result is far more likely when the composed
+# offset/rotation math has to hold up under an arbitrary yaw than when it never has to. Moved out to
+# 0.40 (from 0.36) to hand the freed-up near-robot space to the rag's own channel -- still ~9cm
+# clear of the far edge at 0.51 even with pose_range trimmed down alongside this (see the event
+# params below).
+#
+# REVISED AGAIN (user feedback: wanted still more room freed up near the robot for the rag, now
+# that the rack spawns rotated 90deg -- see RACK_REST_ROT below -- and no longer needs as much Y
+# clearance from the arms). 0.44 keeps pose_range's reach (x in [0.42,0.46] at the current +-0.02
+# range) ~5cm clear of the far edge at 0.51 -- less margin than 0.40's ~9cm, but still comfortably
+# more than the ~3cm gap that was directly observed to tip the rack/plate off the pad in the 0.36->
+# 0.40 investigation above, and the narrower post-rotation Y footprint means there's no longer a
+# competing need to keep x low for arm clearance.
+RACK_POS = (0.44, 0.0, 0.28)
+
+# REVISED (user feedback + direct verification via rack_yaw_check.py, a script that renders the
+# bare rack at yaw in {0, 90, -90, 180}): at the identity yaw used above, the rack's own bracket
+# is WIDE along its local Y axis -- top-down, its two support arms run left-right, spanning close
+# to both ARM_KEEPOUT_XY_LEFT/_RIGHT and clearly the "horizontal" orientation the user flagged as
+# eating the arms' workspace. A 90deg yaw about Z swaps that: the wide bracket axis now runs along
+# world X (toward/away from the robot -- "vertical" in the top-down camera the user was looking
+# at), leaving a narrow footprint in Y right where the arms need clearance. RACK_TO_PLATE_OFFSET is
+# purely vertical (0,0,z) and PLATE_REST_ROT/the randomize event's own jitter are both expressed
+# RELATIVE to the rack's frame (composed as rack_rot * local_rot, see
+# randomize_dish_rack_and_plate), so rotating this base orientation carries the plate's lean along
+# for free -- no separate retuning needed.
+RACK_REST_ROT = (0.7071067811865476, 0.0, 0.0, 0.7071067811865476)
 
 # The plate comes in two sizes -- see PLATE_SIZE_CONFIGS below for the full explanation of why
 # each size needs its OWN measured rest pose, not just a scaled copy of the other's.
@@ -189,6 +231,11 @@ PLATE_SCALE_LARGE = 1.0
 # xy/yaw and the plate's own lean jitter -- consistent with the plate's bottom rim resting on the
 # rack's tray floor while the rest of the disc leans against a peg for lateral support, the same
 # relationship RACK_TO_PLATE_OFFSET_SMALL's docstring found for the small plate at its own radius.
+# NOTE: NOT yet re-verified against RACK_REST_ROT's 90deg rack rotation -- see
+# RACK_TO_PLATE_OFFSET_SMALL's docstring for why the old identity-rack values can't just be reused
+# as-is (a real drop test with these values landed unstable/nearly-flat, not caught in the slot).
+# DEFAULT_PLATE_SIZE is "small", so this hasn't blocked anything yet, but re-measure the same way
+# (plate_finalize.py) before actually using apply_plate_size(env_cfg, "large").
 RACK_TO_PLATE_OFFSET_LARGE = (0.0, 0.0, 0.13)
 PLATE_REST_ROT_LARGE = (0.7372773289680481, 0.6755901575088501, 0.0, 0.0)
 
@@ -234,8 +281,29 @@ PLATE_SCALE_SMALL = 19.0 / 26.0
 # of those confirm it visually as a plate genuinely leaning IN the peg cluster (one edge caught,
 # other side clear of the rack), not floating apart from it or perched flat on the peg tips (the
 # centered-and-shallow failure mode above).
-RACK_TO_PLATE_OFFSET_SMALL = (0.0, 0.0, 0.095)
-PLATE_REST_ROT_SMALL = (0.7372773289680481, 0.6755901575088501, 0.0, 0.0)
+# REVISED (re-measured after RACK_REST_ROT's 90deg rack rotation): the composed-rotation approach
+# -- keep this offset/rot as-is and let randomize_dish_rack_and_plate's own
+# ``target_rot = rack_rot * local_rot`` carry it along -- is mathematically a rigid re-yaw of the
+# whole rack+plate configuration and SHOULD preserve the same relative contact, but direct
+# verification (plate_settle_diag.py: wrote the composed target_rot with the rotated rack, then let
+# the event's own settle_steps run) instead showed the plate visibly rocking/tumbling away from
+# that target every time (85deg tilt at write-time -> 98deg at 5 steps -> 66deg at 15 -> 134deg at
+# 50, never converging) -- NOT a small settle, a genuinely different and unpredictable landing each
+# reset, which lines up exactly with the user's screenshot showing the plate floating flat above
+# the rack instead of leaning in it. Root cause (plate_finalize.py's bbox/drop investigation): the
+# small plate's inner hole is wider than the peg cluster's own footprint (see the "flat drop" note
+# below), so which local axis the lean happens about and where the drop starts BOTH matter for
+# which contact it actually catches -- rolling about the rack's local X axis (correct for the old
+# identity-yaw rack) no longer catches the same way once local X points along a different world
+# direction. Re-measured with a REAL drop (not a direct write) against the rotated rack: leaning
+# about local Y (pitch, not roll) 85deg, started ~2.5cm off-origin along the rack's local X and a
+# small height above, converges to a genuinely stationary rest (speed/angspeed ~1e-4, not just
+# "under a loose tolerance") that visibly reads as caught in the peg slot, not floating -- see
+# plate_finalize.py. RACK_TO_PLATE_OFFSET_SMALL/PLATE_REST_ROT_SMALL below are that measured local
+# offset/rotation (in the rack's own frame, so they still compose correctly if yaw_range_deg is
+# ever widened again).
+RACK_TO_PLATE_OFFSET_SMALL = (0.0249, -0.00002, 0.09276)
+PLATE_REST_ROT_SMALL = (0.76827, 0.00023, 0.64012, 0.00027)
 
 # Outer radius of the plate disc itself (native mesh measured at 26cm outer diameter -> 13cm
 # radius, scaled the same way as the spawn scale). Needed so randomize_dish_rack_and_plate can
@@ -284,6 +352,31 @@ ARM_KEEPOUT_RADIUS = 0.02
 # without rejecting so much of the pad that resampling stops converging.
 ARM_KEEPOUT_MARGIN = 0.03
 
+# REVISED (user feedback: the rag "penetrating" the arm, visibly draped across its FOREARM, not
+# just close to the fingertip cluster -- verified directly via robot.data.body_pos_w at the default
+# reset pose, same methodology ARM_KEEPOUT_XY_LEFT/_RIGHT themselves were measured with): those two
+# constants are a single averaged POINT for the gripper/camera cluster, and that's fine for the
+# plate above (its own radius already dominates required clearance, see ARM_KEEPOUT_RADIUS's
+# comment) -- but measuring the actual link chain shows link5 through the fingers forms a nearly
+# straight ~20cm SEGMENT at close to constant y (x runs ~0.08 to ~0.28 while y stays ~0.153-0.154
+# the whole way), not a point. Pushing the rag away from just the far end of that segment (what the
+# point-based keepout was doing) can push it laterally ALONG the segment's own length instead of
+# away from it -- exactly the failure the screenshots showed. _place_rag_crumpled's arm-avoidance
+# push uses point-to-SEGMENT distance against this instead of point-to-point, so "away from the arm"
+# means away from the nearest part of the whole forearm, not just its end.
+ARM_FOREARM_SEGMENT_LEFT = ((0.08, 0.154), (0.28, 0.154))
+ARM_FOREARM_SEGMENT_RIGHT = ((0.08, -0.154), (0.28, -0.154))
+
+
+def _closest_point_on_segment(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Closest point on segment ``a``-``b`` to each xy point in ``p`` -- all ``(..., 2)`` tensors,
+    ``a``/``b`` broadcastable against ``p``. Standard clamped-projection formula."""
+    ab = b - a
+    ab_len_sq = (ab * ab).sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    t = ((p - a) * ab).sum(dim=-1, keepdim=True) / ab_len_sq
+    t = t.clamp(0.0, 1.0)
+    return a + t * ab
+
 
 def _plate_rest_pos(offset: tuple[float, float, float]) -> tuple[float, float, float]:
     return (RACK_POS[0] + offset[0], RACK_POS[1] + offset[1], RACK_POS[2] + offset[2])
@@ -299,8 +392,86 @@ PLATE_REST_POS = _plate_rest_pos(RACK_TO_PLATE_OFFSET)
 
 # Measured the same way: dropped flat onto the pad (as a PhysX deformable body, not a rigid
 # collider -- see this module's docstring) and read back its settled nodal centroid.
-RAG_REST_POS = (0.30, 0.15, 0.2811)
+#
+# REVISED (user feedback: rag spawns too close to the robot body): the original (0.30, 0.15) put
+# the rag's nominal centroid only ~4cm from ARM_KEEPOUT_XY_LEFT (0.26, 0.153) -- the left arm's OWN
+# resting gripper/camera cluster -- so body_cam renders consistently showed the rag landing right
+# up against or draped over the arm hardware, not just "on the pad near the arm." Verified via the
+# same gym.make + real env.reset() methodology used for the plate fixes above (root/nodal state
+# logged and body_cam rendered every reset).
+#
+# REVISED AGAIN (user feedback after trying (0.18, 0.20) live: still too close to the robot body):
+# that first fix only optimized distance from the arm's resting GRIPPER cluster -- it actually
+# moved x from 0.30 down to 0.18, i.e. noticeably CLOSER to the robot's own base/mount at x=0 than
+# the original was, even though it was farther from the gripper cluster specifically. "Robot body"
+# is the whole robot -- base included, not just where the idle gripper happens to hang -- so pulling
+# x in toward the base traded one kind of closeness for another instead of fixing it.
+# (0.35, 0.18) instead pushes OUT in x (~39cm from the robot origin, farther than the ORIGINAL
+# (0.30, 0.15)'s ~33cm, not just farther than the first attempt's ~27cm) while keeping y far enough
+# from ARM_KEEPOUT_XY_LEFT's y=0.153 for ~9cm clearance from the gripper cluster too -- both
+# distances improved together this time, not traded off against each other. Still within the
+# pick-up task's reach-validated x band (see cube_2's pose_range in pickup_ik_abs_env_cfg.py) and
+# with enough margin from the pad's y=0.285 edge for the toss's own tumble drift not to carry it
+# off the pad (an earlier y=0.24 attempt did exactly that -- fell off the pad edge in 3 of 8 test
+# resets; see the randomize_rag event's params below for the toss energy this pairs with).
+#
+# REVISED AGAIN (this task moved from a toss to direct template placement -- see
+# _place_rag_crumpled -- which now derives its own per-env, radius-aware safe box from PAD_X_RANGE/
+# PAD_Y_RANGE and actively pushes clear of both arms every reset; see that function and RAG_SCALE's
+# docstrings). This nominal spot barely matters any more beyond being A reasonable starting point
+# for that push -- (0.35, 0.18) sits almost exactly ON the arm's own keepout circle at RAG_SCALE, so
+# the push was doing all the real work anyway. (0.30, 0.12) is closer to the actual feasible
+# placement region worked out for RAG_SCALE (see that constant's docstring), so a typical reset
+# pushes less far from its starting point -- purely a minor efficiency/predictability tweak, not a
+# correctness one, since the push+clamp guarantees a valid final position regardless of where this
+# starts.
+#
+# REVISED AGAIN (user feedback + suggestion: occasional arm contact persisted, at y=0.12 the rag
+# sits notably closer to the LEFT arm than the right one, so the push only ever has to fight ONE
+# keepout circle at a time and only has the narrow strip between that circle and the pad edge to
+# work with -- user's own suggestion was to use the gap BETWEEN the two arms instead). y=0 is
+# equidistant from ARM_KEEPOUT_XY_LEFT/_RIGHT by construction (they're mirrored about y=0), so a
+# nominal spot there starts already roughly clearing both keepouts before the push even runs, rather
+# than starting deep inside one of them -- checked directly: (0.18, 0.0) is ~17.7cm from EITHER
+# arm's keepout point already, versus (0.30, 0.12)'s ~5cm from the left one alone. The push-then-
+# clamp loop still runs every reset (this is a better STARTING point, not a substitute for it).
+#
+# REVISED AGAIN (user feedback: narrowed the rack's own randomization and moved RACK_POS out to
+# 0.40 specifically to hand the freed-up near-robot space to the rag -- see RACK_POS's docstring).
+# Nudged x from 0.18 to 0.22 to actually use that freed room (still ~15.8cm from either arm's
+# keepout point, comfortably clearing arm_required at this rag's typical planar_radius) instead of
+# leaving it clustered near the robot-side edge of its own placement channel.
+RAG_REST_POS = (0.22, 0.0, 0.2811)
 RAG_REST_ROT = (1.0, 0.0, 0.0, 0.0)
+
+# REVISED (user feedback: the rag "penetrates the robot arm oftenly"): at native scale, this rag's
+# own crumpled footprint (~20cm planar radius -- see _load_rag_crumple_template_radii's docstring)
+# is simply too big to place with real clearance from the left arm's resting gripper cluster
+# anywhere reachable on this pad -- the two arms are only ~31cm apart center-to-center, so a
+# keepout circle at that radius from EACH arm nearly spans the whole gap between them, same problem
+# the plate already solves with a small/large SCALE option (see PLATE_SIZE_CONFIGS), not by pushing
+# harder.
+#
+# REVISED AGAIN, then REVERTED (user feedback: still sometimes hangs off / falls off the pad edge,
+# and still reads as flat where it lands): tried 0.5 next, reasoning that 0.65's ~10-12.5cm crumpled
+# radius was right at the edge of geometric feasibility (worked out analytically -- the max radius
+# that can clear BOTH the arm-keepout requirement and keep the full footprint, not just the
+# centroid, inset from the pad's real edges comes out to ~0.115m) rather than comfortably inside it.
+# 0.5 (~8.8cm radius) IS comfortably inside that geometric region -- but broke something else: this
+# rag's PhysX deformable material (self-collision filter distance, stiffness) is authored as
+# ABSOLUTE values in the USD, not something UsdFileCfg.scale rescales along with the mesh geometry.
+# Shrunk far enough, those fixed absolute values become relatively too stiff for the now-smaller
+# mesh, and a placed crumple springs back toward flat almost immediately instead of holding its
+# fold -- verified directly: at 0.5, 13 of 15 resets collapsed to near-zero z-spread within the same
+# settle_steps that held a real crumple fine at 0.65 (0.65's own instability was mild by comparison
+# -- mostly held shape, one low outlier). The scene-wide disturbance from that instability even
+# knocked the plate over in a couple of those 0.5-scale resets. So back to 0.65 -- the actual fix
+# for pad-edge overhang is the per-env radius-aware placement box in _place_rag_crumpled (a real
+# bug, independent of scale: it clamped the CENTROID without ever subtracting the object's own
+# radius from the bounds), and the arm clearance is now a partial (not full) keepout factor -- see
+# that function's docstring for why full clearance genuinely isn't achievable at 0.65 either, and
+# what "partial" means concretely.
+RAG_SCALE = 0.65
 
 
 def _settle_plate(
@@ -311,14 +482,16 @@ def _settle_plate(
     start_rot: torch.Tensor,
     settle_steps: int,
 ):
-    """Write the plate to a starting pose (typically hovering a little above where it should end
-    up resting) with zero velocity, then physically step it forward so gravity/contact settles it
-    -- rather than teleporting straight into a hand-picked "resting" pose the way this task did
-    before. Mirrors ``_toss_and_settle_rag``'s reasoning for why stepping physics inside a "reset"
-    event is safe (see ``randomize_rag_drop``'s docstring): every "reset"-mode event runs before
-    the episode's first observation is computed, so the settled result IS the starting state.
+    """Write the plate directly to its known-good target pose (see
+    ``randomize_dish_rack_and_plate``'s docstring for why this is a direct write now, not a drop
+    from height) with zero velocity, then physically step it forward a short, fixed number of
+    steps so contact can relax away the last mm or two of interpenetration an analytic pose leaves
+    -- not to discover whether the pose itself is valid, which prior measurement already settled.
+    Stepping physics inside a "reset" event is safe here for the same reason it's safe in
+    ``randomize_rag_drop``: every "reset"-mode event runs before the episode's first observation is
+    computed, so the settled result IS the starting state.
 
-    Ends by explicitly zeroing the plate's velocity, the same "hard freeze" ``_toss_and_settle_rag``
+    Ends by explicitly zeroing the plate's velocity, the same "hard freeze" ``_place_rag_crumpled``
     uses and for the same reason: verified directly (root_lin_vel_w read right after a reset, before
     this fix existed) that some resets left the plate still moving at up to ~0.5 m/s -- a lean angle
     that only finishes settling into full contact gradually, still sliding/rocking slightly when
@@ -344,11 +517,7 @@ def randomize_dish_rack_and_plate(
     pose_range: dict[str, tuple[float, float]],
     yaw_range_deg: tuple[float, float],
     plate_lean_jitter_deg: dict[str, tuple[float, float]],
-    plate_drop_height: float,
-    plate_height_tolerance: float,
-    plate_xy_tolerance: float,
     settle_steps: int,
-    max_attempts: int,
     rack_cfg: SceneEntityCfg,
     plate_cfg: SceneEntityCfg,
     rack_to_plate_offset: tuple[float, float, float] = RACK_TO_PLATE_OFFSET,
@@ -356,9 +525,9 @@ def randomize_dish_rack_and_plate(
     plate_radius: float = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["radius"],
 ):
     """Place ``dish_rack`` and ``plate`` as one rigid group (shared xy offset AND shared yaw
-    rotation about the rack's own pivot), then separately re-settle the plate's lean within the
-    rack via a small physics drop -- instead of teleporting both into a single hand-measured,
-    always-identical relative pose the way this task did before.
+    rotation about the rack's own pivot), then place the plate DIRECTLY at its known-good leaning
+    pose relative to the rack -- instead of a physics drop-and-retry (what this function used to do)
+    or a single hand-measured, always-identical relative pose (what this task did before that).
 
     Why the rack and plate move together: the plate rests leaning IN the rack (see
     ``rack_to_plate_offset``); randomizing either one independently would drift the plate out of
@@ -368,8 +537,7 @@ def randomize_dish_rack_and_plate(
     (``rack_to_plate_offset`` rotated by the same yaw, ``plate_rest_rot`` composed with the same
     yaw) -- so the plate's target always sits correctly relative to wherever the rack ends up, not
     just the original RACK_POS/PLATE_REST_POS. dish_rack is written directly (kinematic, no
-    settling needed -- see the parent docstring on why it's a RigidObject at all); the plate's
-    target is a STARTING point for a physics drop, not a final write, so its lean can vary.
+    settling needed -- see the parent docstring on why it's a RigidObject at all).
 
     ``rack_to_plate_offset``/``plate_rest_rot`` default to the module-level constants (which
     resolve to whichever size DEFAULT_PLATE_SIZE names), but are real parameters, not just
@@ -377,18 +545,32 @@ def randomize_dish_rack_and_plate(
     instance for the OTHER plate size -- see PLATE_SIZE_CONFIGS' docstring for why the small and
     large plates need genuinely different measured values here, not a scaled copy of one offset.
 
-    Plate leaning direction: rather than trust an arbitrary rotation jitter to still be a physically
-    valid "resting in the rack" configuration (a plate is thin and rigid -- a rotation that isn't
-    actually the shape the rack can support just clips through a wall or tips over), this drops the
-    plate from ``plate_drop_height`` above the group's nominal target with a small extra
-    ``plate_lean_jitter_deg`` roll/pitch tilt (applied in the rack's OWN local frame, i.e. relative
-    to the originally-measured lean, so it means the same thing regardless of the group's yaw), and
-    lets ``settle_steps`` of physics resolve it into whatever valid contact configuration gravity
-    and the (now SDF-collision, see dish_rack_kinematic.usdc) rack actually supports. Checks the
-    settled height against the nominal height (``plate_height_tolerance``) and re-tosses (fresh
-    jitter draw) any env where it doesn't land close to where a plate resting in the rack should be
-    -- e.g. tipped over onto the pad instead of staying in the rack -- up to ``max_attempts`` times,
-    same retry-loop pattern (and same caveat: not an absolute guarantee) as ``randomize_rag_drop``.
+    REVISED (user feedback: resetting -- pressing 'r' in the interactive teleop tool -- took too
+    long; confirmed as real physics-stepping wall time, not a GPU/CPU headroom problem). This used
+    to drop the plate from a small height above the target with a random ``plate_lean_jitter_deg``
+    tilt, physics-settle it for ``settle_steps``, check the settled pose against the target within a
+    tolerance, and retry (fresh jitter draw) up to ``max_attempts`` times on a bad landing -- the
+    same pattern ``randomize_rag_drop`` used for the rag. That was worth it while
+    RACK_TO_PLATE_OFFSET_SMALL/_LARGE and PLATE_REST_ROT_SMALL/_LARGE were still being re-measured
+    (see those constants' own docstrings for that whole history), since physics was the only way to
+    tell a genuinely-caught-by-a-peg lean from one that just clips through the rack. Once measured,
+    though, that same physics settle turned out to be extremely repeatable across yaw/jitter draws
+    ON AVERAGE (verified over 20+ resets per size, both here and while re-measuring those constants:
+    settled root height above the rack varied by around 1cm, xy by a few mm). This writes the
+    jittered target pose directly (no drop offset) and runs a short ``settle_steps`` afterward
+    purely so contact can relax away the last mm or two of interpenetration an analytic pose leaves
+    -- much cheaper than a real drop, since the pose is already known-good, not discovered from
+    scratch.
+
+    A first version of this direct-write removed the tolerance check and retry loop entirely, on
+    the theory that "extremely repeatable on average" meant "always good enough" -- verified WRONG
+    over the next 10-reset check: a small tail of (lean jitter, rack yaw) combinations still produced
+    a genuinely bad landing (one plate ended up ~28cm below the rack, i.e. fell off the pad onto the
+    world ground plane), not just a slower-to-settle one -- a short, fixed settle has no way to catch
+    that a bare write doesn't retry. So a coarse sanity check and a SMALL capped retry (3 attempts,
+    each a fresh jitter draw, each still only the same short settle_steps) are back -- see the
+    function body -- just loose enough to essentially never fire on a normal landing, tight enough to
+    catch a plate that's fallen away from the rack rather than merely leaning a little differently.
     """
     rack = env.scene[rack_cfg.name]
     plate = env.scene[plate_cfg.name]
@@ -455,299 +637,381 @@ def randomize_dish_rack_and_plate(
     env.scene.write_data_to_sim()
     env.scene.update(env.sim.get_physics_dt())
 
-    # ── drop the plate into the now-placed rack, with a random lean, and retry on a bad
-    # landing ──────────────────────────────────────────────────────────────────────────
+    # ── place the plate directly at its known-good leaning pose relative to the now-placed rack,
+    # with a cheap, capped retry on a bad landing -- see docstring for why this isn't a bare,
+    # unchecked write ──────────────────────────────────────────────────────────────────────────
     offset_local = torch.tensor(rack_to_plate_offset, device=device)
     plate_local_rot_const = torch.tensor(plate_rest_rot, device=device)
     lean_range_list = [plate_lean_jitter_deg.get(key, (0.0, 0.0)) for key in ("roll", "pitch")]
     lean_ranges = torch.deg2rad(torch.tensor(lean_range_list, device=device))
-    drop_offset = torch.tensor([0.0, 0.0, plate_drop_height], device=device)
+
+    # read the RACK's actual just-written pose for these envs.
+    rack_pos_now = rack.data.root_pos_w[env_ids]
+    rack_rot_now = rack.data.root_quat_w[env_ids]
 
     pending_ids = env_ids
-    for attempt in range(max_attempts):
+    pending_rack_pos = rack_pos_now
+    pending_rack_rot = rack_rot_now
+    for attempt in range(3):
         m = len(pending_ids)
-        # read the RACK's actual current pose for exactly these envs (indexed by absolute env id,
-        # so this stays correct across retries even as pending_ids shrinks -- no need to carry a
-        # separately-indexed copy of offset_xy/yaw_quat in sync with a shrinking subset).
-        rack_pos_now = rack.data.root_pos_w[pending_ids]
-        rack_rot_now = rack.data.root_quat_w[pending_ids]
-
         lean = math_utils.sample_uniform(lean_ranges[:, 0], lean_ranges[:, 1], (m, 2), device=device)
         lean_quat = math_utils.quat_from_euler_xyz(lean[:, 0], lean[:, 1], torch.zeros(m, device=device))
         # jitter applied in the LOCAL (pre-yaw, as-measured) frame, THEN the group's yaw on top --
         # see docstring on why this order keeps "leaning direction" meaning the same regardless of
         # how the rack itself has been rotated this episode.
         jittered_local_rot = math_utils.quat_mul(lean_quat, plate_local_rot_const.expand(m, 4))
-        start_rot = math_utils.quat_mul(rack_rot_now, jittered_local_rot)
-        start_pos = rack_pos_now + math_utils.quat_apply(rack_rot_now, offset_local.expand(m, 3)) + drop_offset
+        target_rot = math_utils.quat_mul(pending_rack_rot, jittered_local_rot)
+        target_pos = pending_rack_pos + math_utils.quat_apply(pending_rack_rot, offset_local.expand(m, 3))
 
-        _settle_plate(env, plate, pending_ids, start_pos, start_rot, settle_steps)
+        _settle_plate(env, plate, pending_ids, target_pos, target_rot, settle_steps)
 
-        # z doesn't change under a pure yaw-about-z rotation of offset_local, so the expected
-        # height is just the rack's height plus the constant offset -- no need to re-derive it via
-        # quat_apply. xy DOES change under that rotation, so it's derived the same way start_pos
-        # was above.
-        expected_pos = rack_pos_now + math_utils.quat_apply(rack_rot_now, offset_local.expand(m, 3))
+        # coarse sanity check, not a precision tolerance -- direct placement is already known-good
+        # on average (see docstring), this only needs to catch the rare case that fell/got pushed
+        # away during the short settle (e.g. off the rack, or through the pad), not fine-tune the
+        # lean. Generous on purpose so it essentially never fires on a normal landing.
         actual_pos = plate.data.root_pos_w[pending_ids]
-        height_bad = (actual_pos[:, 2] - expected_pos[:, 2]).abs() > plate_height_tolerance
-        # z-only was NOT enough: verified (screenshots from the plate_wiping asset-fix
-        # conversation) that a plate can tip sideways out of the rack and land elsewhere on the
-        # pad while still settling at a height that happened to fall inside plate_height_tolerance
-        # -- e.g. leaning against the rack's OUTSIDE instead of sitting IN it. xy distance from the
-        # expected in-rack position catches that the height check alone missed.
-        xy_bad = (actual_pos[:, 0:2] - expected_pos[:, 0:2]).norm(dim=-1) > plate_xy_tolerance
-        needs_retry = height_bad | xy_bad
-        if not needs_retry.any() or attempt == max_attempts - 1:
+        bad = (actual_pos[:, 2] - target_pos[:, 2]).abs() > 0.08
+        bad |= (actual_pos[:, 0:2] - target_pos[:, 0:2]).norm(dim=-1) > 0.08
+        if not bool(bad.any()) or attempt == 2:
             break
-        pending_ids = pending_ids[needs_retry]
+        pending_ids = pending_ids[bad]
+        pending_rack_pos = pending_rack_pos[bad]
+        pending_rack_rot = pending_rack_rot[bad]
 
 
-def _toss_and_settle_rag(
+RAG_TEMPLATE_DIR = os.path.join(PLATE_WIPING_ASSET_DIR, "rag_crumple_templates")
+_RAG_TEMPLATES_CACHE: dict[str, torch.Tensor] = {}
+
+
+_RAG_TEMPLATE_RADII_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _load_rag_crumple_templates(device: str) -> torch.Tensor:
+    """Load (and cache, per device) the pre-captured crumpled-rag shapes from
+    ``RAG_TEMPLATE_DIR`` as one ``(num_templates, num_nodes, 3)`` tensor, centroid-relative (mean
+    zero on all 3 axes) so a caller can drop any one of them at any target center/yaw with a plain
+    rotate + translate. See ``randomize_rag_drop``'s docstring for why templates replace the
+    physics toss this task used to do at reset time.
+
+    Captured once, offline, by a throwaway script running this task's OLD toss-and-tumble physics
+    (the same ``spin``/``tilt``/height-drop recipe this function used to run every reset) with a
+    generous settle and no time budget, keeping only the landings that came out genuinely crumpled
+    (real z-spread, ranked by that over a large batch -- see the capture script's own history for
+    why footprint, not spread, turned out to be the metric this rag mesh just can't be tuned much
+    below ~30cm on: even the LOWEST-energy tosses tried never produced a footprint under that,
+    across 50+ attempts -- so template selection optimizes for genuinely 3D/creased over flat,
+    accepts that footprint stays roughly rag-sized, and leans on ``_load_rag_crumple_template_radii``
+    /the arm-keepout push in ``_place_rag_crumpled`` to keep that real footprint clear of the arms
+    rather than trying to shrink it away) and saving their settled nodal positions, recentered on
+    their own centroid. Multiple templates (not just one) so resets still look different from each
+    other -- picking a random template plus a random yaw per reset is what stands in for the old
+    toss's own randomness now.
+    """
+    if device not in _RAG_TEMPLATES_CACHE:
+        paths = sorted(glob.glob(os.path.join(RAG_TEMPLATE_DIR, "template_*.npy")))
+        if not paths:
+            raise FileNotFoundError(
+                f"No rag crumple templates found under {RAG_TEMPLATE_DIR} -- randomize_rag_drop "
+                "needs at least one template_*.npy (num_nodes, 3) file, centroid-relative."
+            )
+        arrays = [np.load(p) for p in paths]
+        stacked = np.stack(arrays, axis=0)
+        _RAG_TEMPLATES_CACHE[device] = torch.tensor(stacked, dtype=torch.float32, device=device)
+    return _RAG_TEMPLATES_CACHE[device]
+
+
+def _load_rag_crumple_template_radii(device: str) -> torch.Tensor:
+    """Per-template planar (xy) bounding radius -- max centroid-to-node distance projected onto
+    xy -- as one ``(num_templates,)`` tensor. A CIRCULAR bound, not the tighter rectangular
+    footprint the capture script filtered on, specifically because ``_place_rag_crumpled`` applies
+    a random YAW to each template before placing it: a rectangular footprint's own extent changes
+    with yaw, a circular one doesn't, so this is what the arm-keepout push there can actually rely
+    on being correct regardless of which way a given placement happens to be rotated.
+    """
+    if device not in _RAG_TEMPLATE_RADII_CACHE:
+        templates = _load_rag_crumple_templates(device)
+        planar = templates[..., 0:2]
+        radii = planar.norm(dim=-1).amax(dim=-1)
+        _RAG_TEMPLATE_RADII_CACHE[device] = radii
+    return _RAG_TEMPLATE_RADII_CACHE[device]
+
+
+def _place_rag_crumpled(
     env: ManagerBasedEnv,
     rag: DeformableObject,
     ids: torch.Tensor,
     position_range: dict[str, tuple[float, float]],
-    tilt_range_deg: dict[str, tuple[float, float]],
-    spin_rate_range: tuple[float, float],
     settle_steps: int,
     rack=None,
     min_rack_separation: float = 0.0,
     rack_avoid_margin: float = 0.05,
 ):
-    """One toss-and-settle pass for the given (sub)set of env ids. Factored out of
-    ``randomize_rag_drop`` so that function can call this again, on just the envs that are still
-    too flat, instead of re-tossing envs that already landed wrinkled.
+    """Drop a random pre-crumpled template (see ``_load_rag_crumple_templates``) at a random
+    yaw and a randomized xy target near the rag's own nominal spawn position, write it straight to
+    sim, and run a short, fixed settle purely to relax the couple mm of self-penetration a raw
+    rigid transform of a real, non-convex crumpled shape can leave at its folds -- NOT to discover
+    whether the shape is crumpled, which the template already guarantees.
 
-    Ends by explicitly zeroing nodal velocity (not just letting it settle "naturally" via PhysX's
-    own sleep/damping heuristics). Reported symptom this fixes: the rag visibly shaking/jittering
-    once the episode had already started, instead of sitting still -- self-collision contacts on a
-    freshly-crumpled fold can keep chattering at low amplitude (repeatedly resolving a tiny
-    penetration, which reintroduces a tiny velocity, which causes a tiny new penetration next step)
-    well past the point where the shape has visually finished settling, and PhysX's own sleep
-    threshold isn't guaranteed to trip before ``settle_steps`` runs out. A hard zero-velocity write
-    is a stronger guarantee than tuning damping/sleep parameters further: whatever state the mesh
-    is in when this returns, it starts the episode with zero momentum, full stop.
+    Ends by explicitly zeroing nodal velocity, same reasoning ``randomize_rag_drop``'s old
+    toss-based version used: self-collision contacts on a fold can keep chattering at low amplitude
+    past the point the shape has visually finished settling, so a hard zero-velocity write is a
+    stronger guarantee than trusting PhysX's own sleep/damping heuristics to have fully caught up
+    by the time ``settle_steps`` runs out.
 
     If ``rack`` is given, this ACTIVELY pushes the landing target's xy away from the rack's current
     position -- by exactly enough to clear ``min_rack_separation`` (plus ``rack_avoid_margin``),
-    not just resampled and hoped for. This exists because a purely-random retry (draw a fresh
-    ``position_range`` offset, check the result, retry if still too close) turned out not to be
-    enough on its own: randomize_dish_rack_and_plate can now place the rack almost anywhere on the
-    pad, so its placement range can fully swallow the rag's own (much narrower) landing region --
-    verified across 15 resets, ~47% still ended up under min_rack_separation even with
-    position_range widened and max_attempts raised, because for those draws NO offset within
-    position_range could have cleared the requirement; it wasn't a matter of bad luck to retry
-    past. Deterministically pushing the target away from wherever the rack actually is fixes that
-    at the source, and randomization is preserved: the underlying jitter is still random, this just
-    guarantees the result clears the rack regardless of which way that jitter happened to point.
+    not just resampled and hoped for. Unchanged from the old toss-based version -- see git history /
+    the plate_wiping asset-fix conversation for why a single push-then-clamp pass, or a purely
+    random retry, both turned out not to be enough on their own; the iterated push-then-clamp below
+    is what actually converges to a valid, on-pad, clear-of-the-rack target.
+
+    REVISED (user feedback: the rag "penetrates the robot arm oftenly" in the real interactive
+    tool): this rag mesh's real crumpled footprint is roughly rag-sized (~20-25cm across -- see
+    ``_load_rag_crumple_templates``' docstring), while RAG_REST_POS sits close to the arm's own
+    reach by construction (it has to, to stay reachable) -- nowhere near enough clearance for an
+    object this size without an explicit avoidance check. The OLD version only checked/avoided the
+    RACK's position, on the (wrong) assumption that RAG_REST_POS being "far enough" from the arms by
+    construction made an explicit arm check unnecessary -- exactly the same mistake
+    ``ARM_KEEPOUT_XY_LEFT``/``_RIGHT`` already exist to avoid for the plate.
+
+    REVISED AGAIN (same complaint persisted after adding a point-based arm keepout: screenshots
+    showed the rag draped across the arm's FOREARM, not just close to the fingertip cluster).
+    Measured directly (robot.data.body_pos_w at the default reset pose, same way
+    ARM_KEEPOUT_XY_LEFT/_RIGHT were themselves measured) that link5 through the fingers form a
+    nearly straight ~20cm SEGMENT at close to constant y (see ARM_FOREARM_SEGMENT_LEFT/_RIGHT), not
+    a point. Two different fixes built on that measurement -- a batched random-candidate-search, and
+    point-to-SEGMENT distance dropped into the existing push-then-clamp loop -- BOTH caused a reset
+    to hang for many minutes with no GPU activity (i.e. stuck computing, not frozen): whatever
+    position either approach converged to, on some draws, appears to leave PhysX's contact solver
+    stuck resolving something on the very next settle step. Root cause not pinned down given the
+    time already sunk chasing it (two independent, structurally different implementations both
+    triggering it points at something about how large a correction is being asked for near this
+    segment, not a bug specific to either implementation). Reverted BOTH back to the simpler,
+    verified-non-hanging point-based keepout (``ARM_KEEPOUT_XY_LEFT``/``_RIGHT``, same as the
+    plate's own) -- it doesn't fully solve the forearm-overlap complaint (a point still can't
+    represent a whole segment), but it is known stable, which matters more right now. Revisiting the
+    segment model is future work, to be done WITHOUT wiring it straight into a live reset event
+    again until the hang is understood in isolation.
     """
-    nodal_state = rag.data.default_nodal_state_w[ids].clone()
     n = len(ids)
+    templates = _load_rag_crumple_templates(str(rag.device))
+    template_radii = _load_rag_crumple_template_radii(str(rag.device))
+    template_idx = torch.randint(0, templates.shape[0], (n,), device=rag.device)
+    local = templates[template_idx]  # (n, num_nodes, 3), centroid-relative
+    planar_radius = template_radii[template_idx]  # (n,)
 
-    pos_range_list = [position_range.get(key, (0.0, 0.0)) for key in ("x", "y", "z")]
+    nominal_xy = rag.data.default_nodal_state_w[ids][..., 0:2].mean(dim=1)
+
+    pos_range_list = [position_range.get(key, (0.0, 0.0)) for key in ("x", "y")]
     pos_ranges = torch.tensor(pos_range_list, device=rag.device)
-    pos_offset = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (n, 3), device=rag.device)
+    xy_offset = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (n, 2), device=rag.device)
+    target_xy = nominal_xy + xy_offset
 
+    # Point-based keepout (same convention as the plate's ARM_KEEPOUT_RADIUS/_MARGIN) -- see
+    # docstring for why the more accurate segment-based version isn't in use right now.
+    keepout_centers = []
+    keepout_required = []
     if rack is not None and min_rack_separation > 0.0:
-        # the rest shape's own centroid (nodal_state hasn't been transformed yet at this point),
-        # since transform_nodal_pos below applies pos_offset as an ADDITIVE offset on top of
-        # exactly this centroid -- see its docstring in deformable_object.py.
-        nominal_xy = nodal_state[..., 0:2].mean(dim=1)
-        rack_xy = rack.data.root_pos_w[ids, 0:2]
-        target_xy = nominal_xy + pos_offset[:, 0:2]
-        required = min_rack_separation + rack_avoid_margin
-        # Push-then-clamp, iterated: verified (10-trial visual check, plate_wiping asset-fix
-        # conversation) that a SINGLE push-then-clamp pass could still leave the rag visibly
-        # touching the rack/gripper in ~30-40% of resets. Root cause -- the push moves straight
-        # away from the rack along whatever direction the (random) pre-push target happened to be
-        # in; if that direction points at a nearby pad-boundary wall, clamping cuts the push short
-        # RIGHT THERE, even when a different direction (e.g. straight down in y) would have had
-        # plenty of room inside the same box to satisfy `required`. Re-deriving the push direction
-        # from the just-clamped position and repeating converges toward a corner/edge of the box
-        # that actually clears the rack, in the many cases where the box does contain one -- one
-        # push along a fixed, possibly-unlucky direction does not.
-        for _ in range(4):
-            delta = target_xy - rack_xy
+        keepout_centers.append(rack.data.root_pos_w[ids, 0:2])
+        keepout_required.append(torch.full((n,), min_rack_separation + rack_avoid_margin, device=rag.device))
+    arm_required = 0.85 * planar_radius + ARM_KEEPOUT_RADIUS + ARM_KEEPOUT_MARGIN
+    keepout_centers.append(torch.tensor(ARM_KEEPOUT_XY_LEFT, device=rag.device).expand(n, 2))
+    keepout_required.append(arm_required)
+    keepout_centers.append(torch.tensor(ARM_KEEPOUT_XY_RIGHT, device=rag.device).expand(n, 2))
+    keepout_required.append(arm_required)
+
+    # Pad-interior box derived PER-ENV from each env's own planar_radius -- NOT a fixed constant.
+    # A first version clamped the CENTROID to a fixed box picked to roughly line up with the pad
+    # edges, without subtracting the rag's own radius from it -- so the box let the centroid sit
+    # close enough to a real edge that the template's outer extent (which the box never accounted
+    # for) still hung past it, letting the rag slide/tumble off the pad edge in practice (verified:
+    # exactly the failure the user reported). Insetting these bounds by planar_radius + a small
+    # margin on every side is what actually keeps the FULL footprint on the pad, not just its center.
+    #
+    # REVISED (RAG_REST_POS moved to the GAP BETWEEN the two arms, y=0, instead of tucked to the
+    # left arm's side -- see that constant's docstring): the box now stays CENTERED around that gap
+    # (a symmetric +-0.15m y band) rather than spanning from just off the pad edge all the way to
+    # y=0.02, and capped in x to the channel between the robot base and the rack's own roaming zone
+    # (x~0.30-0.42) -- both bounded with min/max against the true pad-margin inset so a large
+    # planar_radius still can't push the box outside the real pad. Old y range (0.02 up to the pad
+    # edge at 0.285) meant a violating draw only ever had ONE direction to escape toward (further
+    # from the pad edge, i.e. further into the left arm) and comparatively little room before hitting
+    # that edge; centering the box gives the push room on both sides of a central position that
+    # already starts roughly equidistant from both arms.
+    # x_hi raised 0.30 -> 0.34 alongside RACK_POS moving out to 0.40 with a tighter own pose_range
+    # (now x:[0.38,0.42] -- see that constant's docstring): still comfortably clear of the rack's
+    # new, narrower roaming zone even before the dynamic min_rack_separation push below runs, while
+    # handing the rag the room RACK_POS's own move freed up instead of leaving it unused.
+    pad_margin = 0.02
+    x_lo = torch.maximum(PAD_X_RANGE[0] + planar_radius + pad_margin, torch.full_like(planar_radius, 0.14))
+    x_hi = torch.minimum(PAD_X_RANGE[1] - planar_radius - pad_margin, torch.full_like(planar_radius, 0.34))
+    y_lo = torch.maximum(PAD_Y_RANGE[0] + planar_radius + pad_margin, torch.full_like(planar_radius, -0.15))
+    y_hi = torch.minimum(PAD_Y_RANGE[1] - planar_radius - pad_margin, torch.full_like(planar_radius, 0.15))
+
+    for _ in range(6):
+        moved = False
+        for center, required in zip(keepout_centers, keepout_required):
+            delta = target_xy - center
             dist = delta.norm(dim=-1).clamp_min(1e-6)
             push = (required - dist).clamp_min(0.0)
-            if not bool((push > 0.0).any()):
-                break
-            direction = delta / dist.unsqueeze(-1)
-            target_xy = target_xy + direction * push.unsqueeze(-1)
-            # Clamp to a safe pad-interior box every iteration, not just at the end -- verified
-            # separately that an unclamped push could land the rag off the pad entirely (one case
-            # pushed to y=0.42, past the pad's actual y limit of 0.285), landing on the floor
-            # below (z~0). Bounds leave margin for the rag's own ~0.3x0.3m extent plus tumble
-            # drift, not just its centroid.
-            target_xy[:, 0] = target_xy[:, 0].clamp(0.13, 0.45)
-            target_xy[:, 1] = target_xy[:, 1].clamp(-0.22, 0.22)
-        pos_offset[:, 0:2] = target_xy - nominal_xy
+            if bool((push > 0.0).any()):
+                moved = True
+                direction = delta / dist.unsqueeze(-1)
+                target_xy = target_xy + direction * push.unsqueeze(-1)
+        target_xy[:, 0] = torch.maximum(torch.minimum(target_xy[:, 0], x_hi), x_lo)
+        target_xy[:, 1] = torch.maximum(torch.minimum(target_xy[:, 1], y_hi), y_lo)
+        if not moved:
+            break
 
-    tilt_range_list = [tilt_range_deg.get(key, (0.0, 0.0)) for key in ("roll", "pitch", "yaw")]
-    tilt_ranges = torch.deg2rad(torch.tensor(tilt_range_list, device=rag.device))
-    tilt = math_utils.sample_uniform(tilt_ranges[:, 0], tilt_ranges[:, 1], (n, 3), device=rag.device)
-    tilt_quat = math_utils.quat_from_euler_xyz(tilt[:, 0], tilt[:, 1], tilt[:, 2])
+    # random yaw per env, applied to the template about its OWN centroid (already at local origin)
+    yaw = torch.rand(n, device=rag.device) * (2.0 * math.pi)
+    z_axis = torch.zeros((n, 3), device=rag.device)
+    z_axis[:, 2] = 1.0
+    yaw_quat = math_utils.quat_from_angle_axis(yaw, z_axis)
+    num_nodes = local.shape[1]
+    quat_per_node = yaw_quat.unsqueeze(1).expand(-1, num_nodes, -1).reshape(-1, 4)
+    rotated = math_utils.quat_apply(quat_per_node, local.reshape(-1, 3)).reshape(n, num_nodes, 3)
 
-    # transform_nodal_pos rotates/translates about the shape's OWN centroid (see its docstring in
-    # deformable_object.py), so pos_offset/tilt_quat are relative to the already-flat rest pose,
-    # not an absolute world pose.
-    nodal_state[..., :3] = rag.transform_nodal_pos(nodal_state[..., :3], pos_offset, tilt_quat)
+    # place so the template's own lowest node just touches the pad top (RAG_REST_POS'  z, same
+    # pad-top reference the plate/rack recipes use) -- the couple-mm settle below then finds real
+    # contact instead of leaving it floating or embedded.
+    local_zmin = rotated[..., 2].amin(dim=1)
+    target_z = RAG_REST_POS[2] - local_zmin + 0.002
+    target_center = torch.stack([target_xy[:, 0], target_xy[:, 1], target_z], dim=-1)
 
-    # give it a genuine tumble -- random axis, magnitude sampled from spin_rate_range -- via
-    # angular velocity about its own centroid (v = omega x r for every node). Rotation about the
-    # centroid carries no net linear momentum, so this doesn't add its own xy drift on top of
-    # pos_offset above.
-    spin_axis = torch.randn((n, 3), device=rag.device)
-    spin_axis = spin_axis / spin_axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    spin_rate = spin_rate_range[0] + (spin_rate_range[1] - spin_rate_range[0]) * torch.rand(
-        (n, 1), device=rag.device
-    )
-    omega = (spin_axis * spin_rate).unsqueeze(1)
-    centroid = nodal_state[..., :3].mean(dim=1, keepdim=True)
-    nodal_state[..., 3:] = torch.cross(omega.expand_as(nodal_state[..., :3]), nodal_state[..., :3] - centroid, dim=-1)
+    world_pos = rotated + target_center.unsqueeze(1)
+    zero_vel = torch.zeros_like(world_pos)
+    rag.write_nodal_state_to_sim(torch.cat([world_pos, zero_vel], dim=-1), env_ids=ids)
 
-    rag.write_nodal_state_to_sim(nodal_state, env_ids=ids)
-
-    # let it fall, tumble, and crumple/settle -- see randomize_rag_drop's docstring for why extra
-    # sim.step() calls inside a "reset" event are safe.
     env.scene.write_data_to_sim()
     for _ in range(settle_steps):
         env.sim.step(render=False)
     env.scene.update(env.sim.get_physics_dt())
 
-    # hard-freeze: whatever residual velocity PhysX's own damping/sleep didn't fully kill, force it
-    # to zero -- see docstring.
+    # hard-freeze -- see docstring.
     final_state = rag.data.nodal_pos_w[ids]
-    zero_vel = torch.zeros_like(final_state)
-    rag.write_nodal_state_to_sim(torch.cat([final_state, zero_vel], dim=-1), env_ids=ids)
+    rag.write_nodal_state_to_sim(torch.cat([final_state, torch.zeros_like(final_state)], dim=-1), env_ids=ids)
+
+    # TRIED AND REVERTED: kinematically pinning every node at this sculpted pose, then releasing via
+    # an "interval" event a short fixed time into the episode, to buy time before the material's
+    # elastic relaxation (rest shape = the flat authored mesh; confirmed the SAME fast collapse at
+    # every youngsModulus tried, 150 through 15000 -- this is not a stiffness tuning problem)
+    # flattens it. Directly verified (plate_settle_diag-style diagnostic, contact_wake_test.py,
+    # partial_kinematic_test.py) that once ANY node of this deformable has ever had a kinematic
+    # target written via write_nodal_kinematic_target_to_sim, the WHOLE body -- including nodes that
+    # were never marked kinematic -- stops responding to gravity, direct nodal writes, AND genuine
+    # rigid-body contact (a real dropped plate landed on it with zero effect) even long after every
+    # flag is set back to "free". No wake_up equivalent is exposed for soft bodies on this IsaacLab/
+    # PhysX version's SoftBodyView (only rigid bodies have one). That would make the rag permanently
+    # ungraspable after release -- worse than the flat-rag problem this was meant to fix -- so this
+    # is NOT used. See RAG_KINEMATIC_HOLD_SECONDS' docstring (kept, unused) if revisiting this with a
+    # fixed/updated API.
 
 
 def randomize_rag_drop(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     position_range: dict[str, tuple[float, float]],
-    tilt_range_deg: dict[str, tuple[float, float]],
-    spin_rate_range: tuple[float, float],
     settle_steps: int,
-    min_wrinkle_spread: float,
-    max_safe_z: float,
-    min_safe_z: float,
     min_rack_separation: float,
+    min_wrinkle_spread: float,
     max_attempts: int,
     asset_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     rack_cfg: SceneEntityCfg = SceneEntityCfg("dish_rack"),
 ):
-    """Toss the rag -- height, tilt, AND a real tumble -- above its rest pose and physically settle
-    it for a few steps before the episode starts, instead of teleporting it into the exact same
-    flat pose every reset (what the plain xy-only randomizer this replaces did). Produces
-    organically different creased/CRUMPLED shapes episode to episode -- a real rag someone tossed
-    onto a table isn't a taut rectangle, and a taut rectangle flush with the pad also gives a
-    parallel gripper nowhere to get a fingertip under it.
+    """Place a pre-crumpled rag template (see ``_place_rag_crumpled``) near the rag's nominal spot
+    at a random yaw, instead of tossing/tumbling it from height and physically settling the result
+    every reset (what this function used to do -- name kept for the EventTerm wiring below, but the
+    body is a full rewrite).
 
-    An earlier version of this function only applied a static height+tilt offset (no spin) --
-    verified (see the plate_wiping asset-fix conversation's drop-test GIFs) to relax back to a
-    flat, uncreased rectangle within ~0.15s even at that version's max height/tilt, regardless of
-    ``blue_rag_deformable.usdc``'s deformable-body material being soft. The missing piece was
-    self-collision (now enabled on that asset) NEEDING an actual fold-over to have anything to
-    hold in the first place -- a static tilt just settles flat, nothing self-intersects. Giving the
-    nodal state a genuine angular velocity (``spin_rate_range``) about its own centroid -- i.e. an
-    actual tumble in the air, not just a tilted static drop -- is what lets a corner fold UNDER
-    another part of the cloth as it falls, which self-collision can then hold once it lands.
+    REVISED (user feedback: the rag needs to actually be crumpled -- "a circle or another
+    easy-to-grasp shape" -- and resetting was taking too long; confirmed as real physics-stepping
+    wall time, not GPU/CPU headroom). The old approach (real toss: height, tilt, and a genuine
+    angular-velocity tumble, then settle_steps of physics, then check the settled nodal z-spread and
+    RE-TOSS up to max_attempts times if it landed too flat) produced organically different crumples
+    episode to episode, but was fundamentally a gamble every reset: even at tuned toss energy, a
+    real fraction of individual tosses still landed flat or half-folded (verified over many resets
+    while tuning this), so max_attempts had to be raised repeatedly to keep the failure rate down --
+    directly trading reset speed for landing quality, since every attempt costs a real settle_steps
+    worth of physics regardless of whether it succeeds.
 
-    Even with the tumble, not every toss folds -- verified across 6 resets, roughly a third landed
-    close enough to flat (z-spread under ~10mm, vs. 14-46mm for the ones that visibly folded) that
-    it wasn't a meaningfully different starting state from before. Since a flat spawn is exactly
-    what this function exists to avoid, it doesn't just toss once and accept whatever happens: it
-    checks each env's nodal z-spread against ``min_wrinkle_spread`` after settling, and RE-TOSSES
-    (a fresh random draw, not the same one repeated) any env that's still too flat, up to
-    ``max_attempts`` times. This is a retry loop, not a guarantee by construction -- it's still
-    physically possible (just very unlikely across independent draws) for every attempt to land
-    flat, in which case the last attempt's result is kept as-is rather than looping forever.
+    Using a handful of already-verified-crumpled templates instead of a real toss removes MOST of
+    that gamble: the shape being placed is guaranteed good at capture time (a real settled crumple).
+    A first version of this concluded that meant no check/retry was needed at all -- verified WRONG
+    over a 10-reset check: even a pure rigid yaw + short settle can still relax a template flatter
+    than intended in a real minority of resets (the short ``settle_steps`` this needs for placement
+    speed apparently isn't always enough for self-collision at the template's own folds to fully
+    re-stabilize after being rewritten via ``write_nodal_state_to_sim``, which resets the deformable
+    solver's state more abruptly than the gradual physics settle the templates were originally
+    captured with). So the z-spread check and retry loop ARE still here -- just much cheaper than
+    the old toss-based one: each retry redraws a fresh (template, yaw) pair and re-runs the same
+    short ``settle_steps``, capped at ``max_attempts`` (small, since the per-attempt success rate is
+    already high with real templates -- this is mopping up a minority tail, not fighting head-on
+    unreliability the way the toss's retry loop had to).
 
-    The retry check ALSO rejects (and re-tosses) any outcome where a nodal point ends up above
-    ``max_safe_z`` -- this isn't about flatness. The left gripper's fingers sit, at rest, only
-    ~20cm above the rag's rest height (measured: gripper fingers z~0.477, rag rest z~0.281) --
-    right above the rag, since that's exactly where the left arm needs to reach to pick it up
-    later in the episode. A vigorous enough toss/tumble can fling part of the mesh up into contact
-    with those fingers; once that happens the rag gets physically snagged on them and just hangs
-    there -- diagnosed by stepping one such case for 1000 extra physics steps: node speed decayed
-    to near-zero (a real, stable equilibrium, not still-falling) while a chunk of the mesh stayed
-    pinned around z~0.53-0.59, well above the gripper. ``max_safe_z`` should sit comfortably below
-    the gripper height and comfortably above any legitimate crumpled-pile height (a genuine
-    scrunched rag sitting on the pad has no real reason to be taller than a few cm).
-
-    Symmetrically, the retry check ALSO rejects any outcome where the rag's LOWEST nodal point
-    ends up below ``min_safe_z``. Pushing the toss energy up (to make folds more consistently
-    obvious, not just barely non-flat) surfaced this the same way max_safe_z's failure mode was
-    found: an occasional toss now had enough energy to tumble the rag clean off the pad's edge,
-    landing on the world ground plane below (z near 0) instead of settling on the pad (z~0.28) --
-    a spurious "big z-spread" that would otherwise satisfy ``min_wrinkle_spread`` for entirely the
-    wrong reason. ``min_safe_z`` should sit a few cm below the pad's actual top (RAG_REST_POS'
-    z, i.e. some settling/penetration tolerance) but well above the ground plane.
-
-    A third rejection reason, orthogonal to both of the above: the rag's landing centroid ending
-    up within ``min_rack_separation`` of the rack's CURRENT position (``rack_cfg`` -- read live,
-    not RACK_POS, since randomize_dish_rack_and_plate -- which runs first -- can now place the
-    rack almost anywhere on the pad). Without this, a rack that happened to land near the rag's
-    own spawn area had nothing stopping the two from visibly overlapping/interpenetrating.
-
-    This event function does something PickUpEventCfg's/this file's other event terms don't: it
-    steps physics itself (``env.sim.step()``, via ``_toss_and_settle_rag``), rather than just
-    writing a state once. That's safe here because ``_reset_idx`` (manager_based_env.py) applies
-    every "reset"-mode event BEFORE the observation manager computes the episode's first
-    observation -- so by the time this function returns, the settled state IS the state the
-    episode starts from, with nothing downstream the wiser that extra steps (now possibly several
-    toss-settle-check cycles) happened.
-
-    One thing that ordering does NOT give for free: ``_reset_idx`` also runs event_manager.apply
-    BEFORE action_manager.reset(), so the robot's joint position TARGET is still whatever the
-    previous episode last commanded, even though init_robot_pose (an earlier reset event, inherited
-    from PickUpEventCfg) already teleported its joint STATE to the rest pose. Left alone, that stale
-    target would pull the arms out of rest pose while the extra settle steps below run -- so this
-    re-pins the target to the just-reset state first.
+    What's NOT changed from the old version: the rack-avoidance push (``min_rack_separation``,
+    inside ``_place_rag_crumpled``) -- randomize_dish_rack_and_plate can still place the rack almost
+    anywhere on the pad, so the rag's landing still needs to actively dodge wherever it ended up
+    this episode, not just assume its own position_range keeps it clear by construction. Also
+    unchanged: this still re-pins the robot's joint position TARGET to its just-reset state before
+    the settle steps below run, since ``_reset_idx`` (manager_based_env.py) applies event_manager
+    BEFORE action_manager.reset() -- see the old docstring's reasoning, still accurate here.
     """
     rag: DeformableObject = env.scene[asset_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
     rack = env.scene[rack_cfg.name]
 
-    # hold the robot still through the settle steps below -- see docstring
     robot.set_joint_position_target(robot.data.default_joint_pos[env_ids], env_ids=env_ids)
 
     pending_ids = env_ids
     for attempt in range(max_attempts):
-        _toss_and_settle_rag(
+        _place_rag_crumpled(
             env,
             rag,
             pending_ids,
             position_range,
-            tilt_range_deg,
-            spin_rate_range,
             settle_steps,
             rack=rack,
             min_rack_separation=min_rack_separation,
         )
-
         nodal = rag.data.nodal_pos_w[pending_ids]
-        zmax = nodal[..., 2].amax(dim=1)
-        zmin = nodal[..., 2].amin(dim=1)
-        spread = zmax - zmin
-        out_of_bounds = (spread < min_wrinkle_spread) | (zmax > max_safe_z) | (zmin < min_safe_z)
-
-        # this task's env cfg now lets randomize_dish_rack_and_plate place the rack ANYWHERE
-        # across most of the pad (and at any rotation) -- it's no longer safe to assume the rag's
-        # own position_range keeps it clear of wherever the rack+plate happened to land this
-        # episode. Reject (and re-toss) any landing whose centroid ends up too close to the
-        # rack's CURRENT position, rather than relying on the two objects' nominal positions
-        # having been far enough apart by construction.
-        rag_centroid_xy = nodal[..., 0:2].mean(dim=1)
-        rack_xy = rack.data.root_pos_w[pending_ids, 0:2]
-        too_close_to_rack = (rag_centroid_xy - rack_xy).norm(dim=-1) < min_rack_separation
-
-        needs_retry = out_of_bounds | too_close_to_rack
-        if not needs_retry.any() or attempt == max_attempts - 1:
+        spread = nodal[..., 2].amax(dim=1) - nodal[..., 2].amin(dim=1)
+        needs_retry = spread < min_wrinkle_spread
+        if not bool(needs_retry.any()) or attempt == max_attempts - 1:
             break
         pending_ids = pending_ids[needs_retry]
+
+
+# How long into the episode the rag stays kinematically pinned at its sculpted crumpled pose (see
+# _place_rag_crumpled's docstring) before release_rag_kinematic_hold switches it back to a normal,
+# physics-driven soft body. Long enough that the crumple is still genuinely there once a
+# teleoperator's VR view has loaded and they start reaching for it, short enough that it's fully
+# free well before that reach completes -- 30s-long episodes give plenty of room either way. Not
+# yet re-tuned against a live teleop session; adjust if the rag still visibly "unfreezes" too late
+# (feels rigid/unresponsive when grasped) or too early (visibly collapses before it's reachable).
+RAG_KINEMATIC_HOLD_SECONDS = 1.5
+
+
+def release_rag_kinematic_hold(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("rag"),
+):
+    """Switch every node of the rag back to free/physics-driven (kinematic flag -> 1.0), letting it
+    behave like a normal soft body again. Registered as an "interval" event at
+    RAG_KINEMATIC_HOLD_SECONDS -- see that constant's docstring -- so it fires once per env, a
+    fixed short time after THAT env's own reset (interval-mode timers reset at episode start; see
+    EventManager). Writing the CURRENT live nodal positions back (not the original sculpted ones)
+    means release is seamless -- no snap/jump -- regardless of where physics may have nudged the
+    still-kinematic nodes via contact with the robot in the meantime.
+    """
+    rag = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=rag.device)
+    current = rag.data.nodal_pos_w[env_ids]
+    free_target = torch.cat([current, torch.ones_like(current[..., :1])], dim=-1)
+    rag.write_nodal_kinematic_target_to_sim(free_target, env_ids=env_ids)
 
 
 def freeze_dynamic_props(
@@ -792,7 +1056,7 @@ def apply_plate_size(env_cfg, size: str) -> str:
 
     Mutates three things, all needed together -- setting only the spawn scale would leave the
     plate visually resized but still targeting the OTHER size's measured rest pose, landing it
-    wrong every reset (or failing ``plate_height_tolerance``/``plate_xy_tolerance`` every attempt):
+    wrong every reset:
       1. ``env_cfg.scene.plate.spawn.scale`` -- the actual mesh scale.
       2. ``env_cfg.scene.plate.init_state.pos``/``rot`` -- the pose the plate first spawns at,
          before any reset event has run once.
@@ -882,7 +1146,7 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
         # module's docstring for why it needed a RigidBodyAPI at all (it didn't have one before).
         self.scene.dish_rack = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/DishRack",
-            init_state=RigidObjectCfg.InitialStateCfg(pos=RACK_POS, rot=(1.0, 0.0, 0.0, 0.0)),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=RACK_POS, rot=RACK_REST_ROT),
             spawn=sim_utils.UsdFileCfg(usd_path=RACK_USD_PATH),
         )
 
@@ -909,7 +1173,7 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
         self.scene.rag = DeformableObjectCfg(
             prim_path="{ENV_REGEX_NS}/Rag",
             init_state=DeformableObjectCfg.InitialStateCfg(pos=RAG_REST_POS, rot=RAG_REST_ROT),
-            spawn=sim_utils.UsdFileCfg(usd_path=RAG_USD_PATH),
+            spawn=sim_utils.UsdFileCfg(usd_path=RAG_USD_PATH, scale=(RAG_SCALE,) * 3),
         )
 
         # ── Per-episode pose randomization -- see this module's docstring for why dish_rack and
@@ -928,33 +1192,45 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # within [-0.08,0.08] (tight around center, well clear of either arm's own
                 # shoulder, which sits out around +-0.15 -- see the left arm's rest ee_tcp
                 # position measured during the gripper-height check for the rag's max_safe_z).
-                "pose_range": {"x": (-0.06, 0.06), "y": (-0.08, 0.08)},
-                # No angle limit, per direct instruction -- full turn.
-                "yaw_range_deg": (-180.0, 180.0),
+                #
+                # REVISED (user feedback, alongside RACK_POS's own move -- see that constant's
+                # docstring): trimmed way down from +-0.06/+-0.08 to +-0.02/+-0.03 -- "randomize a
+                # little bit," not wander far enough to eat into the rag's own placement channel or
+                # increase the odds of a yaw/offset combination that leaves the plate looking
+                # unseated. The rack/plate group still moves a little every reset, just not far.
+                "pose_range": {"x": (-0.02, 0.02), "y": (-0.03, 0.03)},
+                # REVISED (user feedback: "only spawn one direction... the direction that can make
+                # the plate is in the same direction as arm does" -- was full 360deg per an earlier
+                # direct instruction, superseded by this one). Fixed at 0deg -- the SAME orientation
+                # RACK_TO_PLATE_OFFSET_SMALL/_LARGE and PLATE_REST_ROT_SMALL/_LARGE were actually
+                # measured against (see those constants' docstrings) -- rather than composed with an
+                # arbitrary yaw every reset. The plate-on-rack math is verified solid at this one
+                # orientation; an arbitrary yaw was never separately verified to hold up as well,
+                # and "plate not visibly seated" reports line up with that gap.
+                "yaw_range_deg": (0.0, 0.0),
                 # roll/pitch jitter on the plate's lean, applied in the rack's own local frame
                 # (see randomize_dish_rack_and_plate's docstring) -- how much it tips and which
                 # way, while a physics drop (not a teleport) finds the actual valid resting
                 # contact for that jitter.
                 "plate_lean_jitter_deg": {"roll": (-8.0, 8.0), "pitch": (-8.0, 8.0)},
-                "plate_drop_height": 0.015,
-                # generous enough to accept genuine lean variation, tight enough to reject
-                # "tipped out of the rack onto the pad" (pad top is ~9cm below the nominal plate
-                # height -- see RACK_TO_PLATE_OFFSET's z component).
-                "plate_height_tolerance": 0.05,
-                # z-only wasn't enough to confirm the plate actually stayed IN the rack -- see
-                # randomize_dish_rack_and_plate's docstring for the failure this catches (tipped
-                # sideways out of the rack, landed elsewhere on the pad, but at a height that
-                # coincidentally still passed plate_height_tolerance).
-                "plate_xy_tolerance": 0.05,
-                # Measured reset() wall time end-to-end (all three events together) at 3-20s with
-                # settle_steps=150/max_attempts=10 here and 150/20 on randomize_rag below -- a real
-                # problem for interactive teleop (pressing the reset key), not a GPU-memory limit.
-                # freeze_dynamic_props (runs last, after randomize_rag too) is what actually makes
-                # settle_steps safe to trim back down here: the plate keeps getting "free" extra
-                # settling from randomize_rag's own steps regardless, and gets a final hard freeze
-                # either way, so this doesn't need to fully converge entirely on its own anymore.
-                "settle_steps": 150,
-                "max_attempts": 6,
+                # REVISED (user feedback: resetting takes too long, AND "just spawn it directly in
+                # the ideal state/position if you can" -- see randomize_dish_rack_and_plate's
+                # docstring for the full reasoning): no more plate_drop_height -- the plate is
+                # written straight to its measured target pose now, not dropped from height. The
+                # height/xy tolerance check and retry loop are still here (just no longer configurable
+                # per-event-term -- hardcoded in the function body, loose and capped at 3 attempts)
+                # since a fully unchecked direct write was verified to occasionally produce a real
+                # failure (see the function's docstring), not just a slower-to-settle landing.
+                # settle_steps trimmed way down to match: each attempt now only needs to relax a
+                # couple mm of analytic-pose interpenetration, not converge a real drop from scratch.
+                #
+                # First attempt cut this to 20 -- too aggressive: verified over 10 resets that the
+                # plate could still be caught mid-depenetration when the hard freeze (see
+                # _settle_plate's docstring) landed, some frozen still floating clear of the rack,
+                # one frozen BELOW the rack's own root (a still-resolving SDF-collision push that
+                # hadn't finished). Raised to 50 -- re-verify with the same 10-reset check before
+                # trusting this number.
+                "settle_steps": 50,
                 "rack_cfg": SceneEntityCfg("dish_rack"),
                 "plate_cfg": SceneEntityCfg("plate"),
                 # Explicit (not just relying on the function's own defaults) so apply_plate_size
@@ -968,64 +1244,60 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
             func=randomize_rag_drop,
             mode="reset",
             params={
-                # Height/spin are now free to be pushed for a high per-attempt fold rate, NOT
-                # tuned down for safety -- max_safe_z below is what makes a too-vigorous toss
-                # (one that reaches the gripper) safe: it gets detected and re-tossed like any
-                # other rejected attempt, same as a too-flat one, rather than needing the toss
-                # itself to be weak enough to never reach that high.
-                # x/y widened from +-0.04 -- now that the rack can land almost anywhere on the pad
-                # (see randomize_dish_rack_and_plate's pose_range), the rag needs more room to
-                # actually find a landing spot that clears min_rack_separation below when the rack
-                # happens to come down near its nominal spawn area, not just a narrow band to
-                # sample within.
-                "position_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08), "z": (0.08, 0.16)},
-                "tilt_range_deg": {"roll": (-20.0, 20.0), "pitch": (-20.0, 20.0), "yaw": (-180.0, 180.0)},
-                "spin_rate_range": (12.0, 24.0),
-                # See randomize_dish_rack_and_plate's settle_steps comment -- measured reset()
-                # taking 3-20s with this at 150/max_attempts=20; trimmed down for interactive
-                # teleop use. The final freeze_dynamic_props pass (this task's actual LAST reset
-                # event) means the hard velocity zero at the end of every toss-and-settle attempt
-                # doesn't need to be the last word on its own either.
-                "settle_steps": 100,
-                # Raised from an earlier 10mm (which only rejected outright-flat landings, ~3-7mm)
-                # to 30mm -- verified (plate_wiping asset-fix conversation, the "flat to me"
-                # follow-up) that a merely-non-flat crease around 10-20mm still reads as close to
-                # flat from body_cam's top-down angle. 30mm cleanly separates from that, closer to
-                # the visibly obvious folds this function's docstring describes (14-46mm) rather
-                # than borderline ones.
-                "min_wrinkle_spread": 0.030,
-                # left gripper fingers rest at z~0.477, rag rests at z~0.281 -- see
-                # randomize_rag_drop's docstring for the snagging failure this guards against.
-                "max_safe_z": 0.40,
-                # rag rests at z~0.281 (RAG_REST_POS); 0.25 gives a few cm of settling/penetration
-                # tolerance while still catching the "flew off the pad onto the ground plane"
-                # failure (z near 0) the higher spin_rate_range surfaced -- see docstring.
-                "min_safe_z": 0.25,
-                # Now that randomize_dish_rack_and_plate can place the rack almost anywhere on the
-                # pad (see that event's pose_range), the rack and rag can no longer be assumed far
-                # apart just because their nominal positions are -- this is the check that
-                # actually enforces it, against wherever the rack ACTUALLY ended up this episode
-                # (rack_cfg below), not a fixed position. Deliberately modest (not a big personal-
-                # space buffer): the rag's own position_range is much narrower than the rack's, so
-                # it has limited room to "dodge" a rack that landed nearby -- set too large, this
-                # would mostly just burn through max_attempts without ever finding a satisfying
-                # offset. Tuned to stop literal overlap, not to guarantee generous clearance.
+                # REVISED (user feedback: "in any way if the rag can be spawned with [a crumpled]
+                # state, do it, you can skip the time-consuming dropping physics if you can spawn it
+                # directly"): this now places a pre-crumpled template (see
+                # ``_load_rag_crumple_templates``) instead of tossing/tumbling the rag from height
+                # every reset -- see ``randomize_rag_drop``'s docstring for the full history of why
+                # (repeated tuning rounds trading reset speed for landing-quality retries) that made
+                # this the better fix. position_range only needs xy now (no more toss height/tilt/
+                # spin params) -- kept modest so the template stays near RAG_REST_POS, not so wide it
+                # wanders toward the rack's own roaming zone before the avoidance push below even
+                # runs.
+                "position_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                # REVISED (root cause finally isolated with a direct diagnostic, not another guess):
+                # every earlier settle_steps value here (20, 40, 60) was chosen assuming MORE physics
+                # steps were needed to let self-collision "finish resolving" a rigid-transform seam --
+                # exactly backwards. Isolated by placing the SAME captured template repeatedly at
+                # settle_steps in {0,2,5,10,20,40,60} and reading the settled z-spread each time: it
+                # degrades MONOTONICALLY with more steps -- 0-2 steps preserves ~95-100% of the
+                # template's own captured spread (e.g. 0.115 captured -> 0.105-0.114 settled), 10
+                # steps is already down to ~0.05-0.06, 20+ collapses to near-zero (0.002-0.03) almost
+                # every time. This mesh's self-collision does NOT need real settle time to "lock in" a
+                # rigid-transformed crumple the way it needed real fall-and-tumble time to CREATE one
+                # during capture -- given extra physics steps with nothing driving it (no gravity
+                # doing new work, no tumble), it just relaxes toward the material's flat rest state,
+                # the opposite of what every previous settle_steps bump here was trying to fix. 2
+                # keeps just enough of a step for write_data_to_sim's effects to register and a
+                # velocity read to be meaningful, without giving the relaxation room to run.
+                "settle_steps": 2,
+                # Unchanged from the old toss-based recipe: randomize_dish_rack_and_plate can still
+                # place the rack almost anywhere on the pad, so the rag's landing still needs to
+                # actively dodge wherever it ended up this episode -- see _place_rag_crumpled's
+                # docstring for the push-then-clamp mechanics this drives.
                 "min_rack_separation": 0.22,
-                # History: 20 -> 8 (reset() wall time was 3-20s, a real interactive-teleop
-                # problem, not GPU memory) -> 14 (8 wasn't enough headroom when clearing
-                # min_rack_separation was still partly down to retry-luck) -> 10 (the deterministic
-                # rack-avoidance push meant separation was mostly solved on the first attempt, so
-                # 10 seemed enough) -> 12: verified with 15 resets that 10 still left ~27% of
-                # resets with a z-bounds violation (mostly from the SAME rack-proximity cause,
-                # since the pad-boundary clamp on that push -- see _toss_and_settle_rag's docstring
-                # -- can trade away some separation margin when the rack sits close to the rag's
-                # own zone). Not fully eliminated by construction the way the basic case is, so
-                # retries still matter here more than the comment this replaces assumed.
-                "max_attempts": 12,
+                # REINSTATED (a first version of this direct-spawn recipe dropped this entirely,
+                # believing the template guarantee made it unnecessary -- verified wrong, see
+                # randomize_rag_drop's docstring: ~40% of individual placements still settled flatter
+                # than intended over one 10-reset check). Lower than the old toss-based recipe's 45mm
+                # -- these templates' worst realistic outcome is "didn't fully hold its shape", not
+                # "landed basically flat" the way a bad toss could, so 30mm is enough to catch a
+                # genuinely-degraded placement without demanding every retry match the single best
+                # template's own spread.
+                "min_wrinkle_spread": 0.030,
+                # Raised 4 -> 6 alongside settle_steps' bump above -- 4 attempts at settle_steps=40
+                # still left 2 of 10 resets flat (see that comment); see randomize_rag_drop's
+                # docstring for why this mops up a minority tail rather than fighting head-on
+                # unreliability the way the old toss's retry loop had to.
+                "max_attempts": 6,
                 "asset_cfg": SceneEntityCfg("rag"),
                 "rack_cfg": SceneEntityCfg("dish_rack"),
             },
         )
+        # NOT registered: release_rag_kinematic_hold / RAG_KINEMATIC_HOLD_SECONDS (see
+        # _place_rag_crumpled's docstring on the kinematic-pin approach this went with, and why it
+        # was reverted -- the functions are kept, unused, in case a future PhysX/IsaacLab version
+        # exposes a working soft-body wake and this is worth revisiting).
         # Must run AFTER both events above -- see freeze_dynamic_props' docstring for why an
         # unconditional final freeze is needed even though both of those already do their own.
         self.events.freeze_dynamic_props = EventTerm(
