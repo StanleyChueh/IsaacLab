@@ -73,6 +73,9 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 If you want to replay simulation-recorded trajectory on real robot
 
 ```
+cd ~/Stanley_ws/lerobot_openarm
+uv sync
+source .venv/bin/activate
  env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz --episode 0   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
 ```
 
