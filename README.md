@@ -276,7 +276,7 @@ Launch GR00T N1.7 Policy Server
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate lerobot-latest
-python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --port 5556
 ```
 
 Run Isaac Lab Eval
