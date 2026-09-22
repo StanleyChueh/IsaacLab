@@ -621,6 +621,7 @@ def randomize_dish_rack_and_plate(
     rack_to_plate_offset: tuple[float, float, float] = RACK_TO_PLATE_OFFSET,
     plate_rest_rot: tuple[float, float, float, float] = PLATE_REST_ROT,
     plate_radius: float = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["radius"],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
     """Place ``dish_rack`` and ``plate`` as one rigid group (shared xy offset AND shared yaw
     rotation about the rack's own pivot), then place the plate DIRECTLY at its known-good leaning
@@ -676,9 +677,25 @@ def randomize_dish_rack_and_plate(
     quietly become a no-op against exactly the failure mode it exists to catch). Each attempt now
     also draws a small (+-4mm) position jitter independent of the lean angle, so a failed attempt has
     something to try differently, and the cap was raised 3 -> 5 to give that extra draw more chances.
+
+    REVISED (user report: on every reset, both arms visibly dip down into some other pose first,
+    THEN move up into the real starting pose, instead of just holding it). Root cause: this event
+    runs BEFORE action_manager.reset() (``_reset_idx`` in manager_based_env.py applies event_manager
+    first -- see ``randomize_rag_drop``'s docstring, which already had to work around this same
+    ordering for itself), so while THIS function's own settle-physics steps run (``_settle_plate``,
+    up to ``settle_steps`` per attempt and up to 5 attempts -- by far the longest-running reset event,
+    and the FIRST one), the robot's joint position TARGET is still whatever it was at the end of the
+    PREVIOUS episode (e.g. reaching down over the plate/rack), not yet reset -- so the PD controller
+    keeps driving the arms toward that stale target through every one of those physics steps, visibly
+    moving them there, before the real reset (moments later) snaps the target back to the actual
+    starting pose. Re-pinning the target to ``default_joint_pos`` here too, exactly like
+    ``randomize_rag_drop`` already does for its own settle loop, makes the arms just hold the
+    starting pose through this event's settle steps instead of visiting a stale one first.
     """
     rack = env.scene[rack_cfg.name]
     plate = env.scene[plate_cfg.name]
+    robot = env.scene[robot_cfg.name]
+    robot.set_joint_position_target(robot.data.default_joint_pos[env_ids], env_ids=env_ids)
     n = len(env_ids)
     device = rack.device
 
@@ -1117,6 +1134,87 @@ def randomize_rag_drop(
             break
         pending_ids = pending_ids[needs_retry]
 
+    # REVISED (user report: the rag is flat most of the time, despite min_wrinkle_spread's check
+    # above passing every time it was measured -- ~0.08-0.14m spread right after this event runs,
+    # nowhere near the 0.03 threshold). Root cause was NOT this placement/retry logic at all -- a
+    # standalone timing check (stepping physics after a normal reset and re-reading nodal z-spread
+    # every step) found the deformable material relaxes from its full crumpled spread down to
+    # essentially flat (~0.002m) within about 0.15-0.3s of real sim time REGARDLESS, i.e. well before
+    # an actual teleoperator's VR view has even loaded, let alone before they look at or reach for
+    # it -- this event's own settle_steps (kept deliberately tiny, 2, precisely to NOT let this
+    # relaxation run during the reset itself) only postpones the collapse, it doesn't prevent it once
+    # the episode's real physics stepping starts. See ``_place_rag_crumpled``'s docstring for why the
+    # obvious fix (kinematically pin the shape, then release it after a delay) was already tried and
+    # reverted -- writing ANY node's kinematic target on this PhysX version makes the WHOLE body
+    # (including nodes never marked kinematic) permanently stop responding to gravity, contact, or
+    # direct writes even long after being set back to free, which is worse than the flat-rag problem.
+    # ``_rag_hold_physics_callback`` (set up once by ``setup_rag_hold_callback``, a "startup" event --
+    # see that function's docstring) is a different mechanism that achieves the same practical goal
+    # WITHOUT ever calling ``write_nodal_kinematic_target_to_sim``. Cache the just-achieved shape here
+    # for that callback to read, and arm its per-physics-substep countdown.
+    #
+    # REVISED AGAIN (user report: the rag now visibly SHAKES/jitters during the hold window, then
+    # goes flat -- a new symptom the plain relaxation never had before this hold mechanism existed).
+    # Root cause: the first version of this re-imposed the shape via an EventManager "interval" term,
+    # which only fires once per env CONTROL step (this task's decimation=5 @ 100Hz physics = one
+    # control step per 0.05s) -- and interval-mode events run AFTER that control step's 5 physics
+    # substeps (and its render) have already happened, so every rendered frame during the hold window
+    # was showing 50ms worth of real relaxation, snapped back only after being seen, then relaxing
+    # another 50ms before the next render -- a repeating "relax-then-snap" cycle at ~20Hz that reads
+    # as shaking, especially since self-collision/fold resolution isn't perfectly identical each 50ms
+    # window. Fixed by re-imposing the shape on every raw PHYSICS SUBSTEP instead (100Hz here, via
+    # ``env.sim.add_physics_callback`` -- see ``setup_rag_hold_callback``), not once per control step
+    # -- shrinks the visible relaxation window 5x, to ~10ms, which the fine-grained timing check found
+    # produces essentially no measurable z-spread change at all (0.0807 -> 0.0812 after just one
+    # 10ms substep) -- i.e. small enough that there's nothing left to see "snap back" from.
+    if not hasattr(env, "_rag_hold_target"):
+        env._rag_hold_target = rag.data.nodal_pos_w.clone()
+        env._rag_hold_steps_left = torch.zeros(env.scene.num_envs, dtype=torch.long, device=rag.device)
+    env._rag_hold_target[env_ids] = rag.data.nodal_pos_w[env_ids].clone()
+    env._rag_hold_steps_left[env_ids] = int(round(RAG_KINEMATIC_HOLD_SECONDS / env.sim.get_physics_dt()))
+
+
+def setup_rag_hold_callback(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("rag"),
+):
+    """Registered as a "startup" event -- runs exactly ONCE, when the env is first constructed,
+    before any episode/reset -- that subscribes a physics-step callback re-imposing whichever
+    crumpled shape ``randomize_rag_drop`` most recently cached in ``env._rag_hold_target``, for
+    ``env._rag_hold_steps_left`` physics substeps per env after that env's own reset.
+
+    A single persistent callback (subscribed once, for the env's whole lifetime) rather than
+    subscribing/unsubscribing every reset: simpler lifecycle (nothing to unsubscribe on episode end,
+    only on env close, via ``env.sim.remove_physics_callback`` if that's ever added), and the
+    callback itself is a cheap no-op (one compare, short-circuited by ``active.any()``) for the
+    entire rest of a 30s episode once its ~1.5s hold window closes -- see ``randomize_rag_drop``'s
+    docstring for why this needed to move from an EventManager "interval" term (once per env control
+    step, 20Hz here) to a raw physics-step callback (once per physics substep, 100Hz here): the
+    coarser interval-mode granularity was letting the cloth visibly relax-and-snap every control
+    step, reading as a shake, not a hold.
+
+    Uses the ordinary, non-kinematic ``write_nodal_state_to_sim`` -- the SAME call
+    ``_place_rag_crumpled``'s own settle already uses -- never ``write_nodal_kinematic_target_to_sim``
+    (confirmed elsewhere in this file to permanently break the whole deformable body once used, even
+    long after being set back to "free"; see ``_place_rag_crumpled``'s docstring for the full story).
+    """
+    rag = env.scene[asset_cfg.name]
+    if not hasattr(env, "_rag_hold_target"):
+        env._rag_hold_target = rag.data.nodal_pos_w.clone()
+        env._rag_hold_steps_left = torch.zeros(env.scene.num_envs, dtype=torch.long, device=rag.device)
+
+    def _rag_hold_physics_callback(dt: float):
+        active = env._rag_hold_steps_left > 0
+        if not bool(active.any()):
+            return
+        active_ids = active.nonzero().flatten()
+        target = env._rag_hold_target[active_ids]
+        rag.write_nodal_state_to_sim(torch.cat([target, torch.zeros_like(target)], dim=-1), env_ids=active_ids)
+        env._rag_hold_steps_left[active_ids] -= 1
+
+    env.sim.add_physics_callback("rag_hold_shape", _rag_hold_physics_callback)
+
 
 # How long into the episode the rag stays kinematically pinned at its sculpted crumpled pose (see
 # _place_rag_crumpled's docstring) before release_rag_kinematic_hold switches it back to a normal,
@@ -1462,10 +1560,31 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 "rack_cfg": SceneEntityCfg("dish_rack"),
             },
         )
-        # NOT registered: release_rag_kinematic_hold / RAG_KINEMATIC_HOLD_SECONDS (see
-        # _place_rag_crumpled's docstring on the kinematic-pin approach this went with, and why it
-        # was reverted -- the functions are kept, unused, in case a future PhysX/IsaacLab version
-        # exposes a working soft-body wake and this is worth revisiting).
+        # NOT registered: release_rag_kinematic_hold (see _place_rag_crumpled's docstring on the
+        # kinematic-pin approach this went with, and why it was reverted -- the function is kept,
+        # unused, in case a future PhysX/IsaacLab version exposes a working soft-body wake and this
+        # is worth revisiting). RAG_KINEMATIC_HOLD_SECONDS IS still used, as the hold duration for
+        # setup_rag_hold_callback below -- a different, non-kinematic mechanism for the same goal, see
+        # that function's and randomize_rag_drop's docstrings.
+        #
+        # REVISED (user report: the rag is flat most of the time -- see randomize_rag_drop's
+        # docstring for the root cause, the deformable material relaxing to flat within ~0.15-0.3s of
+        # real sim time regardless of how it was placed). First version of this re-imposed the shape
+        # via an EventManager "interval" term (interval_range_s=(0.0,0.0), firing once per env
+        # CONTROL step, 20Hz at this task's decimation) -- REVISED AGAIN after a second user report
+        # (the rag visibly SHAKES during the hold window instead of holding still): interval-mode
+        # only fires once per control step, AFTER that step's physics substeps and render already
+        # happened, so every rendered frame showed real relaxation that then got snapped back,
+        # repeating at ~20Hz -- see randomize_rag_drop's docstring for the full diagnosis. Switched to
+        # "startup" mode: this only SETS UP a raw physics-step callback (env.sim.add_physics_callback,
+        # see setup_rag_hold_callback) that re-imposes the shape on every physics SUBSTEP (100Hz here)
+        # instead, shrinking the visible relaxation window 5x -- small enough (per the fine-grained
+        # timing check) that there's nothing left to visibly snap back from.
+        self.events.setup_rag_hold_callback = EventTerm(
+            func=setup_rag_hold_callback,
+            mode="startup",
+            params={"asset_cfg": SceneEntityCfg("rag")},
+        )
         # Must run AFTER both events above -- see freeze_dynamic_props' docstring for why an
         # unconditional final freeze is needed even though both of those already do their own.
         self.events.freeze_dynamic_props = EventTerm(

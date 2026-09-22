@@ -2869,7 +2869,9 @@ def main():
             instruction_display.set_labels(arm_label, demo_label)
 
     # ── Initial reset ─────────────────────────────────────────────────────────
-    env.sim.reset()
+    # soft=True -- see the per-episode reset below for why (same collapse-pose flash, here on the
+    # very first episode instead of every subsequent one).
+    env.sim.reset(soft=True)
     env.reset()
     teleop.reset()
 
@@ -3071,7 +3073,22 @@ def main():
                 if return_to_rest is not None:
                     return_to_rest.stop()
                 discard_after_return = False
-                env.sim.reset()
+                # soft=True (was a bare reset()): a full (non-soft) SimulationContext.reset() stops
+                # and replays the whole Kit timeline, which snaps every joint back to the raw
+                # USD-authored drive target (0.0 for every OpenArm joint -- including joint4's own
+                # LOWER limit, so both arms visibly collapse straight down) and explicitly renders
+                # that pose twice to the live viewport, all BEFORE env.reset() below gets a chance to
+                # settle the robot back to its real default_joint_pos "ready" pose (bent elbow) --
+                # verified as the actual cause of the "arms dip down, then rise" flash on every reset
+                # (env.reset()'s own settle physics all runs with render=False, so its correction is
+                # invisible; only this call's two explicit renders and env.reset()'s final 3
+                # rerenders are ever shown). soft=True skips both the stop/play cycle and those two
+                # renders (see SimulationContext.reset()), while still calling through to reset the
+                # scene objects -- avoids the visible collapse-pose flash without dropping the call
+                # entirely, in case it's relied on for something else this session doesn't exercise.
+                # Matters beyond cosmetics here: commands recorded/replayed against a REAL robot
+                # should never command it through an unintended collapsed pose during a reset.
+                env.sim.reset(soft=True)
                 env.recorder_manager.reset()
                 env.reset()
                 teleop.reset()
