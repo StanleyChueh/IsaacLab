@@ -70,6 +70,22 @@ processed:vr_joint_ros2 udp
   --teleop_device vr_joint_ros2_native \
   --ros2_domain_id 1
 
+Driving the real arms alongside the simulation:
+
+  Add --real_arm to the same command. It starts lerobot_openarm/mirror_bridge.py as a child process
+  (using that project's own .venv), which connects to the CAN adapters and makes the real arms follow
+  the simulated ones, and it turns on the joint broadcast that feeds it (--mirror_udp_port, port
+  5557 unless you gave another). Without --real_arm nothing here touches hardware.
+
+  ./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/pickup_pringle.hdf5 \
+    --enable_cameras --num_demos 10 --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 --task_mode handover --manual_save --real_arm
+
+  The bridge asks you to type YES in this terminal before it moves the real arms to the simulated
+  pose, and 'q' + Enter stops them. Bring the CAN-FD links up first (openarm_can/setup: sudo ./my_arm).
+
 Resuming a session:
 
   An existing --dataset_file is never silently overwritten; the run refuses to start instead. Add
@@ -398,6 +414,48 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--real_arm",
+    action="store_true",
+    default=False,
+    help=(
+        "Drive the real OpenArm hardware alongside the simulation: starts"
+        " lerobot_openarm/mirror_bridge.py as a child process and enables --mirror_udp_port (default"
+        " 5557 if not given). The bridge asks for a typed YES in this terminal before it moves the"
+        " arms to the simulated pose; type 'q' + Enter to stop them. Off by default -- without this"
+        " flag nothing in this script touches hardware."
+    ),
+)
+parser.add_argument(
+    "--real_arm_dir",
+    type=str,
+    default=None,
+    help="--real_arm only: the lerobot_openarm checkout. Defaults to <workspace>/lerobot_openarm, next to IsaacLab.",
+)
+parser.add_argument(
+    "--real_arm_calibration",
+    type=str,
+    default="calibration.json",
+    help="--real_arm only: calibration file passed to the bridge, relative to --real_arm_dir.",
+)
+parser.add_argument(
+    "--real_arm_right_port",
+    type=str,
+    default="can0",
+    help="--real_arm only: SocketCAN interface of the right arm.",
+)
+parser.add_argument(
+    "--real_arm_left_port",
+    type=str,
+    default="can1",
+    help="--real_arm only: SocketCAN interface of the left arm.",
+)
+parser.add_argument(
+    "--real_arm_max_joint_speed",
+    type=float,
+    default=0.3,
+    help="--real_arm only: rad/s cap on every real arm joint (the bridge's --max-joint-speed).",
+)
+parser.add_argument(
     "--dump_joint_order",
     type=str,
     default=None,
@@ -421,6 +479,37 @@ args_cli = parser.parse_args()
 import json as _json  # noqa: E402 -- see above; the post-launch import block re-imports these
 import os as _os  # noqa: E402
 import sys as _sys  # noqa: E402
+
+
+def resolve_real_arm_bridge(args) -> tuple[str, str, str, str]:
+    """Locate everything ``--real_arm`` needs, or exit explaining what is missing.
+
+    Returns (project dir, venv python, calibration file, URDF). Checked before Isaac Sim starts for
+    the same reason as the dataset pre-flight: a missing file should cost a second, not a minute.
+    """
+    project_dir = _os.path.abspath(
+        args.real_arm_dir
+        or _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..", "lerobot_openarm")
+    )
+    python = _os.path.join(project_dir, ".venv", "bin", "python")
+    calibration = _os.path.join(project_dir, args.real_arm_calibration)
+    urdf = _os.path.join(project_dir, "model", "openarm_description.urdf")
+    for label, path in (
+        ("the lerobot_openarm venv python (run `uv sync` there)", python),
+        ("the calibration file", calibration),
+        ("the URDF", urdf),
+        ("mirror_bridge.py", _os.path.join(project_dir, "mirror_bridge.py")),
+    ):
+        if not _os.path.exists(path):
+            _sys.exit(f"--real_arm: cannot find {label}: {path}\n(--real_arm_dir is {project_dir})")
+    return project_dir, python, calibration, urdf
+
+
+REAL_ARM_DEFAULT_UDP_PORT = 5557
+if args_cli.real_arm:
+    if not args_cli.mirror_udp_port:
+        args_cli.mirror_udp_port = REAL_ARM_DEFAULT_UDP_PORT
+    real_arm_project_dir, real_arm_python, real_arm_calibration, real_arm_urdf = resolve_real_arm_bridge(args_cli)
 
 
 def next_demo_index(data_group) -> int:
@@ -1591,7 +1680,7 @@ class VRDualArmJointTeleop:
                 print("[VR JOINT TELEOP] X pressed -> start recording")
                 start_cb()
         if button_y and not self._prev_button_y:
-            reset_cb = self._additional_callbacks.get("R")
+            reset_cb = self._additional_callbacks.get("Y_RESET") or self._additional_callbacks.get("R")
             if reset_cb is not None:
                 print("[VR JOINT TELEOP] Y pressed -> discard & reset episode")
                 reset_cb()
@@ -1765,7 +1854,7 @@ class ROS2NativeJointTeleop:
                 print("[ROS2 NATIVE TELEOP] X pressed -> start recording")
                 start_cb()
         if button_y and not self._prev_button_y:
-            reset_cb = self._additional_callbacks.get("R")
+            reset_cb = self._additional_callbacks.get("Y_RESET") or self._additional_callbacks.get("R")
             if reset_cb is not None:
                 print("[ROS2 NATIVE TELEOP] Y pressed -> discard & reset episode")
                 reset_cb()
@@ -2333,6 +2422,54 @@ def main():
             robot=env.scene["robot"], host=args_cli.mirror_udp_host, port=args_cli.mirror_udp_port
         )
 
+    # ── Real-arm bridge process (opt-in, --real_arm) ───────────────────────────
+    # Started only now, with the env built, so the CAN motors are not energised through the
+    # minutes of Isaac Sim startup. It shares this terminal on purpose: its YES prompt and its 'q'
+    # kill switch are read from stdin. It waits for our first broadcast, which is the first
+    # env.step() below, then asks for the YES before moving anything.
+    if args_cli.real_arm:
+        import subprocess
+
+        # The bridge runs in the lerobot_openarm venv, so nothing of this conda env may leak in.
+        bridge_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        bridge_env["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64"
+        bridge_cmd = [
+            real_arm_python,
+            "mirror_bridge.py",
+            "--calibration", real_arm_calibration,
+            "--udp-host", args_cli.mirror_udp_host,
+            "--udp-port", str(args_cli.mirror_udp_port),
+            "--model-path", real_arm_urdf,
+            "--right-port", args_cli.real_arm_right_port,
+            "--left-port", args_cli.real_arm_left_port,
+            "--max-joint-speed", str(args_cli.real_arm_max_joint_speed),
+        ]
+        if args_cli.mirror_feedback_port:
+            bridge_cmd += ["--feedback-port", str(args_cli.mirror_feedback_port)]
+        print(f"[REAL ARM] Starting bridge: {' '.join(bridge_cmd)}")
+        bridge_proc = subprocess.Popen(bridge_cmd, cwd=real_arm_project_dir, env=bridge_env)
+
+        def _stop_real_arm_bridge():
+            if bridge_proc.poll() is not None:
+                return
+            # A Ctrl+C in this terminal reaches the bridge too, and it is then already ramping the
+            # arms down -- a second SIGINT would cut that short. So give it a moment to finish on
+            # its own before asking.
+            try:
+                bridge_proc.wait(timeout=3)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            # SIGINT is what the bridge's own Ctrl-C path handles: it ramps the arms down and
+            # disables the motors. Killing it any harder would leave them energised.
+            bridge_proc.send_signal(signal.SIGINT)
+            try:
+                bridge_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                print("[REAL ARM] Bridge did not exit in 15s -- verify the motors are de-energised.")
+
+        atexit.register(_stop_real_arm_bridge)
+
     # ── Real-robot feedback listener, for a sim-vs-real plot on exit (opt-in) ──
     feedback_receiver = None
     if args_cli.mirror_feedback_port:
@@ -2462,6 +2599,10 @@ def main():
         if requires_manual_arm and args_cli.return_to_rest_secs > 0
         else None
     )
+
+    # Set by button Y when it starts the return-to-rest ramp: the episode is then DISCARDED on
+    # arrival instead of saved (button X's second press saves).
+    discard_after_return = False
 
     def reset_episode():
         nonlocal should_reset
@@ -2637,6 +2778,26 @@ def main():
         else:
             save_episode()
 
+    def on_button_y():
+        """button_y handler -- like the R key (discard & reset), but when the arms are live and
+        --return_to_rest_secs is enabled the robot first drives itself back to the rest pose, the
+        same motion as the second button-X press, and the episode is discarded (not saved) on
+        arrival. Pressed again mid-ramp, it skips the rest of the motion and resets at once.
+        """
+        nonlocal discard_after_return
+        if return_to_rest is not None and return_to_rest.active:
+            reset_episode()
+            return
+        if return_to_rest is None or not recording_armed:
+            reset_episode()  # nothing has moved yet, or the ramp is disabled: plain reset
+            return
+        discard_after_return = True
+        return_to_rest.start()
+        print(
+            f"Returning to rest pose over {args_cli.return_to_rest_secs:.1f}s"
+            " -- the episode is discarded on arrival."
+        )
+
     def start_recording():
         """button_x handler (vr_joint_ros2 / vr_joint_ros2_native only, see
         requires_manual_arm) -- releases the robot AND arms recording, in that order.
@@ -2696,6 +2857,7 @@ def main():
     teleop.add_callback("T", request_ramp_test)
     if requires_manual_arm:
         teleop.add_callback("X_START", on_button_x)
+        teleop.add_callback("Y_RESET", on_button_y)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     instruction_display = InstructionDisplay(xr=False)
@@ -2741,7 +2903,12 @@ def main():
             print(f"               over {args_cli.return_to_rest_secs:.1f}s (grippers held as-is) and the episode is")
             print("               saved on arrival -- that return motion IS part of the demo. Let")
             print("               go of your controllers; they are ignored until it finishes.")
-        print("  Y (Quest)  — discard & reset episode (re-freezes the robot until X)")
+        if return_to_rest is not None:
+            print("  Y (Quest)  — drive back to the rest pose (same motion as the second X press),")
+            print("               then discard the episode & reset (re-freezes the robot until X).")
+            print("               Press Y again mid-motion to reset immediately.")
+        else:
+            print("  Y (Quest)  — discard & reset episode (re-freezes the robot until X)")
         if args_cli.manual_save:
             print("  (--manual_save: the task's success condition will NOT end an episode; only")
             print("   button X or the N key will.)")
@@ -2851,7 +3018,10 @@ def main():
             if rtr_done and return_to_rest is not None:
                 return_to_rest.stop()
                 print("Back at rest pose.")
-                save_episode()
+                if discard_after_return:
+                    reset_episode()
+                else:
+                    save_episode()
 
             # Success check -- gated on recording_armed so a not-yet-armed episode
             # (requires_manual_arm modes, before X is pressed) can never auto-export.
@@ -2900,6 +3070,7 @@ def main():
                 # before env.reset(), or the next episode would open with the teleop still ignored.
                 if return_to_rest is not None:
                     return_to_rest.stop()
+                discard_after_return = False
                 env.sim.reset()
                 env.recorder_manager.reset()
                 env.reset()

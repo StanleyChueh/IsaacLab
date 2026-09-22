@@ -90,7 +90,15 @@ import torch
 # N1.7 policy (Qwen3-VL backbone, transformers>=5) -- the `lerobot-latest` conda env already has
 # such a checkout installed editable, so this is a no-op there.
 LEROBOT_SRC = os.environ.get("LEROBOT_SRC", "/home/csl/Stanley_ws/lerobot_experiment/lerobot/src")
-if LEROBOT_SRC and LEROBOT_SRC not in sys.path and os.path.isdir(LEROBOT_SRC):
+# Guard against a stale/incomplete checkout sitting at this path (e.g. missing configs/__init__.py,
+# which makes lerobot.configs resolve as a namespace package with no PreTrainedConfig): only prepend
+# it if it actually looks like a real lerobot install, so it can never silently shadow the correct
+# editable install already on sys.path in the lerobot-latest env.
+if (
+    LEROBOT_SRC
+    and LEROBOT_SRC not in sys.path
+    and os.path.isfile(os.path.join(LEROBOT_SRC, "lerobot", "configs", "__init__.py"))
+):
     sys.path.insert(0, LEROBOT_SRC)
 
 from lerobot.configs import PreTrainedConfig
