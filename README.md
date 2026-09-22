@@ -365,3 +365,8 @@ env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_gr00t_asyn
   --max-episode-seconds 25 --max-episodes 20 --task "Pick up the Pringles can with the right arm, hand it to the left arm" 
 ```
 
+Brodcast to real robot
+
+```
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python mirror_bridge.py     --calibration calibration.json     --udp-port 5557     --feedback-port 5558     --model-path /home/csl/Stanley_ws/lerobot_openarm/model/openarm_description.urdf     --right-port can0 --left-port can1     --max-joint-speed 0.3  --timeout-ms 5000 --stale-ms 500
+```
