@@ -181,7 +181,23 @@ PAD_Y_RANGE = (-0.285, 0.285)
 # more than the ~3cm gap that was directly observed to tip the rack/plate off the pad in the 0.36->
 # 0.40 investigation above, and the narrower post-rotation Y footprint means there's no longer a
 # competing need to keep x low for arm clearance.
-RACK_POS = (0.44, 0.0, 0.28)
+#
+# REVISED (user request: push the rack -- and the rag -- further toward the pad's far edge, away
+# from the robot body). NOTE the "~5cm clear" reasoning above measured margin from the rack's own
+# CENTER to the edge, not from the rack's actual footprint -- direct mesh measurement (dish_rack_
+# kinematic.usdc's rail prims) shows the post-90deg-yaw rack is 10cm wide along world X, i.e. its own
+# outer edge already reaches RACK_POS[0]+0.05, not just RACK_POS[0]. At the old 0.44 (pose_range max
+# 0.46), the rack's own far edge already touched 0.51 (the pad's literal edge) with zero margin,
+# despite the comment above claiming 5cm -- so there was no slack left to move further out at all by
+# that measure. Pushed anyway, since the rack is a KINEMATIC prop (see the scene.dish_rack comment
+# above) -- it is always written directly to this pose every reset regardless of what's under it, so
+# it can't topple/fall the way a dynamic object stepping past the pad edge could; a few cm of visual
+# overhang past the nominal pad box is not the same failure mode the RACK_POS history above is about
+# (a dynamic PLATE actually falling off, verified at the time by watching it land at world z~0). The
+# plate itself stays physically supported by the rack's own tray/pegs regardless (see
+# randomize_dish_rack_and_plate), not by the pad surface underneath, so moving the rack doesn't
+# reopen that failure mode.
+RACK_POS = (0.47, 0.0, 0.28)
 
 # REVISED (user feedback + direct verification via rack_yaw_check.py, a script that renders the
 # bare rack at yaw in {0, 90, -90, 180}): at the identity yaw used above, the rack's own bracket
@@ -302,8 +318,38 @@ PLATE_SCALE_SMALL = 19.0 / 26.0
 # plate_finalize.py. RACK_TO_PLATE_OFFSET_SMALL/PLATE_REST_ROT_SMALL below are that measured local
 # offset/rotation (in the rack's own frame, so they still compose correctly if yaw_range_deg is
 # ever widened again).
-RACK_TO_PLATE_OFFSET_SMALL = (0.0249, -0.00002, 0.09276)
-PLATE_REST_ROT_SMALL = (0.76827, 0.00023, 0.64012, 0.00027)
+#
+# REVISED (user report + reference photo: the ~2.5cm-off-center recipe above landed the plate
+# leaning against a single peg near one EDGE of the rack, touching only that peg/the pad beside the
+# rack, instead of standing centered inside the peg cluster the way the reference photo shows --
+# same complaint as the pre-rotation "hangs off to one side" failure mode further up this docstring,
+# recurring here after RACK_REST_ROT's rotation and the offset's own re-measurement). Re-tested
+# directly against the real registered task env (gym.make + a genuine env.reset(), not a solo
+# harness) with a battery of centered/off-center/roll-vs-pitch candidates, each direct-written (no
+# free-fall -- a free-fall drop onto this symmetric 4-peg cluster was separately confirmed chaotic,
+# see randomize_dish_rack_and_plate's docstring) and run 400 physics steps (not just settle_steps)
+# to rule out a "looks fine at first, keeps sliding" result the same way the +-2.5cm recipe above
+# was already caught doing under lean jitter. A CENTERED offset (0,0,z) with a PURE 85deg pitch (no
+# small residual roll/yaw noise in the quaternion -- the old recipe's tiny x/z quaternion components
+# turned out to matter: the same offset with the noisy quaternion measured earlier was still visibly
+# tumbling at 400 steps, |w|~5.8, while the clean pure-pitch version settles to |v|<0.001,|w|<0.01)
+# is the only candidate of six tested that both converges to a genuine stationary rest AND stays
+# reasonably centered (settles ~1.5cm off-center in the rack's local y, not the old ~2.5-3cm hard
+# lean to one edge) -- every off-center starting offset tested (0.0125m, and the front/back y=+-3cm
+# pairs) either kept tumbling past 400 steps or, in one case, launched the plate clean off the pad.
+#
+# REVISED (re-verified through the actual randomize_dish_rack_and_plate reset event, not a solo
+# direct-write bypass: 1 of 5 resets with the exact-centered (0,0,z) write above landed badly --
+# 9cm off in xy, still visibly moving at the check's own settle_steps horizon). Root cause: writing
+# EXACTLY centered starts the plate balanced squarely on the peg cluster's own symmetry line, which
+# is the least stable place to start (any solver noise can send it left or right unpredictably) --
+# the four resets that DID land well independently converged to the same slightly-off-center rest,
+# not to the symmetric write target itself. Re-expressed as that already-converged local offset
+# (measured the same way, direct-write + 400-step check through the real reset event) instead of the
+# exact symmetric one, so the write starts AT the natural rest instead of forcing a knife-edge
+# balance every time. plate_rest_rot unchanged (same clean pure-85deg pitch).
+RACK_TO_PLATE_OFFSET_SMALL = (-0.0153, -0.0001, 0.0953)
+PLATE_REST_ROT_SMALL = (0.737277336810124, 0.0, 0.6755902076156602, 0.0)
 
 # Outer radius of the plate disc itself (native mesh measured at 26cm outer diameter -> 13cm
 # radius, scaled the same way as the spawn scale). Needed so randomize_dish_rack_and_plate can
@@ -378,17 +424,59 @@ def _closest_point_on_segment(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor)
     return a + t * ab
 
 
+def _quat_mul(q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]):
+    """wxyz quaternion product q1*q2 -- plain Python (no torch), for module-load-time constants."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def _quat_apply(q: tuple[float, float, float, float], v: tuple[float, float, float]):
+    """Rotate vector ``v`` by wxyz quaternion ``q`` -- plain Python, same math as
+    ``isaaclab.utils.math.quat_apply`` but usable on plain tuples at module-load time."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    uv = (y * vz - z * vy, z * vx - x * vz, x * vy - y * vx)
+    uuv = (y * uv[2] - z * uv[1], z * uv[0] - x * uv[2], x * uv[1] - y * uv[0])
+    return (
+        vx + 2 * (w * uv[0] + uuv[0]),
+        vy + 2 * (w * uv[1] + uuv[1]),
+        vz + 2 * (w * uv[2] + uuv[2]),
+    )
+
+
 def _plate_rest_pos(offset: tuple[float, float, float]) -> tuple[float, float, float]:
-    return (RACK_POS[0] + offset[0], RACK_POS[1] + offset[1], RACK_POS[2] + offset[2])
+    # REVISED (bug found while diagnosing the "plate touches the table" report): this used to be a
+    # plain unrotated add of ``offset`` onto RACK_POS, which was correct back when RACK_REST_ROT was
+    # identity but silently went stale once the rack got its 90deg RACK_REST_ROT yaw -- the actual
+    # per-reset placement (randomize_dish_rack_and_plate) rotates the offset by the rack's real
+    # rotation before adding it, so this static ``scene.plate.init_state`` (only ever visible for
+    # one frame before the first reset event runs) was pointing the plate at a different spot than
+    # every reset actually uses. Harmless for normal play (the reset event always overwrites this
+    # before the first observation), but fixed to match so the raw spawned stage isn't misleading.
+    rx, ry, rz = _quat_apply(RACK_REST_ROT, offset)
+    return (RACK_POS[0] + rx, RACK_POS[1] + ry, RACK_POS[2] + rz)
 
 
 # Kept as the names the rest of this module (and its docstring) already refers to -- resolve to
 # whichever size is DEFAULT_PLATE_SIZE. apply_plate_size() below overrides all of this on an
 # already-constructed env_cfg for the non-default choice; these are just what the scene/event
 # params are initially built with in __post_init__.
+#
+# RACK_TO_PLATE_OFFSET/PLATE_REST_ROT stay the RAW local (pre-rack-rotation) values -- they're also
+# used as randomize_dish_rack_and_plate's own default parameters, which are meant to be local (the
+# function composes them with the rack's actual rotation itself). PLATE_REST_ROT_WORLD is the
+# separate, already-composed value scene.plate's static init_state needs (see _plate_rest_pos above
+# for why the plain PLATE_REST_ROT alone isn't correct there any more either).
 RACK_TO_PLATE_OFFSET = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["offset"]
 PLATE_REST_ROT = PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["rot"]
 PLATE_REST_POS = _plate_rest_pos(RACK_TO_PLATE_OFFSET)
+PLATE_REST_ROT_WORLD = _quat_mul(RACK_REST_ROT, PLATE_REST_ROT)
 
 # Measured the same way: dropped flat onto the pad (as a PhysX deformable body, not a rigid
 # collider -- see this module's docstring) and read back its settled nodal centroid.
@@ -441,7 +529,17 @@ PLATE_REST_POS = _plate_rest_pos(RACK_TO_PLATE_OFFSET)
 # Nudged x from 0.18 to 0.22 to actually use that freed room (still ~15.8cm from either arm's
 # keepout point, comfortably clearing arm_required at this rag's typical planar_radius) instead of
 # leaving it clustered near the robot-side edge of its own placement channel.
-RAG_REST_POS = (0.22, 0.0, 0.2811)
+#
+# REVISED (user request, alongside RACK_POS's own push toward the far edge -- see that constant's
+# docstring): moved from 0.22 to 0.30 to move with it. This alone wouldn't have been enough --
+# _place_rag_crumpled's min_rack_separation push (see its own EventTerm params) actively shoves the
+# rag AWAY from wherever the rack actually ends up by at least min_rack_separation+rack_avoid_margin;
+# at the old 0.22 separation setting, a rag this close to the now-further-out rack would just get
+# pushed straight back toward the robot every reset, silently undoing this move. Reduced together
+# with min_rack_separation (0.22 -> 0.12) and _place_rag_crumpled's own hardcoded x_hi safety cap
+# (0.34 -> 0.38, see that function) so the rag can actually settle out here instead of being pushed
+# back by a stale separation requirement sized for the rack's old position.
+RAG_REST_POS = (0.30, 0.0, 0.2811)
 RAG_REST_ROT = (1.0, 0.0, 0.0, 0.0)
 
 # REVISED (user feedback: the rag "penetrates the robot arm oftenly"): at native scale, this rag's
@@ -571,6 +669,13 @@ def randomize_dish_rack_and_plate(
     each a fresh jitter draw, each still only the same short settle_steps) are back -- see the
     function body -- just loose enough to essentially never fire on a normal landing, tight enough to
     catch a plate that's fallen away from the rack rather than merely leaning a little differently.
+
+    REVISED (found while re-verifying RACK_TO_PLATE_OFFSET_SMALL/PLATE_REST_ROT_SMALL against the
+    real reset event: with plate_lean_jitter_deg now zeroed, every retry attempt above used to
+    redraw the exact same (zero) lean and reproduce the exact same bad landing -- the retry loop had
+    quietly become a no-op against exactly the failure mode it exists to catch). Each attempt now
+    also draws a small (+-4mm) position jitter independent of the lean angle, so a failed attempt has
+    something to try differently, and the cap was raised 3 -> 5 to give that extra draw more chances.
     """
     rack = env.scene[rack_cfg.name]
     plate = env.scene[plate_cfg.name]
@@ -649,10 +754,20 @@ def randomize_dish_rack_and_plate(
     rack_pos_now = rack.data.root_pos_w[env_ids]
     rack_rot_now = rack.data.root_quat_w[env_ids]
 
+    # REVISED (found while re-verifying RACK_TO_PLATE_OFFSET_SMALL above through the real reset
+    # event: a bad landing's retry used to redraw ``lean`` from plate_lean_jitter_deg, but that's
+    # now (0,0) -- so every retry attempt wrote the EXACT same target and reproduced the EXACT same
+    # bad landing, making the retry loop below pure dead weight against the "starts on a knife-edge"
+    # failure mode that motivated re-centering the offset in the first place. A small POSITION
+    # jitter, independent of the lean angle, gives a failed attempt something different to try --
+    # just enough to break exact symmetry without reopening the +-8deg lean instability that caused
+    # the original "touches the table" report.
+    retry_pos_jitter_range = torch.tensor([[-0.004, 0.004], [-0.004, 0.004]], device=device)
+
     pending_ids = env_ids
     pending_rack_pos = rack_pos_now
     pending_rack_rot = rack_rot_now
-    for attempt in range(3):
+    for attempt in range(5):
         m = len(pending_ids)
         lean = math_utils.sample_uniform(lean_ranges[:, 0], lean_ranges[:, 1], (m, 2), device=device)
         lean_quat = math_utils.quat_from_euler_xyz(lean[:, 0], lean[:, 1], torch.zeros(m, device=device))
@@ -661,18 +776,30 @@ def randomize_dish_rack_and_plate(
         # how the rack itself has been rotated this episode.
         jittered_local_rot = math_utils.quat_mul(lean_quat, plate_local_rot_const.expand(m, 4))
         target_rot = math_utils.quat_mul(pending_rack_rot, jittered_local_rot)
-        target_pos = pending_rack_pos + math_utils.quat_apply(pending_rack_rot, offset_local.expand(m, 3))
+        pos_jitter_xy = math_utils.sample_uniform(
+            retry_pos_jitter_range[:, 0], retry_pos_jitter_range[:, 1], (m, 2), device=device
+        )
+        jittered_offset_local = offset_local.expand(m, 3).clone()
+        jittered_offset_local[:, 0:2] += pos_jitter_xy
+        target_pos = pending_rack_pos + math_utils.quat_apply(pending_rack_rot, jittered_offset_local)
 
         _settle_plate(env, plate, pending_ids, target_pos, target_rot, settle_steps)
 
-        # coarse sanity check, not a precision tolerance -- direct placement is already known-good
-        # on average (see docstring), this only needs to catch the rare case that fell/got pushed
-        # away during the short settle (e.g. off the rack, or through the pad), not fine-tune the
-        # lean. Generous on purpose so it essentially never fires on a normal landing.
+        # REVISED (user report: plate ends up touching the pad/table instead of the rack, every
+        # reset -- traced to this check, not just plate_lean_jitter_deg above): 0.08m was loose
+        # enough to silently PASS a plate that had already slid most of the way down off the peg
+        # contact onto the tray/pad -- verified directly (see plate_lean_jitter_deg's docstring):
+        # a jittered landing measured only ~4-8cm below target at this check's own settle_steps
+        # horizon, comfortably under the old 0.08 threshold, yet kept sliding to within 0.3-1.6cm of
+        # the rack root (i.e. onto the pad) once physics kept running into the actual episode. Even
+        # with jitter now zeroed, this stays tight (not just reverted) as a real regression guard:
+        # the verified-stable zero-jitter pose itself only moves <1mm from target once settled, so
+        # 0.02 has ample margin above normal settle noise while still catching a genuine bad landing
+        # (off the rack, through the pad) instead of only a catastrophic one.
         actual_pos = plate.data.root_pos_w[pending_ids]
-        bad = (actual_pos[:, 2] - target_pos[:, 2]).abs() > 0.08
-        bad |= (actual_pos[:, 0:2] - target_pos[:, 0:2]).norm(dim=-1) > 0.08
-        if not bool(bad.any()) or attempt == 2:
+        bad = (actual_pos[:, 2] - target_pos[:, 2]).abs() > 0.02
+        bad |= (actual_pos[:, 0:2] - target_pos[:, 0:2]).norm(dim=-1) > 0.02
+        if not bool(bad.any()) or attempt == 4:
             break
         pending_ids = pending_ids[bad]
         pending_rack_pos = pending_rack_pos[bad]
@@ -842,9 +969,17 @@ def _place_rag_crumpled(
     # (now x:[0.38,0.42] -- see that constant's docstring): still comfortably clear of the rack's
     # new, narrower roaming zone even before the dynamic min_rack_separation push below runs, while
     # handing the rag the room RACK_POS's own move freed up instead of leaving it unused.
+    #
+    # REVISED (user request: push both the rack and the rag further toward the pad's far edge --
+    # see RACK_POS's and RAG_REST_POS's own docstrings). Raised 0.34 -> 0.38 alongside RACK_POS's
+    # move out to 0.47: the rack's own footprint (10cm wide post-rotation, see RACK_POS's docstring)
+    # now starts around x~0.40 at its nearest, so 0.38 keeps a couple cm clear of that before the
+    # dynamic min_rack_separation push (reduced alongside this, see the EventTerm params) does the
+    # rest. Still under the PAD_X_RANGE-derived limit below (~0.39 at this rag's typical
+    # planar_radius), so this hardcoded cap remains the binding one, same as before.
     pad_margin = 0.02
     x_lo = torch.maximum(PAD_X_RANGE[0] + planar_radius + pad_margin, torch.full_like(planar_radius, 0.14))
-    x_hi = torch.minimum(PAD_X_RANGE[1] - planar_radius - pad_margin, torch.full_like(planar_radius, 0.34))
+    x_hi = torch.minimum(PAD_X_RANGE[1] - planar_radius - pad_margin, torch.full_like(planar_radius, 0.38))
     y_lo = torch.maximum(PAD_Y_RANGE[0] + planar_radius + pad_margin, torch.full_like(planar_radius, -0.15))
     y_hi = torch.minimum(PAD_Y_RANGE[1] - planar_radius - pad_margin, torch.full_like(planar_radius, 0.15))
 
@@ -1157,7 +1292,7 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
         # small/large variants need their own measured offset/rotation, not just a rescaled copy.
         self.scene.plate = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Plate",
-            init_state=RigidObjectCfg.InitialStateCfg(pos=PLATE_REST_POS, rot=PLATE_REST_ROT),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=PLATE_REST_POS, rot=PLATE_REST_ROT_WORLD),
             spawn=sim_utils.UsdFileCfg(
                 usd_path=PLATE_USD_PATH,
                 scale=(PLATE_SIZE_CONFIGS[DEFAULT_PLATE_SIZE]["scale"],) * 3,
@@ -1208,11 +1343,24 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # orientation; an arbitrary yaw was never separately verified to hold up as well,
                 # and "plate not visibly seated" reports line up with that gap.
                 "yaw_range_deg": (0.0, 0.0),
-                # roll/pitch jitter on the plate's lean, applied in the rack's own local frame
-                # (see randomize_dish_rack_and_plate's docstring) -- how much it tips and which
-                # way, while a physics drop (not a teleport) finds the actual valid resting
-                # contact for that jitter.
-                "plate_lean_jitter_deg": {"roll": (-8.0, 8.0), "pitch": (-8.0, 8.0)},
+                # REVISED (user report: plate lands touching the pad/table instead of resting on
+                # the rack, reproducible across repeated resets): the +-8deg range here was NEVER
+                # actually a safe perturbation of PLATE_REST_ROT_SMALL/RACK_TO_PLATE_OFFSET_SMALL --
+                # verified directly with a standalone rack+plate physics harness (real gravity, no
+                # tolerance shortcuts): the committed target pose IS a genuine stable equilibrium
+                # at zero jitter (settles at the documented ~9.27cm above the rack and stays there,
+                # velocity -> 0, for a full 5s of physics), but every jittered pitch draw tested
+                # (e.g. +8deg pitch, or the -8/+8 combo) slides CONTINUOUSLY off the peg over the
+                # next several seconds -- from ~9.2cm down to 0.3-1.6cm above the rack root, i.e.
+                # down onto the tray/pad -- well past what the short settle_steps below or the
+                # sanity check's tolerance actually observes at reset time. Since this event only
+                # steps physics for settle_steps before the episode starts, a jittered reset that
+                # "looked fine" at the 50-step mark keeps sliding during the ACTUAL teleop session
+                # afterward, unobserved -- exactly the reported symptom. Zeroed out (not just
+                # narrowed) until a genuinely wider stable basin is found and re-verified the same
+                # way; this makes every reset land at the one pose that's actually been confirmed
+                # to hold, at the cost of per-episode lean variety.
+                "plate_lean_jitter_deg": {"roll": (0.0, 0.0), "pitch": (0.0, 0.0)},
                 # REVISED (user feedback: resetting takes too long, AND "just spawn it directly in
                 # the ideal state/position if you can" -- see randomize_dish_rack_and_plate's
                 # docstring for the full reasoning): no more plate_drop_height -- the plate is
@@ -1230,7 +1378,17 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # one frozen BELOW the rack's own root (a still-resolving SDF-collision push that
                 # hadn't finished). Raised to 50 -- re-verify with the same 10-reset check before
                 # trusting this number.
-                "settle_steps": 50,
+                #
+                # REVISED (raised 50 -> 120, alongside zeroing plate_lean_jitter_deg above): the
+                # standalone physics harness used to diagnose the "touches the table" report showed
+                # a bad (jittered) landing can still be sliding measurably at 50 steps and only
+                # reveals how far it will actually fall after several hundred more -- so 50 steps
+                # was too short to trust the very sanity check below that's supposed to catch a bad
+                # landing. 120 is still cheap (this direct-write settle only needs to relax mm-scale
+                # interpenetration for the now-deterministic, pre-verified target pose, not discover
+                # a resting pose from scratch) but gives a real bad landing enough time to show up
+                # as still moving, instead of looking momentarily fine.
+                "settle_steps": 120,
                 "rack_cfg": SceneEntityCfg("dish_rack"),
                 "plate_cfg": SceneEntityCfg("plate"),
                 # Explicit (not just relying on the function's own defaults) so apply_plate_size
@@ -1275,7 +1433,17 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
                 # place the rack almost anywhere on the pad, so the rag's landing still needs to
                 # actively dodge wherever it ended up this episode -- see _place_rag_crumpled's
                 # docstring for the push-then-clamp mechanics this drives.
-                "min_rack_separation": 0.22,
+                #
+                # REVISED (user request: push the rag further toward the pad's far edge, alongside
+                # RACK_POS's own move out to 0.47 -- see RAG_REST_POS's docstring): lowered
+                # 0.22 -> 0.12. RAG_REST_POS's new nominal (0.30) sits only ~0.17m from RACK_POS
+                # (0.47) -- the OLD 0.22 separation requirement (0.22+0.05 margin = 0.27m) would have
+                # been violated by that nominal spot alone, so the push-away-from-rack logic would
+                # have shoved the rag straight back toward the robot every single reset, silently
+                # undoing the move. 0.12 (+0.05 margin = 0.17m) matches the new nominal gap instead of
+                # fighting it, while still giving the push something real to do whenever the rack's
+                # own per-reset xy jitter happens to land closer than that.
+                "min_rack_separation": 0.12,
                 # REINSTATED (a first version of this direct-spawn recipe dropped this entirely,
                 # believing the template guarantee made it unnecessary -- verified wrong, see
                 # randomize_rag_drop's docstring: ~40% of individual placements still settled flatter
