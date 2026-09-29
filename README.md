@@ -40,6 +40,20 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --manual_save --headless
 ```
 
+If you want to send command to real robot also
+
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/plate_wipe.hdf5 \
+    --enable_cameras \
+    --num_demos 10 \
+    --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 \
+    --manual_save --headless --real_arm
+```
+
 Dora publish code
 
 please refer to https://github.com/StanleyChueh/dora-openarm-data-collection.git 
