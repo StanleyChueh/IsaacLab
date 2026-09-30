@@ -86,6 +86,21 @@ Driving the real arms alongside the simulation:
   The bridge asks you to type YES in this terminal before it moves the real arms to the simulated
   pose, and 'q' + Enter stops them. Bring the CAN-FD links up first (openarm_can/setup: sudo ./my_arm).
 
+Recording the real robot too (--real_arm_dataset):
+
+  Adds a LeRobot v3 dataset of the REAL cameras + measured joints, written by the bridge process
+  (lerobot_openarm/real_episode_recorder.py) next to the sim HDF5: one real episode per demo saved
+  here, started by button X and dropped on Y/R, same 16D LJ1..8/RJ1..8 layout as the sim datasets.
+  --resume/--overwrite apply to both. No conversion step is needed for it.
+
+  ./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
+    --dataset_file logs/demos/plate_wipe.hdf5 \
+    --enable_cameras --num_demos 10 --teleop_device vr_joint_ros2_native \
+    --ros2_domain_id 1 --manual_save --headless --real_arm \
+    --real_arm_dataset ~/datasets/plate_wipe_real \
+    --real_arm_task "<the same task string as the sim dataset>"
+
 Resuming a session:
 
   An existing --dataset_file is never silently overwritten; the run refuses to start instead. Add
@@ -456,6 +471,47 @@ parser.add_argument(
     help="--real_arm only: rad/s cap on every real arm joint (the bridge's --max-joint-speed).",
 )
 parser.add_argument(
+    "--real_arm_dataset",
+    type=str,
+    default=None,
+    help=(
+        "--real_arm only: also record the REAL robot -- its cameras and measured joints -- into a"
+        " LeRobot v3 dataset at this directory, one episode for every demo this script saves (see"
+        " lerobot_openarm/real_episode_recorder.py). --resume/--overwrite apply to it as well."
+    ),
+)
+parser.add_argument(
+    "--real_arm_task",
+    type=str,
+    default=None,
+    help=(
+        "--real_arm_dataset only (required there): the task string stored with every frame. SmolVLA"
+        " conditions on it, so use the same string as the sim dataset's convert_hdf5_to_lerobot.py --task."
+    ),
+)
+parser.add_argument(
+    "--real_arm_cameras",
+    type=str,
+    default="body_cam=rs_body,wrist_cam=rs_wrist_left,right_wrist_cam=rs_wrist_right",
+    help="--real_arm_dataset only: <dataset_key>=<video index or udev alias> pairs, comma-separated.",
+)
+parser.add_argument(
+    "--real_arm_action_source",
+    choices=["command", "next_state"],
+    default="command",
+    help=(
+        "--real_arm_dataset only: what the real dataset's 'action' is. 'command' = the sim joint target"
+        " the real arm was told to follow; 'next_state' = the next measured real state (the proxy"
+        " convert_hdf5_to_lerobot.py uses for sim data)."
+    ),
+)
+parser.add_argument(
+    "--real_arm_event_port",
+    type=int,
+    default=5559,
+    help="--real_arm_dataset only: UDP port for the start/save/reset episode events sent to the bridge.",
+)
+parser.add_argument(
     "--dump_joint_order",
     type=str,
     default=None,
@@ -506,10 +562,25 @@ def resolve_real_arm_bridge(args) -> tuple[str, str, str, str]:
 
 
 REAL_ARM_DEFAULT_UDP_PORT = 5557
+RESET_HOLD_S = 30.0  # how long the bridge keeps the real arm holding while env.reset() blocks
 if args_cli.real_arm:
     if not args_cli.mirror_udp_port:
         args_cli.mirror_udp_port = REAL_ARM_DEFAULT_UDP_PORT
     real_arm_project_dir, real_arm_python, real_arm_calibration, real_arm_urdf = resolve_real_arm_bridge(args_cli)
+if args_cli.real_arm_dataset:
+    if not args_cli.real_arm:
+        _sys.exit("--real_arm_dataset records the real robot, so it needs --real_arm.")
+    if not args_cli.real_arm_task:
+        _sys.exit("--real_arm_dataset needs --real_arm_task (the task string stored with every frame).")
+    args_cli.real_arm_dataset = _os.path.abspath(_os.path.expanduser(args_cli.real_arm_dataset))
+    _real_info = _os.path.join(args_cli.real_arm_dataset, "meta", "info.json")
+    if _os.path.exists(_real_info) and not (args_cli.resume or args_cli.overwrite):
+        with open(_real_info) as _f:
+            _n = _json.load(_f).get("total_episodes", "?")
+        _sys.exit(
+            f"--real_arm_dataset {args_cli.real_arm_dataset} already holds {_n} episode(s). Add --resume"
+            " to append to it (and to --dataset_file) or --overwrite to start both again."
+        )
 
 
 def next_demo_index(data_group) -> int:
@@ -628,6 +699,20 @@ DATASET_PATH, RESUME_OFFSET = preflight_dataset(args_cli)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Kit's omni.usd-abi plugin logs "IRenderSettings::getRenderSettings failed getting a stage-id" as an
+# [Error] several times per step in a --headless --enable_cameras run. Nothing here depends on what
+# it failed to read (the cameras render and record regardless), and at 30 Hz it buries every line
+# this script and the real-arm bridge print. Only that one channel is silenced, and only below
+# fatal -- every other Kit error still shows.
+try:
+    import omni.log
+
+    omni.log.get_log().set_channel_level(
+        "omni.usd-abi.plugin", omni.log.Level.FATAL, omni.log.SettingBehavior.OVERRIDE
+    )
+except Exception as _e:  # never let a logging tweak stop a recording session
+    print(f"[WARN] could not silence omni.usd-abi.plugin log channel: {_e}")
+
 """Rest everything follows."""
 
 import json
@@ -646,7 +731,7 @@ import torch
 # autonomous-policy evaluator (scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py) can
 # drive the real robot over the exact same wire format this teleop recorder does, against one
 # shared lerobot_openarm/mirror_bridge.py. Nothing about the behaviour changed in the move.
-from sim_mirror import JointFeedbackReceiver, JointMirrorBroadcaster, save_sim_vs_real_plot
+from sim_mirror import EpisodeEventSender, JointFeedbackReceiver, JointMirrorBroadcaster, save_sim_vs_real_plot
 
 import omni.ui as ui
 
@@ -2446,6 +2531,19 @@ def main():
         ]
         if args_cli.mirror_feedback_port:
             bridge_cmd += ["--feedback-port", str(args_cli.mirror_feedback_port)]
+        if args_cli.real_arm_dataset:
+            bridge_cmd += [
+                "--record-root", args_cli.real_arm_dataset,
+                "--record-task", args_cli.real_arm_task,
+                "--record-cameras", args_cli.real_arm_cameras,
+                "--record-fps", str(args_cli.step_hz),
+                "--record-event-port", str(args_cli.real_arm_event_port),
+                "--record-action-source", args_cli.real_arm_action_source,
+            ]
+            if args_cli.resume:
+                bridge_cmd.append("--record-resume")
+            if args_cli.overwrite:
+                bridge_cmd.append("--record-overwrite")
         print(f"[REAL ARM] Starting bridge: {' '.join(bridge_cmd)}")
         bridge_proc = subprocess.Popen(bridge_cmd, cwd=real_arm_project_dir, env=bridge_env)
 
@@ -2455,8 +2553,10 @@ def main():
             # A Ctrl+C in this terminal reaches the bridge too, and it is then already ramping the
             # arms down -- a second SIGINT would cut that short. So give it a moment to finish on
             # its own before asking.
+            # With --real_arm_dataset it also has to notice we are gone (its 1s packet timeout),
+            # ramp down, and finalize the dataset -- give it room, a SIGINT is only a fallback.
             try:
-                bridge_proc.wait(timeout=3)
+                bridge_proc.wait(timeout=30 if args_cli.real_arm_dataset else 3)
                 return
             except subprocess.TimeoutExpired:
                 pass
@@ -2469,6 +2569,28 @@ def main():
                 print("[REAL ARM] Bridge did not exit in 15s -- verify the motors are de-energised.")
 
         atexit.register(_stop_real_arm_bridge)
+
+    # ── Episode events for the bridge's real-robot dataset (opt-in, --real_arm_dataset) ──
+    episode_events = (
+        EpisodeEventSender(host=args_cli.mirror_udp_host, port=args_cli.real_arm_event_port)
+        if args_cli.real_arm_dataset
+        else None
+    )
+
+    def send_episode_event(event: str):
+        if episode_events is not None:
+            episode_events.send(event, demo_count)
+
+    def announce_episode_export():
+        """Call right BEFORE exporting an episode. Writing the demo (with its camera frames) to the
+        HDF5 blocks the step loop, and so the mirror broadcast, for longer than the bridge's packet
+        timeout: unannounced, the bridge disables the real motors and throws away the real episode
+        it was still recording. The "save" goes out first so the real episode ends here, at the
+        demo's last step, rather than collecting frames of the arm standing still during the write.
+        """
+        send_episode_event("save")
+        if mirror_broadcaster is not None:
+            mirror_broadcaster.announce_hold(RESET_HOLD_S)
 
     # ── Real-robot feedback listener, for a sim-vs-real plot on exit (opt-in) ──
     feedback_receiver = None
@@ -2815,6 +2937,7 @@ def main():
         env.recorder_manager.reset([0])
         recording_armed = True
         MOTION_GATE["enabled"] = True
+        send_episode_event("start")
         print("Recording started (button X) -- robot released")
 
     def save_episode():
@@ -2822,6 +2945,7 @@ def main():
         if requires_manual_arm and not recording_armed:
             print("Not recording yet -- press X to start recording before saving.")
             return
+        announce_episode_export()
         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
         env.recorder_manager.set_success_to_episodes(
             [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
@@ -2874,6 +2998,8 @@ def main():
     env.sim.reset(soft=True)
     env.reset()
     teleop.reset()
+    if recording_armed:
+        send_episode_event("start")
 
     mode_str = "Dual-Arm" if is_dual_arm else "Single-Arm"
     print(f"\n=== OpenArm {mode_str} Recording ===")
@@ -3040,6 +3166,7 @@ def main():
                 if succeeded and not args_cli.manual_save and not rtr_active:
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
+                        announce_episode_export()
                         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
                         env.recorder_manager.set_success_to_episodes(
                             [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
@@ -3088,10 +3215,16 @@ def main():
                 # entirely, in case it's relied on for something else this session doesn't exercise.
                 # Matters beyond cosmetics here: commands recorded/replayed against a REAL robot
                 # should never command it through an unintended collapsed pose during a reset.
+                # env.reset() blocks this loop, and so the mirror broadcast, for longer than the
+                # bridge's packet timeout -- unannounced, it would disable the real motors.
+                if mirror_broadcaster is not None:
+                    mirror_broadcaster.announce_hold(RESET_HOLD_S)
                 env.sim.reset(soft=True)
                 env.recorder_manager.reset()
                 env.reset()
                 teleop.reset()
+                # After a save this is a no-op on the bridge; otherwise it drops the real episode.
+                send_episode_event("reset")
                 success_step_count = 0
                 should_reset = False
                 # requires_manual_arm modes go back to un-armed after every reset -- the next
@@ -3099,6 +3232,8 @@ def main():
                 # Other modes stay always-armed (old behavior).
                 recording_armed = not requires_manual_arm
                 MOTION_GATE["enabled"] = recording_armed
+                if recording_armed:
+                    send_episode_event("start")  # always-armed modes: the next episode starts now
                 handover_stage_seen["value"] = None
                 # Reset gripper states to open
                 left_gripper_state = 1.0
@@ -3113,6 +3248,10 @@ def main():
 
             rate_limiter.sleep(env)
 
+    # Ends the bridge now (ramp down, disable, finalize the real dataset) instead of leaving it to
+    # sit out whatever hold was last announced while env.close() runs.
+    if mirror_broadcaster is not None:
+        mirror_broadcaster.announce_shutdown()
     env.close()
     session_count = demo_count - resume_offset
     print(

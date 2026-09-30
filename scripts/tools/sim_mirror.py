@@ -11,6 +11,8 @@ rollout onto the real robot over the exact same wire format a teleop recording s
 one bridge process, one packet schema, one plot, whichever sim-side script is driving.
 
 Wire format (sim -> bridge, UDP JSON): {"seq": int, "t": float, "joints": {joint_name: radians}}
+                                        plus "hold_ms": float on the packet sent before a reset
+                                        (see JointMirrorBroadcaster.announce_hold)
 Feedback   (bridge -> sim, UDP JSON): {"t": float, "joints": {joint_name: radians}}
 """
 
@@ -54,8 +56,6 @@ class JointMirrorBroadcaster:
         names = [all_names[i] for i in indices]
         return indices, names
 
-    WIDTH_PRINT_PERIOD_S = 0.5  # throttle -- printing every step at 30Hz would flood the console
-
     # Matches BinaryJointPositionActionCfg's open_command_expr/close_command_expr for the
     # finger joints in stack_joint_pos_env_cfg.py (both arms use the same values).
     GRIPPER_OPEN_VAL = 0.044
@@ -68,7 +68,6 @@ class JointMirrorBroadcaster:
         self._robot = robot
         self._seq = 0
         self._history: list[tuple[float, dict]] = []
-        self._last_width_print_t = 0.0
         print(f"[MIRROR] Broadcasting {len(self._names)} joints to {host}:{port} -> {self._names}")
 
     def broadcast(self, left_gripper_state: float | None = None, right_gripper_state: float | None = None):
@@ -123,17 +122,61 @@ class JointMirrorBroadcaster:
         except OSError:
             pass  # best-effort only -- never let a networking hiccup break recording
 
-        if packet["t"] - self._last_width_print_t >= self.WIDTH_PRINT_PERIOD_S:
-            self._last_width_print_t = packet["t"]
-            # Both finger joints are prismatic, 0.0 (closed) .. 0.044m (open), moving symmetrically
-            # outward -- see openarm_description.urdf finger_joint1/2 limits and mimic tag. Total
-            # gripper opening width is the sum of both fingers' travel from the closed position.
-            left_mm = joints.get("openarm_left_finger_joint1", 0.0) * 2000.0
-            right_mm = joints.get("openarm_right_finger_joint1", 0.0) * 2000.0
-            print(f"[SIM GRIPPER]  left={left_mm:5.1f}mm  right={right_mm:5.1f}mm")
+    def announce_hold(self, hold_s: float) -> None:
+        """Tell the bridge the broadcasts are about to pause for up to ``hold_s`` seconds.
+
+        Call right before anything that blocks the step loop (env.reset()). The bridge treats more
+        than --timeout-ms of silence as "the sim died" and disables the motors, which drops the
+        arms; a packet carrying "hold_ms" makes it hold the last pose for that long instead. It
+        re-sends the last joints, so the arm is not asked to move.
+        """
+        if not self._history:
+            return
+        packet = {"seq": self._seq, "t": time.time(), "joints": self._history[-1][1], "hold_ms": hold_s * 1000.0}
+        self._seq += 1
+        try:
+            self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
+        except OSError:
+            pass
+
+    def announce_shutdown(self) -> None:
+        """Tell the bridge this process is finished: it ramps the arm down and exits at once,
+        rather than after its packet timeout (or a hold announced just before)."""
+        if not self._history:
+            return
+        packet = {"seq": self._seq, "t": time.time(), "joints": self._history[-1][1], "shutdown": True}
+        self._seq += 1
+        try:
+            self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
+        except OSError:
+            pass
 
     def history(self) -> list[tuple[float, dict]]:
         return self._history
+
+
+class EpisodeEventSender:
+    """Tells the real-robot bridge where episodes begin and end, so it can record the real cameras
+    and joints alongside this process's own dataset (lerobot_openarm/real_episode_recorder.py).
+
+    Wire format (sim -> bridge, UDP JSON): {"event": "start"|"save"|"reset", "seq": int, "t": float,
+    "demo": int}. On its own port because the joint receiver keeps only the newest packet, and a
+    "save" must never be overtaken. Fire-and-forget, like JointMirrorBroadcaster.
+    """
+
+    def __init__(self, host: str, port: int):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._addr = (host, port)
+        self._seq = 0
+        print(f"[REAL REC] Sending episode events to {host}:{port}")
+
+    def send(self, event: str, demo: int) -> None:
+        packet = {"event": event, "seq": self._seq, "t": time.time(), "demo": demo}
+        self._seq += 1
+        try:
+            self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
+        except OSError:
+            pass  # best-effort only -- never let a networking hiccup break recording
 
 
 class JointFeedbackReceiver:
