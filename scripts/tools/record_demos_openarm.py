@@ -3123,9 +3123,18 @@ def main():
             if running:
                 obs, *_ = env.step(actions)
                 if mirror_broadcaster is not None:
+                    # Before button X the sim robot is held at its rest pose with the grippers OPEN
+                    # (MOTION_GATE), but build_dual_action() still reports the headset's trigger --
+                    # which, after an episode that ended holding something, says "closed". Passing
+                    # that on made the real gripper stay shut on the object while the sim's had
+                    # already opened. Un-armed, mirror what the sim robot is actually doing: None
+                    # makes broadcast() send the measured finger position instead of the command.
+                    mirror_commanded_grippers = recording_armed or not requires_manual_arm
                     mirror_broadcaster.broadcast(
-                        left_gripper_state=left_gripper_state,
-                        right_gripper_state=right_gripper_state if is_dual_arm else None,
+                        left_gripper_state=left_gripper_state if mirror_commanded_grippers else None,
+                        right_gripper_state=(
+                            right_gripper_state if is_dual_arm and mirror_commanded_grippers else None
+                        ),
                     )
 
                 # ── Debug: right arm left-finger contact force vs cube_2 ────────
