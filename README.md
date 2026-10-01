@@ -26,25 +26,10 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --manual_save
 ```
 
-If you want to run in headless mode
-
+If you want to record dataset in real world(real world robot and camera)
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/plate_wipe.hdf5 \
-    --enable_cameras \
-    --num_demos 10 \
-    --teleop_device vr_joint_ros2_native \
-    --ros2_domain_id 1 \
-    --manual_save --headless
-```
-
-If you want to send command to real robot also
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
- ./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PlateWipe-OpenArm-IK-Abs-v0     --dataset_file logs/demos/plate_wipe.hdf5     --enable_cameras --num_demos 30     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v0     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm" --overwrite
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PlateWipe-OpenArm-IK-Abs-v0     --dataset_file logs/demos/plate_wipe.hdf5     --num_demos 20     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v00     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm" 
 ```
 
 Dora publish code
