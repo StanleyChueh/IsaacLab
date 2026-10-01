@@ -101,6 +101,13 @@ Recording the real robot too (--real_arm_dataset):
     --real_arm_dataset ~/datasets/plate_wipe_real \
     --real_arm_task "<the same task string as the sim dataset>"
 
+  --real_arm_dataset implies --no_sim_cameras: the sim's cameras are removed and the HDF5 holds
+  states and actions only. Rendering them held the step loop -- which is what commands the real arm
+  -- to ~8 Hz; without them it runs at ~20 Hz, bounded by physics. Two opt-in flags go further, and
+  belong together: --real_arm_mirror command sends the real arm the joint targets instead of the
+  sim arm's measured pose (no sim tracking lag, but no sim collision stop either), and
+  --sim_decimation 2 cuts the physics per step so the loop reaches the full --step_hz.
+
 Resuming a session:
 
   An existing --dataset_file is never silently overwritten; the run refuses to start instead. Add
@@ -506,10 +513,58 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--real_arm_mirror",
+    choices=["measured", "command"],
+    default="measured",
+    help=(
+        "--real_arm only: which sim joint values the real arm is sent. 'measured' (default) = where"
+        " the simulated arm IS, so the real arm trails the sim arm's own tracking lag but also stops"
+        " wherever the sim arm is stopped by a simulated collision (the table). 'command' = the"
+        " joint target the simulated arm was GIVEN this step (still gated by button X, --task_mode"
+        " and the return-to-rest ramp), which removes that lag -- and that collision stop: the real"
+        " arm is then limited only by the bridge's speed cap."
+    ),
+)
+parser.add_argument(
+    "--sim_decimation",
+    type=int,
+    default=None,
+    help=(
+        "Override the task's decimation (physics substeps per step). Physics is what bounds the"
+        " step loop once the sim cameras are gone, so fewer substeps let the loop -- and the real"
+        " arm's command rate -- reach --step_hz. Simulated time then runs slower than real time,"
+        " so use it with --real_arm_mirror command, never for data the sim itself is recorded for."
+    ),
+)
+parser.add_argument(
     "--real_arm_event_port",
     type=int,
     default=5559,
     help="--real_arm_dataset only: UDP port for the start/save/reset episode events sent to the bridge.",
+)
+parser.add_argument(
+    "--real_arm_view_hz",
+    type=float,
+    default=10.0,
+    help=(
+        "--real_arm_dataset only: rate of the live rerun window showing the real cameras and the"
+        " collection status. It runs in the bridge process off its control loop, and the viewer is"
+        " a separate process, so it does not slow the arm. 0 disables it."
+    ),
+)
+parser.add_argument(
+    "--no_sim_cameras",
+    action="store_true",
+    default=False,
+    help=(
+        "Remove every simulated camera from the task (scene sensors, their image observations and"
+        " any event that targets them) before the env is built, so Isaac Sim renders no camera"
+        " images at all; --enable_cameras is then not needed on the command line. For real-robot collection (--real_arm_dataset),"
+        " where the images that matter come from the real cameras: rendering the sim's cameras is"
+        " what holds the step loop -- and so the rate the real arm is commanded at -- to a few Hz."
+        " The HDF5 this script writes then holds states and actions only, no images. Implied by"
+        " --real_arm_dataset."
+    ),
 )
 parser.add_argument(
     "--dump_joint_order",
@@ -525,6 +580,16 @@ parser.add_argument(
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+# Recording the real robot is the case --no_sim_cameras exists for: the images come from the real
+# cameras, and the sim's are pure cost on the loop that commands the real arm.
+if args_cli.real_arm_dataset:
+    args_cli.no_sim_cameras = True
+# --no_sim_cameras still launches the camera-capable headless app: the plain headless one ships no
+# omni.ui / app window, which this script's instruction window and keyboard shortcuts import. With
+# no camera left in the scene nothing is rendered either way, so this costs startup time only.
+if args_cli.no_sim_cameras and args_cli.headless:
+    args_cli.enable_cameras = True
 
 
 # ─── Existing-dataset pre-flight (--resume / --overwrite) ─────────────────────
@@ -2029,15 +2094,81 @@ class ROS2NativeJointTeleop:
         return full, full[LEFT_JOINT_GRP_IDX].item(), full[RIGHT_JOINT_GRP_IDX].item()
 
 
+def strip_sim_cameras(env_cfg) -> list[str]:
+    """Drop every camera sensor from ``env_cfg.scene`` and everything that refers to one, for
+    --no_sim_cameras. Must run on the parsed cfg BEFORE gym.make(). Returns the removed names.
+
+    A camera left in the scene makes the env refuse to build without --enable_cameras, and an
+    observation/event term left pointing at a removed one fails to resolve its SceneEntityCfg --
+    so all three go together. ``None`` is what the managers read as "skip this term".
+    """
+    from isaaclab.managers import SceneEntityCfg
+    from isaaclab.sensors import CameraCfg
+
+    cameras = [name for name, value in vars(env_cfg.scene).items() if isinstance(value, CameraCfg)]
+    for name in cameras:
+        setattr(env_cfg.scene, name, None)
+
+    def refers_to_camera(term) -> bool:
+        params = getattr(term, "params", None) or {}
+        return any(isinstance(v, SceneEntityCfg) and v.name in cameras for v in params.values())
+
+    def strip_terms(group) -> None:
+        for term_name, term in list(vars(group).items()):
+            if refers_to_camera(term):
+                setattr(group, term_name, None)
+
+    for group in vars(env_cfg.observations).values():
+        if group is not None and hasattr(group, "__dict__"):
+            strip_terms(group)
+    if getattr(env_cfg, "events", None) is not None:
+        strip_terms(env_cfg.events)
+    if hasattr(env_cfg, "image_obs_list"):
+        env_cfg.image_obs_list = []
+    return cameras
+
+
+def pump_app_without_rendering(env) -> None:
+    """Run one Kit app update when env.step() is not going to (--headless --no_sim_cameras).
+
+    env.step() only updates the app between physics substeps when there is a GUI or an RTX sensor
+    to render for. With neither, nothing in the step does -- and the app update is what ticks
+    OmniGraph's OnPlaybackTick, i.e. what makes build_ros2_joint_command_graph's subscriber decode
+    the next ROS2 message. Left to RateLimiter's render alone, the headset's commands and buttons
+    would arrive only on steps that finished early enough to sleep. Same playSimulations guard as
+    SimulationContext.render(), so the update does not also step physics.
+    """
+    sim = env.sim
+    if sim.has_gui() or sim.has_rtx_sensors():
+        return
+    sim.set_setting("/app/player/playSimulations", False)
+    simulation_app.update()
+    sim.set_setting("/app/player/playSimulations", True)
+
+
 class RateLimiter:
-    def __init__(self, hz):
+    def __init__(self, hz, exact: bool = False):
+        """``exact`` sleeps only what is left of the period. Without it every wait is a whole
+        ``render_period`` plus a render, however little was left -- a step that takes 25 ms of a
+        33 ms period then costs 60+ ms, i.e. half of --step_hz. Left as it was for the sim-camera
+        runs (whose pacing every existing dataset was recorded under) and switched on for
+        --no_sim_cameras, where that rate is the rate the real arm is commanded at."""
         self.hz = hz
         self.last_time = time.time()
         self.sleep_duration = 1.0 / hz
         self.render_period = min(0.033, self.sleep_duration)
+        self.exact = exact
 
     def sleep(self, env):
         next_wakeup_time = self.last_time + self.sleep_duration
+        if self.exact:
+            remaining = next_wakeup_time - time.time()
+            if remaining > 0:
+                time.sleep(remaining)
+                self.last_time = next_wakeup_time
+            else:
+                self.last_time = time.time()  # overran: start the next period now, not on the old grid
+            return
         while time.time() < next_wakeup_time:
             time.sleep(self.render_period)
             env.sim.render()
@@ -2387,7 +2518,7 @@ def mask_locked_arms_in_action(
 
 
 def main():
-    rate_limiter = RateLimiter(args_cli.step_hz)
+    rate_limiter = RateLimiter(args_cli.step_hz, exact=args_cli.no_sim_cameras)
 
     # ── Output dirs ──────────────────────────────────────────────────────────
     output_dir = os.path.dirname(args_cli.dataset_file)
@@ -2457,6 +2588,15 @@ def main():
         summary = apply_plate_size(env_cfg, args_cli.plate_size)
         print(f"[PLATE SIZE] {summary}")
 
+    if args_cli.sim_decimation is not None:
+        env_cfg.decimation = args_cli.sim_decimation
+        env_cfg.sim.render_interval = args_cli.sim_decimation
+        print(f"[SIM DECIMATION] {args_cli.sim_decimation} physics substep(s) per step.")
+
+    if args_cli.no_sim_cameras:
+        removed = strip_sim_cameras(env_cfg)
+        print(f"[NO SIM CAMERAS] Removed {', '.join(removed) or 'nothing'} -- the HDF5 will hold no images.")
+
     if args_cli.teleop_device == "vr_joint_ros2":
         try:
             swap_to_joint_position_actions(env_cfg)
@@ -2504,7 +2644,10 @@ def main():
     mirror_broadcaster = None
     if args_cli.mirror_udp_port:
         mirror_broadcaster = JointMirrorBroadcaster(
-            robot=env.scene["robot"], host=args_cli.mirror_udp_host, port=args_cli.mirror_udp_port
+            robot=env.scene["robot"],
+            host=args_cli.mirror_udp_host,
+            port=args_cli.mirror_udp_port,
+            use_targets=args_cli.real_arm_mirror == "command",
         )
 
     # ── Real-arm bridge process (opt-in, --real_arm) ───────────────────────────
@@ -2539,6 +2682,7 @@ def main():
                 "--record-fps", str(args_cli.step_hz),
                 "--record-event-port", str(args_cli.real_arm_event_port),
                 "--record-action-source", args_cli.real_arm_action_source,
+                "--record-view-hz", str(args_cli.real_arm_view_hz),
             ]
             if args_cli.resume:
                 bridge_cmd.append("--record-resume")
@@ -2580,6 +2724,41 @@ def main():
     def send_episode_event(event: str):
         if episode_events is not None:
             episode_events.send(event, demo_count)
+
+    _STATUS_COLORS = {
+        "READY": "33",  # yellow
+        "RECORDING": "31",  # red
+        "RETURNING": "35",  # magenta
+        "SAVING": "32",  # green
+        "SAVED": "32",
+        "DISCARDING": "90",  # grey
+        "RESETTING": "36",  # cyan
+    }
+    _status_color = _sys.stdout.isatty()
+    # The last status sent, re-sent every STATUS_RESEND_S (see the main loop): the first one goes out
+    # before the bridge has its cameras up and is listening, and UDP does not queue it.
+    last_status = {"fields": None, "sent": 0.0}
+    STATUS_RESEND_S = 2.0
+
+    def show_status(state: str, text: str = "", episode: int | None = None):
+        """One banner line per state change, so the episode number and what the session is doing
+        can be read off the terminal at a glance; also forwarded to the bridge's rerun window.
+        ``episode`` defaults to the one being recorded now (1-based)."""
+        if episode is None:
+            episode = demo_count + 1
+        total = args_cli.num_demos if args_cli.num_demos > 0 else None
+        ep = f"Episode {episode}/{total}" if total else f"Episode {episode}"
+        label = f" {state} "
+        if _status_color:
+            label = f"\033[1;7;{_STATUS_COLORS.get(state, '37')}m{label}\033[0m"
+        print(f"\n━━━ [{ep}] {label} {text}", flush=True)
+        last_status["fields"] = dict(state=state, episode=episode, total=total, text=text)
+        resend_status()
+
+    def resend_status():
+        if episode_events is not None and last_status["fields"] is not None:
+            episode_events.send("status", demo_count, **last_status["fields"])
+            last_status["sent"] = time.time()
 
     def announce_episode_export():
         """Call right BEFORE exporting an episode. Writing the demo (with its camera frames) to the
@@ -2729,7 +2908,8 @@ def main():
     def reset_episode():
         nonlocal should_reset
         should_reset = True
-        print("Reset requested")
+        if recording_armed:
+            show_status("DISCARDING", "episode thrown away")
 
     def request_ramp_test():
         nonlocal ramp_test_requested
@@ -2893,9 +3073,9 @@ def main():
             start_recording()
         elif return_to_rest is not None:
             return_to_rest.start()
-            print(
-                f"Returning to rest pose over {args_cli.return_to_rest_secs:.1f}s"
-                " -- grippers stay as they are; the episode is saved on arrival."
+            show_status(
+                "RETURNING",
+                f"to rest pose over {args_cli.return_to_rest_secs:.1f}s -- saved on arrival (let go of the controllers)",
             )
         else:
             save_episode()
@@ -2915,9 +3095,9 @@ def main():
             return
         discard_after_return = True
         return_to_rest.start()
-        print(
-            f"Returning to rest pose over {args_cli.return_to_rest_secs:.1f}s"
-            " -- the episode is discarded on arrival."
+        show_status(
+            "RETURNING",
+            f"to rest pose over {args_cli.return_to_rest_secs:.1f}s -- DISCARDED on arrival (Y again: reset now)",
         )
 
     def start_recording():
@@ -2938,20 +3118,20 @@ def main():
         recording_armed = True
         MOTION_GATE["enabled"] = True
         send_episode_event("start")
-        print("Recording started (button X) -- robot released")
+        show_status("RECORDING", "X = end & save, Y = discard")
 
     def save_episode():
         nonlocal should_reset
         if requires_manual_arm and not recording_armed:
             print("Not recording yet -- press X to start recording before saving.")
             return
+        show_status("SAVING", "writing the episode")
         announce_episode_export()
         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
         env.recorder_manager.set_success_to_episodes(
             [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
         )
         env.recorder_manager.export_episodes([0])
-        print("Episode saved!")
         should_reset = True
 
     def toggle_arm():
@@ -3049,6 +3229,15 @@ def main():
     else:
         print()
 
+    def show_ready_status():
+        arm = "" if use_any_vr_teleop or not is_dual_arm else f" (active arm: {active_arm.upper()})"
+        if recording_armed:
+            show_status("RECORDING", f"recording since the reset{arm} -- N = save, R = discard")
+        else:
+            show_status("READY", f"robot held at rest pose -- press X to start recording{arm}")
+
+    show_ready_status()
+
     # Installed here (after AppLauncher/simulation_app setup, which may install its own
     # SIGINT handler) so this one takes effect for Ctrl+C from here on. It only sets a
     # flag rather than doing any work itself -- signal handlers can fire between any two
@@ -3065,6 +3254,9 @@ def main():
                 run_ramp_to_rest_test(env, stop_requested=stop_requested)
                 teleop.clear_deltas()  # clear deltas accumulated while keys were held during the ramp
                 continue
+
+            # Before the teleop device is read: this is what delivers the ROS2 message it reads.
+            pump_app_without_rendering(env)
 
             # Build action vector sized to match the task's action space
             if use_any_vr_teleop:
@@ -3154,7 +3346,6 @@ def main():
             # target would cut the arrival itself out of every demo.
             if rtr_done and return_to_rest is not None:
                 return_to_rest.stop()
-                print("Back at rest pose.")
                 if discard_after_return:
                     reset_episode()
                 else:
@@ -3175,13 +3366,13 @@ def main():
                 if succeeded and not args_cli.manual_save and not rtr_active:
                     success_step_count += 1
                     if success_step_count >= args_cli.num_success_steps:
+                        show_status("SAVING", "auto-success condition met")
                         announce_episode_export()
                         env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
                         env.recorder_manager.set_success_to_episodes(
                             [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
                         )
                         env.recorder_manager.export_episodes([0])
-                        print("Auto-success condition met!")
                         should_reset = True
                 else:
                     success_step_count = 0
@@ -3190,10 +3381,12 @@ def main():
             total_in_dataset = resume_offset + env.recorder_manager.exported_successful_episode_count
             if total_in_dataset > demo_count:
                 demo_count = total_in_dataset
-                if resume_offset:
-                    print(f"Total demos in dataset: {demo_count} ({demo_count - resume_offset} this session)")
-                else:
-                    print(f"Total demos recorded: {demo_count}")
+                show_status(
+                    "SAVED",
+                    f"{demo_count} in dataset"
+                    + (f" ({demo_count - resume_offset} this session)" if resume_offset else ""),
+                    episode=demo_count,
+                )
                 _refresh_label()
 
             # Check exit condition
@@ -3203,7 +3396,7 @@ def main():
 
             # Handle reset
             if should_reset:
-                print("Resetting environment...")
+                show_status("RESETTING", "resetting the scene")
                 # Covers the discard path too (button Y / R mid-ramp): the override must be gone
                 # before env.reset(), or the next episode would open with the teleop still ignored.
                 if return_to_rest is not None:
@@ -3248,12 +3441,13 @@ def main():
                 left_gripper_state = 1.0
                 right_gripper_state = 1.0
                 _refresh_label()
-                print(f"Ready. Active arm: {active_arm.upper()}")
-                if requires_manual_arm:
-                    print("Robot held at rest pose. Press X to release it and start recording.")
+                show_ready_status()
 
             if env.sim.is_stopped():
                 break
+
+            if time.time() - last_status["sent"] > STATUS_RESEND_S:
+                resend_status()
 
             rate_limiter.sleep(env)
 

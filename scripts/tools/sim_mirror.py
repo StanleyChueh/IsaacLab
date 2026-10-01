@@ -61,7 +61,11 @@ class JointMirrorBroadcaster:
     GRIPPER_OPEN_VAL = 0.044
     GRIPPER_CLOSED_VAL = 0.0
 
-    def __init__(self, robot, host: str, port: int):
+    def __init__(self, robot, host: str, port: int, use_targets: bool = False):
+        """``use_targets`` broadcasts the joint position TARGETS the robot was last given instead
+        of its measured positions -- what the sim arm was told rather than where it has got to, so
+        the real arm does not inherit the sim arm's tracking lag (nor its collision stops)."""
+        self._use_targets = use_targets
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._addr = (host, port)
         self._indices, self._names = self.resolve_mirror_joint_indices(robot)
@@ -96,7 +100,8 @@ class JointMirrorBroadcaster:
         trigger position would classify every value but an exact 0.0 as "open", i.e. the real
         gripper would never be told to close.
         """
-        joint_pos = self._robot.data.joint_pos[0, self._indices].tolist()
+        data = self._robot.data
+        joint_pos = (data.joint_pos_target if self._use_targets else data.joint_pos)[0, self._indices].tolist()
         joints = dict(zip(self._names, joint_pos))
 
         if left_gripper_state is not None:
@@ -170,8 +175,8 @@ class EpisodeEventSender:
         self._seq = 0
         print(f"[REAL REC] Sending episode events to {host}:{port}")
 
-    def send(self, event: str, demo: int) -> None:
-        packet = {"event": event, "seq": self._seq, "t": time.time(), "demo": demo}
+    def send(self, event: str, demo: int, **extra) -> None:
+        packet = {"event": event, "seq": self._seq, "t": time.time(), "demo": demo, **extra}
         self._seq += 1
         try:
             self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
