@@ -73,6 +73,9 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 If you want to replay simulation-recorded trajectory on real robot
 
 ```
+cd ~/Stanley_ws/lerobot_openarm
+uv sync
+source .venv/bin/activate
  env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz --episode 0   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
 ```
 
@@ -273,7 +276,7 @@ Launch GR00T N1.7 Policy Server
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate lerobot-latest
-python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
+python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --port 5556
 ```
 
 Run Isaac Lab Eval
@@ -345,7 +348,7 @@ Deploy in async evaluation
 cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 30 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 30 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20 --task "Pick up the Pringles can with the right arm, hand it to the left arm" 
 ```
 
 Deploy in async evaluation(GR00T N1.7)
@@ -359,6 +362,11 @@ env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_gr00t_asyn
   --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right \
   --calibration calibration.json \
   --control-hz 30 --max-joint-speed 1.5 --chunk-size-threshold 0.8 \
-  --max-episode-seconds 25 --max-episodes 20
+  --max-episode-seconds 25 --max-episodes 20 --task "Pick up the Pringles can with the right arm, hand it to the left arm" 
 ```
 
+Brodcast to real robot
+
+```
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python mirror_bridge.py     --calibration calibration.json     --udp-port 5557     --feedback-port 5558     --model-path /home/csl/Stanley_ws/lerobot_openarm/model/openarm_description.urdf     --right-port can0 --left-port can1     --max-joint-speed 0.3  --timeout-ms 5000 --stale-ms 500
+```
