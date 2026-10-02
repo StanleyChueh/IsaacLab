@@ -22,6 +22,16 @@ parser.add_argument(
     "--input_file", type=str, default="./datasets/dataset.hdf5", help="File name of the dataset to be annotated."
 )
 parser.add_argument(
+    "--allow_rate_mismatch",
+    action="store_true",
+    default=False,
+    help=(
+        "OpenArm tasks: continue even if the dataset was recorded at a different control rate than the env"
+        " now steps at. Off by default -- annotation replays the recorded actions one per env step, so a"
+        " mismatch evaluates the subtask signals on a differently-timed motion. See openarm_sim_timing.py."
+    ),
+)
+parser.add_argument(
     "--output_file",
     type=str,
     default="./datasets/dataset_annotated.hdf5",
@@ -258,6 +268,12 @@ def main():
         f"Action space: {_action_mode}"
         + ("" if _action_mode == "task_default" else f" (swapped to match the {_actions.shape[1]}D recording)")
     )
+
+    # Annotation replays the recorded actions one per env step: refuse a recording made at another rate.
+    if "OpenArm" in str(args_cli.task):
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_sim_timing import check_source_rate
+
+        check_source_rate(args_cli.input_file, env_cfg, allow_mismatch=args_cli.allow_rate_mismatch)
 
     # extract success checking function to invoke manually
     success_term = None

@@ -95,6 +95,8 @@ import pathlib
 
 import torch
 
+from .openarm_sim_timing import scale_odd, scale_steps
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -196,7 +198,7 @@ jaws physically cannot go much past half-closed while it is between them. Do not
 upper bound to exactly half (0.044) on the theory that a firm grip closes further -- measured, that
 rejects 10 real hand-overs out of 10."""
 
-HANDOVER_RECEIVER_HOLD_STEPS = 20
+HANDOVER_RECEIVER_HOLD_STEPS = scale_steps(20)  # 20 steps = 1.0 s at the 20 Hz this was tuned at
 """How many CONSECUTIVE steps the receiving hand must satisfy :func:`receiver_grip_confirmed`,
 with the giving hand already off the can, before the hand-over counts as complete.
 
@@ -1797,14 +1799,14 @@ def _pick_subtasks(term_signal_grasp: str) -> list:
             subtask_term_signal=term_signal_grasp,
             # Short tail: 2-5 extra steps keeps the seam tight and limits the positional
             # spread at the transition.
-            subtask_term_offset_range=(2, 5),
+            subtask_term_offset_range=(scale_steps(2), scale_steps(5)),
             selection_strategy="nearest_neighbor_object",
             selection_strategy_kwargs={"nn_k": 10},
             action_noise=0.0,
-            num_interpolation_steps=50,
+            num_interpolation_steps=scale_steps(50),
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
-            waypoint_smoothing_window=5,
+            waypoint_smoothing_window=scale_odd(5),
             description="Reach and grasp the can",
             next_subtask_description="Lift the can",
         ),
@@ -1815,10 +1817,10 @@ def _pick_subtasks(term_signal_grasp: str) -> list:
             selection_strategy="nearest_neighbor_object",
             selection_strategy_kwargs={"nn_k": 10},
             action_noise=0.0,
-            num_interpolation_steps=10,
+            num_interpolation_steps=scale_steps(10),
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
-            waypoint_smoothing_window=5,
+            waypoint_smoothing_window=scale_odd(5),
             description="Lift the can above the table",
         ),
     ]
@@ -1840,7 +1842,7 @@ def _idle_subtasks() -> list:
             subtask_term_offset_range=(0, 0),
             selection_strategy="random",
             action_noise=0.0,
-            num_interpolation_steps=5,
+            num_interpolation_steps=scale_steps(5),
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
             description="Stay clear of the working arm",
@@ -1960,7 +1962,7 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     # 15 rather than more because every added step is right-arm-only delay, and this mode's
     # two-arm synchronisation has no constraints holding it together -- only the fact that both
     # arms replay one source demo whose phasing already worked.
-    SEAM_INTERP = 15
+    SEAM_INTERP = scale_steps(15)  # 15 steps = 0.75 s at the reference 20 Hz; the same duration at any rate
 
     # The phase compensation that makes raising SEAM_INTERP safe.
     #
@@ -1991,7 +1993,8 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     # generated demos it took the trial success rate from 5/6 to 5/11 while the smoothness fix
     # itself worked exactly as intended, so the two effects are independent and this one is purely
     # the arithmetic.
-    LEFT_INTERP = 2 * SEAM_INTERP - 5
+    # The 5 is the right arm's head start in STEPS (10 right vs 5 left at interp=5), so it scales too.
+    LEFT_INTERP = 2 * SEAM_INTERP - scale_steps(5)
 
     # term_signal deliberately untyped: SubTaskConfig annotates it as plain `str` while defaulting
     # it to None, so an honest `str | None` here just moves the type error into the
@@ -2064,7 +2067,7 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             # where the grasp and the seam live, move by ~1 mm. Widening to 9 buys another halving of
             # the accel but pushes the worst-case corner past 3.8 cm, which starts to matter against
             # this task's 7 cm grasp cylinder.
-            waypoint_smoothing_window=5,
+            waypoint_smoothing_window=scale_odd(5),
             # The one thing waypoint_smoothing_window structurally CANNOT fix. That filter pins
             # segment endpoints on purpose (see smooth_eef_pose_segment: "the first and last
             # waypoints stay within a millimetre or so of where they were"), because the endpoint

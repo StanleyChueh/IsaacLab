@@ -46,7 +46,7 @@ import isaaclab.envs.mdp as mdp_core
 from isaaclab_tasks.manager_based.manipulation.stack import mdp
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import openarm_domain_randomization
 
-from . import openarm_task_modes
+from . import openarm_actuator_profile, openarm_sim_timing, openarm_task_modes
 
 from . import stack_ik_abs_visuomotor_env_cfg
 
@@ -657,6 +657,18 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
 
     def __post_init__(self):
         super().__post_init__()  # cameras, IK-Abs action, pad, cubes
+
+        # Control rate: 30 Hz by default (OPENARM_CONTROL_HZ=20 restores the legacy 20 Hz). Set here
+        # rather than in stack_env_cfg.py because that base is shared with every upstream stack task.
+        # Every step count that was tuned at 20 Hz derives from the same setting -- see
+        # openarm_sim_timing.py for why and for what would silently break otherwise.
+        openarm_sim_timing.apply_control_rate(self)
+
+        # Fitted real-arm actuator profile (scripts/tools/sysid/fit_sim_actuators.py). Opt-in via
+        # OPENARM_ACTUATOR_PROFILE=<json>; unset = the cfg's own actuator values, untouched.
+        _summary = openarm_actuator_profile.apply_actuator_profile(self)
+        if _summary:
+            print(_summary)
 
         # ── Remove blue and green cubes — only red cube participates ──────────
         # The scene builder skips attributes set to None.

@@ -22,6 +22,16 @@ parser.add_argument(
 )
 parser.add_argument("--input_file", type=str, default=None, required=True, help="File path to the source dataset file.")
 parser.add_argument(
+    "--allow_rate_mismatch",
+    action="store_true",
+    default=False,
+    help=(
+        "OpenArm tasks: continue even if the source HDF5 was recorded at a different control rate than the"
+        " env now steps at. Off by default -- the source actions are replayed one per env step, so a rate"
+        " mismatch plays the demos too fast or too slow without any error. See openarm_sim_timing.py."
+    ),
+)
+parser.add_argument(
     "--output_file",
     type=str,
     default="./datasets/output_dataset.hdf5",
@@ -284,6 +294,12 @@ def main():
             radius_delta_range=tuple(args_cli.object_radius_range),
         )
         print(f"[OBJ SIZE] {summary}")
+
+    # The source demos are replayed one waypoint per env step: refuse a recording made at another rate.
+    from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_sim_timing import check_source_rate
+
+    if "OpenArm" in env_name:
+        check_source_rate(args_cli.input_file, env_cfg, allow_mismatch=args_cli.allow_rate_mismatch)
 
     # Create environment
     env = gym.make(env_name, cfg=env_cfg).unwrapped

@@ -1351,6 +1351,13 @@ class OpenarmPlateWipeEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg):
     def __post_init__(self):
         super().__post_init__()  # cameras, dual-arm IK-Abs actions, pad, cube_2 (removed next)
 
+        # Pinned to the legacy 20 Hz regardless of OPENARM_CONTROL_HZ: this task's deformable rag and
+        # its kinematic-hold timing were tuned at dt=0.01 and have not been re-verified at the
+        # pick-up family's 30 Hz physics step.
+        from .openarm_sim_timing import apply_control_rate
+
+        apply_control_rate(self, hz=20)
+
         # ── Remove every cube -- none of them are part of this task ───────────
         self.scene.cube_2 = None
 

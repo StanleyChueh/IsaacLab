@@ -30,6 +30,7 @@ import torch
 
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_sim_timing import scale_steps
 
 # 14D IK action layout, per arm: (delta slice, gripper index, eef pose obs key prefix)
 _ARM_LAYOUT = {
@@ -56,10 +57,10 @@ _GIVING_EEF = "right_eef"
 """Which arm hands the can over in ``handover`` mode. Fixed by the mode itself (openarm_task_modes'
 handover_success ends with the can in the LEFT hand), not something a demo can vary."""
 
-_HANDOVER_RELEASE_OVERLAP_STEPS = 5
+_HANDOVER_RELEASE_OVERLAP_STEPS = scale_steps(5)
 """Steps the giving hand keeps holding after the receiving hand has taken the can.
 
-0.25 s at this task's 20 Hz control rate, matching the 0-4 step overlap the operator actually leaves
+0.25 s (5 steps at the reference 20 Hz, rescaled by openarm_sim_timing.scale_steps), matching the 0-4 step overlap the operator actually leaves
 in the recorded demos. Not raised further on purpose: both jaws close on a rigid can at kp=500, so a
 long two-handed hold is squeezing it between two position-controlled grippers, which PhysX resolves
 as growing internal force rather than as a firmer grip."""
