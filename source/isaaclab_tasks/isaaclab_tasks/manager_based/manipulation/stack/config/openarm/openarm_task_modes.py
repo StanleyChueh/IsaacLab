@@ -1528,6 +1528,66 @@ def reset_object_free(
     asset.write_root_state_to_sim(states, env_ids=env_ids)
 
 
+_PARKED_HAND_LINK_KEYS = ("finger", "tcp", "link6", "link7")
+"""Substrings of the body names that make up a parked hand, for :func:`parked_hand_xy`."""
+
+SPAWN_HAND_CLEARANCE = 0.065
+"""m -- default horizontal distance a can's axis must keep from every parked hand-link origin.
+
+Measured, not derived: over 40 hand-over resets with the arms held at the reset pose, the one
+spawn that toppled the can (tilted 90 deg, flung 11 cm) had a finger origin 0.046 m from the can's
+axis; the closest spawns that left it undisturbed were 0.051 and 0.052. The can's radius is 0.03 m
+and the parked fingertips sit at z=0.478, level with its rim (top z=0.480), so inside ~5 cm the
+finger lands on the rim. 0.065 is that threshold plus ~1.3 cm of margin.
+
+:data:`_ARM_KEEP_OUT_BOXES` does not cover this: it starts at |y|=0.085 (centre-based), while the
+hand-over range reaches |y|=0.077 and a finger hangs well inside that box's edge."""
+
+
+def parked_hand_xy(env) -> torch.Tensor:
+    """(K, 2) env-local xy of every hand link of the robot as it stands RIGHT NOW (call it after a
+    reset, when the arms are at the pose a rollout starts from). Env 0 only: the arms park
+    identically in every env, so one is representative."""
+    robot = env.scene["robot"]
+    ids = [i for i, n in enumerate(robot.data.body_names) if any(k in n for k in _PARKED_HAND_LINK_KEYS)]
+    return (robot.data.body_pos_w[0, ids, :2] - env.scene.env_origins[0, :2]).clone()
+
+
+def reset_object_clear_of_hands(
+    env,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(CAN_NAME),
+    x_range: tuple[float, float] = _OBJECT_X_RANGE,
+    y_range: tuple[float, float] = _OBJECT_Y_RANGE,
+    hand_xy: torch.Tensor | None = None,
+    clearance: float = SPAWN_HAND_CLEARANCE,
+    max_tries: int = 200,
+) -> None:
+    """:func:`reset_object_free`, but re-drawing any spawn whose axis is closer than *clearance* to
+    a parked hand link (*hand_xy*, from :func:`parked_hand_xy`). A spawn that close lands the can
+    on a fingertip, which topples it before the policy has moved at all. With ``hand_xy=None`` or
+    ``clearance<=0`` this is exactly :func:`reset_object_free`.
+
+    Draws are redone only for the envs that failed, so the accepted distribution stays uniform over
+    the legal area, as in :func:`reset_object_free`. Falls back to the last draw (with a warning)
+    rather than raising, for the same reason that function does.
+    """
+    reset_object_free(env, env_ids, asset_cfg=asset_cfg, x_range=x_range, y_range=y_range)
+    if hand_xy is None or clearance <= 0.0:
+        return
+    asset: RigidObject = env.scene[asset_cfg.name]
+    hand_xy = hand_xy.to(asset.device)
+    pending = env_ids
+    for _ in range(max_tries):
+        xy = asset.data.root_pos_w[pending, :2] - env.scene.env_origins[pending, :2]
+        too_close = torch.cdist(xy, hand_xy).min(dim=1).values < clearance
+        if not bool(too_close.any()):
+            return
+        pending = pending[too_close]
+        reset_object_free(env, pending, asset_cfg=asset_cfg, x_range=x_range, y_range=y_range)
+    print(f"[warn] reset_object_clear_of_hands: no spawn clear of the hands after {max_tries} draws.")
+
+
 def _object_rest_z(env, env_ids: torch.Tensor | None = None):
     """Height (env-local m) at which the can's origin sits when standing on the pad.
 

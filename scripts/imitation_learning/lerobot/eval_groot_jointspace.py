@@ -241,6 +241,38 @@ parser.add_argument(
     ),
 )
 
+parser.add_argument(
+    "--no_timer_overlay", action="store_true", default=False,
+    help=(
+        "Disable the on-screen real-time clock overlay. By default a small window in the Isaac Sim"
+        " viewport shows the actual wall-clock time (to the millisecond), the elapsed real time of"
+        " the current rollout and of the whole eval, and sim-time/real-time, so a screen recording"
+        " of an evaluation is verifiably unedited and not sped up. Ignored with --headless."
+    ),
+)
+
+parser.add_argument(
+    "--auto_start", action="store_true", default=False,
+    help=(
+        "Start rolling out immediately instead of waiting for the operator to press S in the Isaac"
+        " Sim window. By default (GUI only) the scene is reset and shown, a prompt tells the"
+        " operator to press S, and the policy does not run until they do."
+    ),
+)
+parser.add_argument(
+    "--wait_each_trial", action="store_true", default=False,
+    help="Wait for S before EVERY rollout, not just the first (ignored with --auto_start).",
+)
+
+parser.add_argument(
+    "--spawn_clearance", type=float, default=0.065,
+    help=(
+        "Minimum horizontal distance (m) between the can's axis and every parked hand link at"
+        " reset; closer spawns are re-drawn. Without it, ~1 in 40 hand-over spawns lands the can on"
+        " a fingertip and it topples before the policy moves. 0 disables (original spawn behaviour)."
+    ),
+)
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -250,6 +282,7 @@ simulation_app = app_launcher.app
 """Everything else after Isaac Sim is up."""
 
 import atexit
+import datetime
 import os
 import pickle
 import random
@@ -272,6 +305,8 @@ from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task
     CAN_TARGET_TASKS,
     GRIPPER_OPEN_VAL,
     apply_task_mode,
+    parked_hand_xy,
+    reset_object_clear_of_hands,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -455,6 +490,8 @@ def _step_direct(env, target_q: np.ndarray, apply_idx: list[int], gripper_cols: 
         env.scene.write_data_to_sim()
         env.sim.step(render=False)
         if (env._sim_step_counter % env.cfg.sim.render_interval == 0) and is_rendering:
+            if _timer_overlay is not None:
+                _timer_overlay.update()
             env.sim.render()
         env.scene.update(dt=env.physics_dt)
 
@@ -473,6 +510,82 @@ def _step_direct(env, target_q: np.ndarray, apply_idx: list[int], gripper_cols: 
     env.episode_length_buf += 1
 
     return env.observation_manager.compute()
+
+
+# ── real-time clock overlay ────────────────────────────────────────────────────
+
+class TimerOverlay:
+    """On-screen wall-clock window so a screen recording of an eval proves it is unedited.
+
+    Shows the actual time of day (ms resolution), real seconds elapsed in the current rollout and
+    in the whole eval, and the sim-time / real-time ratio. A cut shows up as a jump in the clock;
+    a fast-forward shows up as the clock advancing slower than the video and a ratio above 1x.
+    Refreshed at every render (see _step_direct / RateLimiter), not just once per policy step, so
+    the clock keeps ticking while the policy server is thinking. Drag the window to move it.
+    """
+
+    def __init__(self, env, num_rollouts: int, horizon: int):
+        import omni.ui as ui
+
+        self._env = env
+        self._num_rollouts = num_rollouts
+        self._horizon = horizon
+        self._eval_t0 = time.time()
+        self._rollout_t0 = self._eval_t0
+        self._trial = 0
+        self._step = 0
+        self._waiting = False
+        self._window = ui.Window(
+            "Real-time clock", width=520, height=130, position_x=20, position_y=60,
+            flags=ui.WINDOW_FLAGS_NO_TITLE_BAR | ui.WINDOW_FLAGS_NO_RESIZE
+            | ui.WINDOW_FLAGS_NO_SCROLLBAR | ui.WINDOW_FLAGS_NO_COLLAPSE,
+            dockPreference=ui.DockPreference.DISABLED,
+        )
+        with self._window.frame:
+            with ui.VStack(spacing=2):
+                self._clock = ui.Label("", style={"font_size": 30, "color": 0xFF00FFFF})
+                self._rollout = ui.Label("", style={"font_size": 20})
+                self._info = ui.Label("", style={"font_size": 20})
+
+    def start_rollout(self, trial: int):
+        """Called when a rollout's policy loop begins (after any mirror hold)."""
+        self._trial = trial
+        self._step = 0
+        self._waiting = False
+        self._rollout_t0 = time.time()
+        self.update()
+
+    def set_waiting(self, trial: int):
+        """Waiting for the operator's S: the rollout timer must not run yet."""
+        self._trial = trial
+        self._step = 0
+        self._waiting = True
+
+    def set_step(self, step: int):
+        self._step = step
+
+    def update(self):
+        now = time.time()
+        t_roll = 0.0 if self._waiting else now - self._rollout_t0
+        t_sim = self._step * self._env.step_dt
+        rtf = t_sim / t_roll if t_roll > 1e-3 else 0.0
+        self._clock.text = "REAL TIME  " + datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S.%f")[:-3]
+        self._rollout.text = (
+            f"Trial {self._trial}/{self._num_rollouts}   waiting for S to start"
+            if self._waiting else
+            f"Trial {self._trial}/{self._num_rollouts}   rollout {t_roll:6.1f} s"
+            f"   step {self._step}/{self._horizon}"
+        )
+        self._info.text = f"eval total {_fmt_hms(now - self._eval_t0)}   sim/real {rtf:4.2f}x"
+
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+# Set in main() unless --no_timer_overlay / --headless; None means "no overlay".
+_timer_overlay: "TimerOverlay | None" = None
 
 
 # ── real-robot mirroring helpers (only used with --mirror_udp_port) ────────────
@@ -500,6 +613,8 @@ class RateLimiter:
                 break
             time.sleep(min(0.005, remaining))
             if is_rendering:
+                if _timer_overlay is not None:
+                    _timer_overlay.update()
                 env.sim.render()
         self._next += self._period
         # Fell behind (a slow policy step, a long render): re-base off now instead of trying to
@@ -580,6 +695,75 @@ def _mirror_hold_until_enter(env, mirror, rate_hz: float, message: str, kb: "Key
     return True
 
 
+# ── press-S-to-start prompt ────────────────────────────────────────────────────
+
+class StartPrompt:
+    """Big centred banner telling the operator how to start, shown only while waiting."""
+
+    def __init__(self):
+        import omni.ui as ui
+
+        w, h = 760, 150
+        x = max(0, int(ui.Workspace.get_main_window_width() / 2 - w / 2))
+        y = max(0, int(ui.Workspace.get_main_window_height() / 2 - h / 2))
+        self._window = ui.Window(
+            "Start prompt", width=w, height=h, position_x=x, position_y=y,
+            flags=ui.WINDOW_FLAGS_NO_TITLE_BAR | ui.WINDOW_FLAGS_NO_RESIZE
+            | ui.WINDOW_FLAGS_NO_SCROLLBAR | ui.WINDOW_FLAGS_NO_COLLAPSE,
+            dockPreference=ui.DockPreference.DISABLED,
+        )
+        with self._window.frame:
+            with ui.VStack(spacing=6):
+                self._title = ui.Label("", alignment=ui.Alignment.CENTER, style={"font_size": 40, "color": 0xFF00A5FF})
+                ui.Label(
+                    "Click the Isaac Sim viewport first, then press S",
+                    alignment=ui.Alignment.CENTER, style={"font_size": 22},
+                )
+                ui.Label("(R = reset early,  Q = quit)", alignment=ui.Alignment.CENTER, style={"font_size": 18})
+        self._window.visible = False
+
+    def show(self, text: str):
+        self._title.text = text
+        self._window.visible = True
+
+    def hide(self):
+        self._window.visible = False
+
+
+# Set in main() for GUI runs without --auto_start.
+_start_prompt: "StartPrompt | None" = None
+
+
+def _wait_for_start(env, kb: "KeyboardHandler", trial: int) -> bool:
+    """Show the scene in its reset pose and block until the operator presses S.
+
+    Keeps rendering while waiting so the viewport and the clock stay live. Returns False if the
+    operator pressed Q instead (the rollout is then abandoned, see rollout()).
+    """
+    kb.consume_start()   # drop a stale S/Enter/Space pressed before we were waiting
+    text = f"Press S to start evaluation  (trial {trial}/{args_cli.num_rollouts})"
+    print(f"\n[start] {text} -- click the Isaac Sim window first so it has keyboard focus.")
+    if _start_prompt is not None:
+        _start_prompt.show(text)
+    if _timer_overlay is not None:
+        _timer_overlay.set_waiting(trial)
+    try:
+        while not kb.consume_start():
+            if kb.quit_requested:
+                print("[start] Quit requested while waiting -- not starting this rollout.")
+                return False
+            if _timer_overlay is not None:
+                _timer_overlay.update()
+            env.sim.render()
+            time.sleep(0.01)
+    finally:
+        if _start_prompt is not None:
+            _start_prompt.hide()
+    kb.consume_reset()   # an R pressed while waiting must not abort the rollout's first step
+    print("[start] Starting rollout.")
+    return True
+
+
 # ── keyboard reset (identical to eval_smolvla_jointspace.py) ───────────────────
 
 class NullKeyboardHandler:
@@ -617,8 +801,8 @@ class KeyboardHandler:
         self._sub = self._input.subscribe_to_keyboard_events(
             self._keyboard, self._on_key
         )
-        print("[keyboard] Press  R  to reset episode early,  Q  to quit,"
-              "  Enter/Space to start a held rollout (--mirror_udp_port only).")
+        print("[keyboard] Press  S  (or Enter/Space) to start a rollout,  R  to reset episode early,"
+              "  Q  to quit.")
 
     def _on_key(self, event, *args, **kwargs):
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -628,11 +812,14 @@ class KeyboardHandler:
             elif event.input == carb.input.KeyboardInput.Q:
                 self.quit_requested = True
                 print("[keyboard] Quit requested.")
-            elif event.input in (carb.input.KeyboardInput.ENTER, carb.input.KeyboardInput.SPACE):
-                # Second way to answer the mirror hold, for when the terminal's stdin is not
+            elif event.input in (carb.input.KeyboardInput.S, carb.input.KeyboardInput.ENTER,
+                                 carb.input.KeyboardInput.SPACE):
+                # Starts a rollout held by _wait_for_start; also a second way to answer the mirror
+                # hold, for when the terminal's stdin is not
                 # reaching this process (the Isaac Sim app owns the foreground window, and whether
                 # Enter typed in the launching terminal arrives here depends on how the session was
-                # started). Ignored outside a hold -- consume_start() is only polled there.
+                # started). Ignored outside a hold -- consume_start() is only polled there, and
+                # _wait_for_start drains any stale press before it begins waiting.
                 self.start_requested = True
                 print("[keyboard] Start requested.")
         return True
@@ -677,6 +864,15 @@ def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera
         # would put a trial the operator deliberately abandoned into the success rate.
         return None
 
+    # Operator-gated start (GUI only; the mirror hold above already gates its own start). First
+    # rollout only unless --wait_each_trial, so a multi-trial run isn't one keypress per trial.
+    if (
+        mirror is None and _start_prompt is not None
+        and (trial == 1 or args_cli.wait_each_trial)
+        and not _wait_for_start(env, kb, trial)
+    ):
+        return None
+
     # Previous open/closed decision per hand, so the report can flag the transitions -- over a
     # 300-step rollout the two or three steps where a jaw actually changes state are the whole
     # story and are otherwise invisible in a wall of identical lines.
@@ -686,6 +882,8 @@ def rollout(env, sock, success_term, horizon: int, kb: "KeyboardHandler", camera
     # instantly, so including it would open every plot with a multi-second interval where the two
     # legitimately disagree and squash the rollout itself into the right-hand edge.
     rollout_t0 = time.time()
+    if _timer_overlay is not None:
+        _timer_overlay.start_rollout(trial or 0)
     try:
         return _rollout_steps(env, sock, success_term, horizon, kb, camera_names, apply_idx,
                               gripper_cols, gripper_labels, mirror, limiter, prev_open, obs_dict)
@@ -712,6 +910,10 @@ def _rollout_steps(env, sock, success_term, horizon: int, kb: "KeyboardHandler",
         if kb.consume_reset():
             print(f"  [step {step+1:3d}] manually reset")
             return False
+
+        if _timer_overlay is not None:
+            _timer_overlay.set_step(step)
+            _timer_overlay.update()
 
         state   = _get_state(env)
         cameras = _get_cameras(obs_dict, camera_names)
@@ -742,6 +944,8 @@ def _rollout_steps(env, sock, success_term, horizon: int, kb: "KeyboardHandler",
             prev_open = open_now
 
         obs_dict = _step_direct(env, policy_action, apply_idx, gripper_cols)
+        if _timer_overlay is not None:
+            _timer_overlay.set_step(step + 1)
 
         if mirror is not None:
             # Forward the SAME binarized open/closed decision _step_direct just drove the sim
@@ -803,10 +1007,26 @@ def main():
     env_cfg.terminations.time_out = None
     env_cfg.recorders = None
 
+    # Re-draw can spawns that land on a parked fingertip. The hand positions are only known once the
+    # env exists, so main() fills them into the live term after a first reset.
+    spawn_term = getattr(env_cfg.events, "randomize_object", None)
+    if args_cli.spawn_clearance > 0.0 and spawn_term is not None:
+        spawn_term.func = reset_object_clear_of_hands
+        spawn_term.params["hand_xy"] = None
+        spawn_term.params["clearance"] = args_cli.spawn_clearance
+
     success_term = env_cfg.terminations.success
     env_cfg.terminations.success = None
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+
+    if args_cli.spawn_clearance > 0.0 and spawn_term is not None:
+        # Parked hand positions at the pose every rollout starts from; this reset's own spawn is
+        # discarded. Stored on the live term so every later reset sees it.
+        env.reset()
+        hand_xy = parked_hand_xy(env)
+        env.event_manager.get_term_cfg("randomize_object").params["hand_xy"] = hand_xy
+        print(f"Spawn clearance: can axis kept >= {args_cli.spawn_clearance:g} m from {len(hand_xy)} parked hand links")
 
     print(f"\nEnv obs keys   : {list(env.observation_space.spaces.keys())}")
     print("Action mode    : DIRECT joint-space (bypassing the env's own IK action term)")
@@ -938,6 +1158,12 @@ def main():
 
     camera_names = [name.strip() for name in args_cli.cameras.split(",") if name.strip()]
     print(f"[INFO] Camera keys (sent to gr00t_server.py verbatim, no slot remapping): {camera_names}")
+
+    global _timer_overlay, _start_prompt
+    if not args_cli.auto_start and not args_cli.headless:
+        _start_prompt = StartPrompt()
+    if not args_cli.no_timer_overlay and not args_cli.headless:
+        _timer_overlay = TimerOverlay(env, args_cli.num_rollouts, args_cli.horizon)
 
     results = []
     for trial in range(args_cli.num_rollouts):
