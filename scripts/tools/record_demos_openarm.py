@@ -478,6 +478,18 @@ parser.add_argument(
     help="--real_arm only: rad/s cap on every real arm joint (the bridge's --max-joint-speed).",
 )
 parser.add_argument(
+    "--real_arm_gripper_squeeze_tau",
+    type=float,
+    default=1.5,
+    help=(
+        "--real_arm only: N-m of extra closing torque the bridge adds to a real gripper while it is"
+        " commanded closed (the bridge's --gripper-squeeze-tau; 0 = off). The real gripper's position gain"
+        " is tiny (kp=3), so without this a thin object such as a plate rim is barely squeezed. The DM4310"
+        " is rated 3 N-m (7 peak): raise in 0.5 steps if the plate still slips, lower if the gripper"
+        " motor overheats or latches an overload fault."
+    ),
+)
+parser.add_argument(
     "--real_arm_dataset",
     type=str,
     default=None,
@@ -2671,6 +2683,7 @@ def main():
             "--right-port", args_cli.real_arm_right_port,
             "--left-port", args_cli.real_arm_left_port,
             "--max-joint-speed", str(args_cli.real_arm_max_joint_speed),
+            "--gripper-squeeze-tau", str(args_cli.real_arm_gripper_squeeze_tau),
         ]
         if args_cli.mirror_feedback_port:
             bridge_cmd += ["--feedback-port", str(args_cli.mirror_feedback_port)]

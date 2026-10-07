@@ -5,7 +5,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, create_repo
 
 def main():
-    repo_id = "ethanCSL/openarm_pringles_real_v00"  # The name of the dataset repo on Hugging Face Hub
+    repo_id = "ethanCSL/openarm_plate_wiping_real_v00"  # The name of the dataset repo on Hugging Face Hub
     dataset_dir = Path("~/Stanley_ws/IsaacLab/datasets").expanduser() / repo_id
 
     create_repo(
