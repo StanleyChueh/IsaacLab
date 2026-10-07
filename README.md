@@ -36,10 +36,20 @@ Dora publish code
 
 please refer to https://github.com/StanleyChueh/dora-openarm-data-collection.git 
 
+Without MuJoCo GUI
+
 ```
 cd ~/Stanley_ws/dora-openarm-data-collection
 source .venv/bin/activate
 dora run dataflow-vr-mujoco-ros2.yaml --uv
+```
+
+With MuJoCo GUI
+
+```
+cd ~/Stanley_ws/dora-openarm-data-collection
+source .venv/bin/activate
+dora run dataflow-vr-mujoco-ros2-viewer.yaml --uv
 ```
 
 note:
