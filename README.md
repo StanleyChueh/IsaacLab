@@ -24,15 +24,30 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --task_mode handover \
     --manual_save 
 ```
+If you want to record dataset in real world(real world robot and camera)
+```
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0      --dataset_file logs/demos/pickup_pringle.hdf5    --num_demos 20     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v00     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm"  --max-joint-speed 0.3
+```
 
 Dora publish code
 
 please refer to https://github.com/StanleyChueh/dora-openarm-data-collection.git 
 
+Without MuJoCo GUI
+
 ```
 cd ~/Stanley_ws/dora-openarm-data-collection
 source .venv/bin/activate
 dora run dataflow-vr-mujoco-ros2.yaml --uv
+```
+
+With MuJoCo GUI
+
+```
+cd ~/Stanley_ws/dora-openarm-data-collection
+source .venv/bin/activate
+dora run dataflow-vr-mujoco-ros2-viewer.yaml --uv
 ```
 
 note:
@@ -42,25 +57,9 @@ make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can
 sudo ip addr add 10.100.1.240/24 dev wlp7s0
 ```
 
-Resume recording
-
-Add --resume to resume recording 
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/pickup_pringle.hdf5 \
-    --enable_cameras \
-    --num_demos 10 \
-    --teleop_device vr_joint_ros2_native \
-    --ros2_domain_id 1 \
-    --task_mode handover \
-    --manual_save 
-    --resume
-```
-
 # Replay dataset
+
+Replay in IsaacSim
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
@@ -70,38 +69,45 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
     --enable_cameras
 ```
 
-If you want to replay simulation-recorded trajectory on real robot
+Replay in real world
 
 ```
 cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
- env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz --episode 0   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
+env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz --episode 0   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
 ```
 
 # Remove episode
 
 ```
 ./isaaclab.sh -p scripts/tools/remove_demos_hdf5.py \
-    --dataset_file logs/demos/pickup_pringles_VR_V7.hdf5 --episodes 3 7 10~13 \
-    --output logs/demos/pickup_pringles_VR_V7_fixed.hdf5
+    --dataset_file logs/demos/pickup_pringle.hdf5 --episodes 3 7 10~13 \
+    --output logs/demos/pickup_pringle_fixed.hdf5
 ```
 
 # Isaac Lab Mimic
 
-## Record source demo (keyboard teleoperation)
+## Record source demo (IsaacSim)
+
+Use the following commands to record dataset in IsaacSim with Meta Quest3 Pro(same as above)
 
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 ./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 \
+    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0  \
     --dataset_file logs/demos/pickup_pringle.hdf5 \
     --enable_cameras \
     --num_demos 10 \
     --teleop_device vr_joint_ros2_native \
     --ros2_domain_id 1 \
-    --task_mode handover \
-    --manual_save 
+    --manual_save
+```
+
+```
+cd ~/Stanley_ws/dora-openarm-data-collection
+source .venv/bin/activate
+dora run dataflow-vr-mujoco-ros2.yaml --uv
 ```
 
 ## Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
