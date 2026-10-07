@@ -29,7 +29,7 @@ cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
 If you want to record dataset in real world(real world robot and camera)
 ```
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PlateWipe-OpenArm-IK-Abs-v0     --dataset_file logs/demos/plate_wipe.hdf5     --num_demos 20     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v00     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm" 
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PlateWipe-OpenArm-IK-Abs-v0     --dataset_file logs/demos/plate_wipe.hdf5     --num_demos 20     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v00     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm"  --max-joint-speed 0.3
 ```
 
 Dora publish code
@@ -184,7 +184,7 @@ cd ~/CSL/lerobot/ && conda activate lerobot
     "observation.images.right_wrist_cam": "observation.images.camera1",
     "observation.images.wrist_cam":       "observation.images.camera2",
     "observation.images.body_cam":        "observation.images.camera3"
-  }'   --dataset.video_backend=pyav
+  }'   --dataset.video_backend=pyav --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
 ```
 
 ### GR00T N1.7 (Testing, unstable)
@@ -231,6 +231,7 @@ lerobot-train \
   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
   --wandb.enable=false \
   --wandb.disable_artifact=false
+  --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
 ```
 
 => It takes around 47GB VRAM
@@ -336,7 +337,7 @@ Deploy in async evaluation
 cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 30 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.8     --max-episode-seconds 25 --max-episodes 20 --rerun  --no-live-view
+env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_plate_wiping_real_v00_smolvla    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 20 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.5     --max-episode-seconds 20 --max-episodes 20 --rerun  --no-live-view --gripper-squeeze-tau 1.0
 ```
 
 Deploy in async evaluation(GR00T N1.7)
@@ -346,10 +347,10 @@ cd ~/Stanley_ws/lerobot_openarm
 uv sync
 source .venv/bin/activate
 env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_gr00t_async.py \
-  --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
+  --checkpoint ethanCSL/openarm_pringles_gr00t_real_v00 \
   --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right \
   --calibration calibration.json \
   --control-hz 30 --max-joint-speed 1.5 --chunk-size-threshold 0.8 \
-  --max-episode-seconds 25 --max-episodes 20
+  --max-episode-seconds 20 --max-episodes 20 --rerun --no-live-view
 ```
 
