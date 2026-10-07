@@ -196,7 +196,7 @@ cd ~/CSL/lerobot/ && conda activate lerobot
     "observation.images.right_wrist_cam": "observation.images.camera1",
     "observation.images.wrist_cam":       "observation.images.camera2",
     "observation.images.body_cam":        "observation.images.camera3"
-  }'   --dataset.video_backend=pyav
+  }'   --dataset.video_backend=pyav --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
 ```
 
 ### GR00T N1.7 (Testing, unstable)
@@ -243,6 +243,7 @@ lerobot-train \
   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
   --wandb.enable=false \
   --wandb.disable_artifact=false
+  --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
 ```
 
 => It takes around 47GB VRAM
