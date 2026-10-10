@@ -113,6 +113,15 @@ source .venv/bin/activate
 dora run dataflow-vr-mujoco-ros2.yaml --uv
 ```
 
+## lerobot-compatible sim pipeline (recommended)
+
+Record sim demos through the official `lerobot-record` exactly like the real arm, get the same demos as Mimic
+source demos, generate with domain randomization, and convert to the real datasets' format:
+`scripts/tools/lerobot_sim_server.py` (`--mimic_hdf5`), then `annotate_demos.py --from_states` and
+`generate_dataset.py` below (they record the joint targets lerobot needs, `openarm_recorders.py`), then
+lerobot_openarm's `mimic_to_lerobot.py`. Full commands: lerobot_openarm README, "Isaac Sim through the same
+pipeline", Sim Steps 1-6.
+
 ## Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 
 ```

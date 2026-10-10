@@ -26,6 +26,15 @@ The action space is replaced by absolute joint targets (openarm_joint_actions.sw
 Every termination is removed: the scene resets only when the robot asks (between episodes), as a real
 table does -- a dropped can stays dropped. The task's success term is still evaluated and reported.
 
+Mimic source demos (--mimic_hdf5 PATH): every episode lerobot-record SAVES is also written to an Isaac Lab
+HDF5, the format record_demos_openarm.py's --teleop_device vr_joint_ros2_native writes -- 16D absolute joint
+targets [left arm 7 | left finger | right arm 7 | right finger] as `actions`, scene states after each step
+as `states`, the state at the X press as `initial_state`. Discarded episodes are dropped, so the HDF5 and
+the lerobot dataset hold the same demos in the same order. Feed it to annotate_demos.py --from_states and
+generate_dataset.py (Isaac Lab Mimic); the robot plugin's README section has the commands. Record these
+source demos WITHOUT --domain_randomization: randomization belongs to the generation step, and annotation
+replays the states in an env without it. An existing file is appended to.
+
 The wire protocol is lerobot_openarm's plugins/.../sim_link.py, loaded from --lerobot_openarm.
 """
 
@@ -52,6 +61,11 @@ parser.add_argument(
     help="The lerobot_openarm checkout whose sim_link.py defines the wire protocol.",
 )
 parser.add_argument("--settle_steps", type=int, default=3, help="Steps run after a reset before answering it.")
+parser.add_argument(
+    "--mimic_hdf5",
+    default=None,
+    help="Also write every saved episode to this Isaac Lab HDF5, as Mimic source demos (appended if it exists).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True  # the robot's observations ARE the cameras
@@ -78,6 +92,7 @@ from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.pickup_ik_ab
     attach_domain_randomization,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg  # noqa: E402
+from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler  # noqa: E402
 
 
 def _load_sim_link(checkout: str):
@@ -136,6 +151,9 @@ class SimRobotServer:
         self.obs = None
         self.success = False
         self.step_count = 0
+        self.demo: EpisodeData | None = None  # the Mimic source demo pending since episode_begin, until episode_end
+        self.demo_open = False  # steps are appended to it (episode_begin .. episode_close)
+        self.demo_file = self._open_demo_file(args_cli.mimic_hdf5) if args_cli.mimic_hdf5 else None
         self.step_s = 0.0  # time inside env.step (physics + rendering), for the rate line
         policy_obs = env.observation_manager.compute()["policy"]
         self.cameras = {
@@ -152,7 +170,11 @@ class SimRobotServer:
                 self.action[0, slot] = float(value)
 
     def _step(self) -> None:
+        if self.demo_open:
+            self.demo.add("actions", self.action[0].clone())
         self.obs, *_ = self.env.step(self.action)
+        if self.demo_open:
+            self.demo.add("states", _first_env(self.env.scene.get_state(is_relative=True)))
         self.step_count += 1
         if self.success_term is not None:
             done = self.success_term.func(self.env, **self.success_term.params)
@@ -229,7 +251,57 @@ class SimRobotServer:
             return self._observation()
         if cmd == "observe":
             return self._observation()
+        if cmd == "episode_begin":
+            return self.episode_begin()
+        if cmd == "episode_close":  # the episode's last frame is in; lerobot decides save/discard later
+            self.demo_open = False
+            return {"ok": True}
+        if cmd == "episode_end":
+            return self.episode_end(bool(msg.get("save")))
         return {"error": f"unknown command {cmd!r}"}
+
+    # -- Mimic source demos -----------------------------------------------------------------------------
+    def _open_demo_file(self, path: str) -> HDF5DatasetFileHandler:
+        handler = HDF5DatasetFileHandler()
+        if os.path.exists(path):
+            handler.open(path, mode="a")
+            print(f"[lerobot_sim_server] Mimic source demos: appending to {path} ({handler.get_num_episodes()} already).")
+        else:
+            handler.create(path, env_name=args_cli.task.split(":")[-1])
+            cfg = self.env.cfg
+            # sim_args: what openarm_sim_timing.check_source_rate reads to refuse a replay at another rate.
+            handler.add_env_args({
+                "sim_args": {"dt": cfg.sim.dt, "decimation": cfg.decimation,
+                             "render_interval": cfg.sim.render_interval, "num_envs": 1},
+                "task_mode": args_cli.task_mode,
+                "recorded_with": "lerobot_sim_server.py (lerobot-record, --robot.type=openarm_isaac)",
+            })
+            handler.flush()
+            print(f"[lerobot_sim_server] Mimic source demos: writing {path}.")
+        return handler
+
+    def episode_begin(self) -> dict:
+        if self.demo_file is None:
+            return {"recording": False}
+        self.demo = EpisodeData()
+        self.demo.add("initial_state", _first_env(self.env.scene.get_state(is_relative=True)))
+        self.demo_open = True
+        return {"recording": True}
+
+    def episode_end(self, save: bool) -> dict:
+        demo, self.demo, self.demo_open = self.demo, None, False
+        if self.demo_file is None or demo is None or demo.is_empty() or "actions" not in demo.data:
+            return {"saved": None}
+        if not save:
+            return {"saved": None, "discarded": len(demo.data["actions"])}
+        demo.success = True  # saved by the operator: what Mimic treats as a source demo
+        demo.pre_export()
+        name = f"demo_{self.demo_file.get_num_episodes()}"
+        self.demo_file.write_episode(demo)
+        self.demo_file.flush()
+        steps = len(demo.data["actions"])
+        print(f"[lerobot_sim_server] Mimic source demo {name}: {steps} steps -> {args_cli.mimic_hdf5}", flush=True)
+        return {"saved": name, "steps": steps}
 
     def serve(self, host: str, port: int) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -277,7 +349,17 @@ class SimRobotServer:
                 print(f"[lerobot_sim_server] dropped the connection: {type(e).__name__}: {e}", flush=True)
             finally:
                 conn.close()
+                if self.demo is not None:
+                    print("[lerobot_sim_server] the robot left mid-episode: that Mimic source demo is dropped.", flush=True)
+                    self.demo, self.demo_open = None, False
         server.close()
+
+
+def _first_env(state):
+    """scene.get_state()'s nested dict, cut to env 0 the way the recorder manager stores one env's episode."""
+    if isinstance(state, dict):
+        return {k: _first_env(v) for k, v in state.items()}
+    return state[0].clone()
 
 
 def main() -> None:
@@ -304,6 +386,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if server.demo_file is not None:
+            server.demo_file.close()
         env.close()
 
 

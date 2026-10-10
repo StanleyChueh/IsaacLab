@@ -220,6 +220,16 @@ def main():
         task_name = args_cli.task.split(":")[-1]
     env_name = task_name or get_env_name_from_dataset(args_cli.input_file)
 
+    # OpenArm: also record the joint targets the IK commands each step -- what lerobot_openarm's
+    # mimic_to_lerobot.py stores as `action`, matching the real lerobot-record datasets (openarm_recorders.py).
+    recorder_cfg = None
+    if "OpenArm" in env_name:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_recorders import (
+            OpenArmLeRobotRecorderManagerCfg,
+        )
+
+        recorder_cfg = OpenArmLeRobotRecorderManagerCfg()
+
     # Configure environment
     env_cfg, success_term = setup_env_config(
         env_name=env_name,
@@ -228,6 +238,7 @@ def main():
         num_envs=num_envs,
         device=args_cli.device,
         generation_num_trials=args_cli.generation_num_trials,
+        recorder_cfg=recorder_cfg,
         task_mode=args_cli.task_mode,
     )
 
