@@ -39,6 +39,8 @@ The wire protocol is lerobot_openarm's plugins/.../sim_link.py, loaded from --le
 """
 
 import argparse
+import json
+import math
 import os
 
 from isaaclab.app import AppLauncher
@@ -61,6 +63,15 @@ parser.add_argument(
     help="The lerobot_openarm checkout whose sim_link.py defines the wire protocol.",
 )
 parser.add_argument("--settle_steps", type=int, default=3, help="Steps run after a reset before answering it.")
+parser.add_argument(
+    "--real_look",
+    nargs="?",
+    const="default",
+    default=None,
+    help="Render the scene to look like the real rig (robot colours, photo backdrop, lighting, sensor model fitted from"
+    " the real dataset; openarm_real_look.py). Bare flag = the shipped look; or pass another look folder. Not needed"
+    " with Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1, which has it built in.",
+)
 parser.add_argument(
     "--mimic_hdf5",
     default=None,
@@ -118,8 +129,9 @@ REPORTED_JOINTS = [f"openarm_{s}_joint{n}" for s in ("left", "right") for n in r
 
 
 class SimRobotServer:
-    def __init__(self, env, success_term):
+    def __init__(self, env, success_term, sensor=None):
         self.env = env
+        self.sensor = sensor  # openarm_real_look.SensorModel, or None for the renderer's raw frames
         self.robot = env.scene["robot"]
         self.success_term = success_term
         names = list(self.robot.data.joint_names)
@@ -184,17 +196,25 @@ class SimRobotServer:
         pos = self.robot.data.joint_pos[0, self.joint_idx].cpu().numpy()
         images = {}
         for cam in self.cameras:
-            img = self.obs["policy"][cam][0]
-            images[cam] = img[..., :3].to(torch.uint8).cpu().numpy()
+            img = self.obs["policy"][cam][0][..., :3].to(torch.uint8)
+            if self.sensor is not None:
+                img = self.sensor(cam, img)
+            images[cam] = img.cpu().numpy()
+        objects = {}
+        for name in getattr(self.env.cfg, "report_objects", ()):  # props a task wants reported (poses in the env frame)
+            asset = self.env.scene[name]
+            pose = torch.cat([asset.data.root_pos_w[0] - self.env.scene.env_origins[0], asset.data.root_quat_w[0]])
+            objects[name] = [float(v) for v in pose.cpu()]
         return {
             "joints": {name: float(v) for name, v in zip(REPORTED_JOINTS, pos)},
+            "objects": objects,
             "images": images,
             "success": self.success,
             "sim_time": self.step_count / CONTROL_HZ,
             "step": self.step_count,
         }
 
-    def reset(self, joints: dict | None) -> dict:
+    def reset(self, joints: dict | None, object_xy=None, objects: dict | None = None) -> dict:
         """Re-randomize the scene. With `joints`, put the robot there; without, keep it exactly where it is
         (pose, velocity, targets), as when a person resets the table between episodes."""
         kept = None
@@ -202,6 +222,21 @@ class SimRobotServer:
             kept = (self.robot.data.joint_pos.clone(), self.robot.data.joint_vel.clone(), self.action.clone())
         self.obs, _ = self.env.reset()
         self.success = False
+        if object_xy is not None:  # a replay tool wants the can where a real episode had it
+            can = self.env.scene["can"]
+            root = can.data.default_root_state.clone()
+            root[:, :3] = self.env.scene.env_origins + torch.tensor([*object_xy, CAN_REST_Z], device=self.env.device)
+            root[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.env.device)
+            root[:, 7:] = 0.0
+            can.write_root_state_to_sim(root)
+        for name, (x, y, yaw_deg) in (objects or {}).items():  # a replay tool wants each prop where a real episode had it
+            asset = self.env.scene[name]
+            root = asset.data.default_root_state.clone()
+            half = math.radians(yaw_deg) / 2.0
+            root[:, :2] = self.env.scene.env_origins[:, :2] + torch.tensor([x, y], device=self.env.device)
+            root[:, 3:7] = torch.tensor([math.cos(half), 0.0, 0.0, math.sin(half)], device=self.env.device)  # about +z, from identity
+            root[:, 7:] = 0.0
+            asset.write_root_state_to_sim(root)
         if kept is not None:
             self.robot.write_joint_state_to_sim(kept[0], kept[1])
             self.action = kept[2]
@@ -242,7 +277,7 @@ class SimRobotServer:
                 "domain_randomization": args_cli.domain_randomization,
             }
         if cmd == "reset":
-            return self.reset(msg.get("joints"))
+            return self.reset(msg.get("joints"), msg.get("object_xy"), msg.get("objects"))
         if cmd == "step":
             self._set_targets(msg["joints"])
             t0 = time.perf_counter()
@@ -355,6 +390,9 @@ class SimRobotServer:
         server.close()
 
 
+CAN_REST_Z = 0.28 + 0.1 + 0.003  # env-frame z of the can's origin standing on the pad (pad top + half its length + a hair)
+
+
 def _first_env(state):
     """scene.get_state()'s nested dict, cut to env 0 the way the recorder manager stores one env's episode."""
     if isinstance(state, dict):
@@ -365,7 +403,15 @@ def _first_env(state):
 def main() -> None:
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     env_cfg.env_name = args_cli.task.split(":")[-1]
-    apply_task_mode(env_cfg, args_cli.task_mode)
+    if getattr(env_cfg, "task_mode_applicable", True):  # the battery task has no can and no task modes
+        apply_task_mode(env_cfg, args_cli.task_mode)
+    look_dir = getattr(env_cfg, "real_look_dir", None)  # a task that carries its look (…-IK-Abs-v1) already applied it
+    if args_cli.real_look and look_dir is None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import LOOK_DIR, apply_real_look
+
+        look_dir = LOOK_DIR if args_cli.real_look == "default" else args_cli.real_look
+        applied = apply_real_look(env_cfg, look_dir)
+        print(f"[lerobot_sim_server] real look: {'; '.join(applied) or 'nothing found in the look folder'}")
     if args_cli.domain_randomization != "none":
         attached = attach_domain_randomization(env_cfg, args_cli.domain_randomization, args_cli.enable_camera_shake)
         print(f"[lerobot_sim_server] domain randomization '{args_cli.domain_randomization}': {', '.join(attached)}")
@@ -379,8 +425,19 @@ def main() -> None:
     env_cfg.observations.policy.concatenate_terms = False
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+    if look_dir is not None and os.path.isfile(os.path.join(look_dir, "contact_physics.json")):
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import apply_contact_physics
+
+        fitted = json.load(open(os.path.join(look_dir, "contact_physics.json")))["params"]
+        print(f"[lerobot_sim_server] contact physics fitted to the real episodes: {apply_contact_physics(env, fitted)} + {fitted}")
     env.reset()
-    server = SimRobotServer(env, success_term)
+    sensor = None
+    if look_dir is not None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import SensorModel
+
+        sensor = SensorModel(look_dir)
+        print(f"[lerobot_sim_server] camera sensor model: {sensor.params or 'none fitted'}")
+    server = SimRobotServer(env, success_term, sensor)
     try:
         server.serve(args_cli.host, args_cli.port)
     except KeyboardInterrupt:

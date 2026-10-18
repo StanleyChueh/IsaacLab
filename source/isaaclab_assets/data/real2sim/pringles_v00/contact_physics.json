@@ -1,0 +1,13 @@
+{
+ "params": {
+  "can_friction": 1.202,
+  "finger_friction": 0.2242,
+  "can_mass": 0.108,
+  "grip_stiffness": 635.8135,
+  "grip_damping": 6.5149,
+  "grip_effort": 25.6554
+ },
+ "fitted_with": "scripts/tools/sysid/fit_contact_physics.py on real episodes 0-34 of ethanCSL/openarm_pringles_lerobot_real_v00",
+ "result": "replays of the real actions: can lifted and still up at the end in 29/50 episodes (cfg physics: 14/50); held-out 35-49: carry-follow 0.588 vs 0.423",
+ "caveat": "effective values that reproduce carrying, not measured ones; can_mass sits at the search's lower bound (0.10 kg)"
+}

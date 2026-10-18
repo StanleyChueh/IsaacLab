@@ -102,6 +102,10 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
         # a hand-eyeballed 20cm-behind-the-gripper position to the URDF's true 6cm mount point.
         # Re-check the rendered image after this change: field of view differs substantially
         # this close to the gripper, so `rot` may need re-tuning in the Isaac Sim GUI.
+        # Lens (2026-10-18): the real D435i at 640x480 has fx = 605.4 (left) / 607.8 (right) (`rs-enumerate-devices -c`);
+        # aperture = 640 * 24 / fx instead of 20.955, which gave fx = 733. The mount is unchanged: hand-eye
+        # calibration over the real episodes (scripts/tools/sysid/wrist_handeye.py) disagreed between the two
+        # identical cameras by 15 deg, so it could not justify moving the URDF-derived mount.
         self.scene.wrist_cam = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_left_ee_tcp/wrist_cam",
             update_period=0.0,
@@ -111,7 +115,7 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=24.0,
                 focus_distance=400.0,
-                horizontal_aperture=20.955,
+                horizontal_aperture=25.3704,
                 clipping_range=(0.05, 2.0),
             ),
             offset=CameraCfg.OffsetCfg(
@@ -135,7 +139,7 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=24.0,
                 focus_distance=400.0,
-                horizontal_aperture=20.955,
+                horizontal_aperture=25.2720,
                 clipping_range=(0.05, 2.0),
             ),
             offset=CameraCfg.OffsetCfg(
@@ -146,11 +150,15 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
         )
 
         # ── Body camera (attached to openarm_body_link0, front of torso at shoulder height) ─
-        # Positioned at the front face of the central body pillar, ~65 cm above the base,
-        # matching the real OpenArm robot's chest-mounted camera location.
-        # pos=(0.12, 0, 0.65) relative to openarm_body_link0; looks toward workspace center.
-        # Rotation: camera looks forward (+X world) and 60° downward toward the workspace.
-        # To retune: adjust pos/rot manually in Isaac Sim, then copy values here.
+        # Calibrated against the real D435i body camera (2026-10-18):
+        #  * Lens: the real colour stream at 640x480 has fx = fy = 607.2 px (`rs-enumerate-devices -c`,
+        #    HFOV 55.6 deg); aperture = 640 * 24 / 607.22. The old 20.955 mm aperture gave fx = 733 px
+        #    (HFOV 47.2 deg), ~17% zoomed in. The real principal point (326.4, 238.7) is not set: the
+        #    renderer ignores aperture offsets and always centres it, and the pose fit absorbs the 6 px.
+        #  * Mount: fitted by scripts/tools/sysid/calibrate_camera.py -- the sim robot posed at 123 real
+        #    frames' joint states (ethanCSL/openarm_pringles_lerobot_real_v00), its silhouette matched to
+        #    the real robot's. ~14 cm lower and ~6 deg steeper than the hand-tuned (0.04563, 0, 0.97524).
+        #    Robot-silhouette IoU 0.33 -> 0.71 (median). Re-run that pipeline if the camera is re-mounted.
         self.scene.body_cam = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_body_link0/body_cam",
             update_period=0.0,
@@ -160,12 +168,12 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=24.0,
                 focus_distance=400.0,
-                horizontal_aperture=20.955,
+                horizontal_aperture=25.2956,
                 clipping_range=(0.1, 3.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.04563, 0.0, 0.97524),
-                rot=(0.1203, -0.6968, 0.6968, -0.1203),
+                pos=(0.05621, -0.00305, 0.83062),
+                rot=(0.18720, -0.68244, 0.69543, -0.12490),
                 convention="ros",
             ),
         )

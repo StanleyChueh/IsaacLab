@@ -118,6 +118,7 @@ logger = logging.getLogger(__name__)
 # eval_smolvla_jointspace.py both check their --task against this list.
 CAN_TARGET_TASKS = (
     "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
+    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1",
     "Isaac-PickUp-RedCube-OpenArm-CamMount-IK-Abs-v0",
 )
 

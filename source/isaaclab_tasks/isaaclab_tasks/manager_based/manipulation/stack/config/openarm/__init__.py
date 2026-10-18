@@ -25,6 +25,8 @@ import gymnasium as gym
 from . import (
     pickup_ik_abs_cammount_env_cfg,
     pickup_ik_abs_env_cfg,
+    pickup_ik_abs_insertbattery_env_cfg,
+    pickup_ik_abs_reallook_env_cfg,
     plate_wipe_ik_abs_env_cfg,
 )
 
@@ -34,6 +36,28 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCfg,
+    },
+)
+
+# The same task rendered to look like the real rig (fitted robot colours, light, photo backdrop, camera sensor model --
+# openarm_real_look.py). Physics, actions and success are identical to v0; use --domain_randomization none.
+gym.register(
+    id="Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": pickup_ik_abs_reallook_env_cfg.OpenarmPickUpRedCubeRealLookEnvCfg,
+    },
+)
+
+# Battery insertion (left arm lifts the charging station, right arm brings the battery), real look built in. The charger's
+# slots are drawn, not modelled: grasp-level physics only. See pickup_ik_abs_insertbattery_env_cfg.py.
+gym.register(
+    id="Isaac-InsertBattery-OpenArm-IK-Abs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": pickup_ik_abs_insertbattery_env_cfg.OpenarmInsertBatteryEnvCfg,
     },
 )
 

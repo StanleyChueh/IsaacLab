@@ -1,0 +1,560 @@
+{
+ "openarm_body_link0/mat_5": {
+  "diffuse": [
+   0.5608,
+   0.5529,
+   0.5412
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_body_link0/mat_2_006": {
+  "diffuse": [
+   0.9569,
+   0.9569,
+   0.9608
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_body_link0/mat_0_008": {
+  "diffuse": [
+   0.2471,
+   0.2471,
+   0.2471
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_body_link0/mat_4": {
+  "diffuse": [
+   0.7961,
+   0.7961,
+   0.7961
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_body_link0/mat_3_002": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_body_link0/mat_1_008": {
+  "diffuse": [
+   0.6274,
+   0.6274,
+   0.6274
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link0/Material": {
+  "diffuse": [
+   0.8,
+   0.8,
+   0.8
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link1/mat_3": {
+  "diffuse": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link1/mat_0_001": {
+  "diffuse": [
+   0.2471,
+   0.2471,
+   0.2471
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link1/mat_2": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link1/mat_1_001": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link2/mat_0_002": {
+  "diffuse": [
+   0.2471,
+   0.2471,
+   0.2471
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link2/mat_2_001": {
+  "diffuse": [
+   0.6274,
+   0.6274,
+   0.6274
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link2/mat_1_002": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link3/mat_2_002": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link3/mat_1_003": {
+  "diffuse": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link3/mat_0_003": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link4/mat_1_004": {
+  "diffuse": [
+   0.1127,
+   0.1118,
+   0.1095
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link4/mat_0_004": {
+  "diffuse": [
+   0.0637,
+   0.0637,
+   0.0637
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link4/mat_2_003": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link5/mat_2_004": {
+  "diffuse": [
+   0.0647,
+   0.0647,
+   0.0647
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link5/mat_1_005": {
+  "diffuse": [
+   0.1047,
+   0.1039,
+   0.1018
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link5/mat_0_005": {
+  "diffuse": [
+   0.058,
+   0.058,
+   0.058
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link6/mat_1_006": {
+  "diffuse": [
+   0.0365,
+   0.0365,
+   0.0365
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link6/mat_0_006": {
+  "diffuse": [
+   0.3717,
+   0.3687,
+   0.3613
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link7/mat_3_001": {
+  "diffuse": [
+   0.1345,
+   0.1345,
+   0.135
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link7/mat_2_005": {
+  "diffuse": [
+   0.0285,
+   0.0285,
+   0.0285
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link7/mat_1_007": {
+  "diffuse": [
+   0.6274,
+   0.6274,
+   0.6274
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_link7/mat_0_007": {
+  "diffuse": [
+   0.7961,
+   0.7961,
+   0.7961
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_camera_link/\u6750\u8cea": {
+  "diffuse": [
+   0.0626,
+   0.0626,
+   0.0626
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_right_finger/mat_0_009": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_right_finger/mat_1_009": {
+  "diffuse": [
+   0.0838,
+   0.0838,
+   0.0838
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_left_finger/mat_0_009": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_left_left_finger/mat_1_009": {
+  "diffuse": [
+   0.1593,
+   0.1593,
+   0.1593
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link0/Material": {
+  "diffuse": [
+   0.8,
+   0.8,
+   0.8
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link1/mat_3": {
+  "diffuse": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link1/mat_0_001": {
+  "diffuse": [
+   0.2471,
+   0.2471,
+   0.2471
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link1/mat_2": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link1/mat_1_001": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link2/mat_0_002": {
+  "diffuse": [
+   0.2471,
+   0.2471,
+   0.2471
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link2/mat_2_001": {
+  "diffuse": [
+   0.6274,
+   0.6274,
+   0.6274
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link2/mat_1_002": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link3/mat_2_002": {
+  "diffuse": [
+   0.0687,
+   0.0687,
+   0.0687
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link3/mat_1_003": {
+  "diffuse": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link3/mat_0_003": {
+  "diffuse": [
+   0.1287,
+   0.1277,
+   0.1252
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link4/mat_1_004": {
+  "diffuse": [
+   0.0632,
+   0.0628,
+   0.0615
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link4/mat_0_004": {
+  "diffuse": [
+   0.0463,
+   0.0463,
+   0.0463
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link4/mat_2_003": {
+  "diffuse": [
+   0.0941,
+   0.0941,
+   0.0941
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link5/mat_2_004": {
+  "diffuse": [
+   0.1069,
+   0.1069,
+   0.1069
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link5/mat_1_005": {
+  "diffuse": [
+   0.1232,
+   0.1222,
+   0.1198
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link5/mat_0_005": {
+  "diffuse": [
+   0.0542,
+   0.0542,
+   0.0542
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link6/mat_1_006": {
+  "diffuse": [
+   0.1425,
+   0.1425,
+   0.1425
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link6/mat_0_006": {
+  "diffuse": [
+   0.2148,
+   0.2131,
+   0.2089
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link7/mat_3_001": {
+  "diffuse": [
+   0.1846,
+   0.1846,
+   0.1853
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link7/mat_2_005": {
+  "diffuse": [
+   0.0169,
+   0.0169,
+   0.0169
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link7/mat_1_007": {
+  "diffuse": [
+   0.6274,
+   0.6274,
+   0.6274
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_link7/mat_0_007": {
+  "diffuse": [
+   0.7961,
+   0.7961,
+   0.7961
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_camera_link/\u6750\u8cea": {
+  "diffuse": [
+   0.0586,
+   0.0586,
+   0.0586
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_right_finger/mat_0_009": {
+  "diffuse": [
+   0.073,
+   0.0724,
+   0.071
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_right_finger/mat_1_009": {
+  "diffuse": [
+   0.0978,
+   0.0978,
+   0.0978
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_left_finger/mat_0_009": {
+  "diffuse": [
+   0.9843,
+   0.9765,
+   0.9569
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ },
+ "openarm_right_left_finger/mat_1_009": {
+  "diffuse": [
+   0.0176,
+   0.0176,
+   0.0176
+  ],
+  "roughness": 0.5,
+  "metallic": 0.0
+ }
+}
