@@ -181,6 +181,16 @@ and the robot base pose).
   links (`robot_self_collisions=False`), not gravity (gravity is off for the robot already); the shoulder/elbow effort limit is scaled
   1.6x (`arm_effort_scale`); the cell needs damping or it creeps across the mat; a gripper command queued behind another leg must
   build on that leg's end, not on the stale pose.
-* Result: 16/16 headless, live server 3/3 then the recorded dataset (see below). Limits: the arm trajectories are scripted (smooth
-  min-jerk, not a human's), the bay is wider than the real one (1.8 vs 1.5 cm) with a collar, and the sim hand cannot be made to match
-  the real one's reach (a calibration gap of centimetres between real joint angles and the URDF).
+* Result: 32/32 inserted headless over the sampled start region (`run_battery_expert.py --scatter`); in earlier live-server tries
+  (before the last gripper-opening and collar fixes) 15 of 24 and then 10 of 12 inserted. The live success rate after those fixes
+  was not re-measured, and the final dataset recording was not finished. Limits: the arm trajectories are scripted (smooth
+  min-jerk, not a human's), the bay is wider than the real one (1.8 vs 1.5 cm) with a collar, and the sim hand cannot be made to
+  match the real one's reach (a calibration gap of centimetres between real joint angles and the URDF).
+
+> **KNOWN ISSUE: robot collisions.** The battery task sets `robot_self_collisions=False` to stop convex-hull collisions inside one
+> arm from stalling the joints. That also removes collisions between the LEFT and RIGHT arm and between the arms and the torso, and
+> neither the expert nor `battery_meeting.py` checks link-to-link distance. Near the meeting pose the two hands and forearms are
+> close, so episodes may have arms passing through each other (not measured). Datasets recorded this way
+> (`ethanCSL/openarm_insertbattery_lerobot_sim_v02_expert`, a partial unfinalized run, and `..._v02_expert_early17`) are NOT safe to
+> train on. Planned fix: measure the minimum link distance per episode, enable only the cross-arm and arm-to-torso collision pairs,
+> add a link-distance check to the IK / meeting solver, then re-record.
