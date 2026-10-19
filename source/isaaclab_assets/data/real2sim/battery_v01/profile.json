@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dataset_repo_id": "ethanCSL/openarm_insertbattery_lerobot_real_v01",
+  "compatible_tasks": ["Isaac-InsertBattery-OpenArm-IK-Abs-v0"],
+  "cameras": ["body_cam", "wrist_cam", "right_wrist_cam"],
+  "compatible_randomization": ["none"],
+  "required_assets": [
+    "albedo.json", "lighting.json", "sensor.json", "tone.json",
+    "backdrop_body.npz", "backdrop_wrist_cam.npz", "backdrop_right_wrist_cam.npz",
+    "charger_top.png"
+  ],
+  "hide_visuals": ["table", "workspace_pad", "plane"]
+}

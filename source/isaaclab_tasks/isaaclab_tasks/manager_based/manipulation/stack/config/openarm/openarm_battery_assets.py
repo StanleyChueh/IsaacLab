@@ -10,9 +10,9 @@
   (``build_charger_texture.py``): lid, three batteries in their slots, the empty slot, the LED.
 * **Battery** -- one AA cell lying flat, 5.05 cm x 1.45 cm, 27 g.
 
-Both are plain rigid bodies with box / cylinder colliders. The charger's slots are drawn, not modelled: nothing here lets
-a battery drop into one. That needs the slot geometry to sub-millimetre accuracy, which a look cannot give (see the sysid
-README, "Battery insertion").
+The leftmost, empty slot has an approximate compound box collider, so a battery can physically enter it.
+Its dimensions are estimated from the rectified photo and must be replaced with measured geometry before claiming
+sub-millimetre insertion fidelity (see the sysid README, "Battery insertion").
 """
 
 from __future__ import annotations
@@ -31,6 +31,27 @@ CHARGER_SIZE = (0.115, 0.0652, 0.0375)
 BATTERY_RADIUS, BATTERY_LENGTH, BATTERY_MASS = 0.00725, 0.0505, 0.027
 CHARGER_MASS = 0.25
 """kg. An estimate (body plus three AA cells at 27 g); the contact fit can move it."""
+EMPTY_SLOT_CENTER = (-0.011, 0.0215)
+EMPTY_SLOT_SIZE = (0.056, 0.0175)
+EMPTY_SLOT_DEPTH = 0.009
+"""Metres in charger local x/y/z, estimated from charger_top.png. The leftmost bay is empty."""
+
+
+def _slot_collider_parts():
+    """Five non-overlapping boxes that form a charger body with one open rectangular bay."""
+    L, W, T = CHARGER_SIZE
+    sx, sy = EMPTY_SLOT_CENTER
+    sl, sw = EMPTY_SLOT_SIZE
+    d = EMPTY_SLOT_DEPTH
+    x0, x1 = sx - sl / 2, sx + sl / 2
+    y0, y1 = sy - sw / 2, sy + sw / 2
+    return (
+        ("base", (L, W, T - d), (0.0, 0.0, -d / 2)),
+        ("end_pos", (L / 2 - x1, W, d), ((x1 + L / 2) / 2, 0.0, (T - d) / 2)),
+        ("end_neg", (x0 + L / 2, W, d), ((x0 - L / 2) / 2, 0.0, (T - d) / 2)),
+        ("side_pos", (sl, W / 2 - y1, d), (sx, (y1 + W / 2) / 2, (T - d) / 2)),
+        ("side_neg", (sl, y0 + W / 2, d), (sx, (y0 - W / 2) / 2, (T - d) / 2)),
+    )
 
 
 def spawn_charger(prim_path: str, cfg: "ChargerCfg", translation=None, orientation=None, **kwargs):
@@ -42,9 +63,10 @@ def spawn_charger(prim_path: str, cfg: "ChargerCfg", translation=None, orientati
     import json
 
     from PIL import Image
-    from pxr import Gf, Sdf, UsdGeom, UsdShade, Vt
+    from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade, Vt
 
     from isaaclab.sim.spawners.shapes.shapes import spawn_cuboid
+    from isaaclab.sim import schemas
 
     from .openarm_real_look import emissive_from_srgb
 
@@ -59,9 +81,31 @@ def spawn_charger(prim_path: str, cfg: "ChargerCfg", translation=None, orientati
         material_path = f"{prim_path}/geometry/body_material"
         body_material.func(material_path, body_material)
         sim_utils.bind_visual_material(f"{prim_path}/geometry/mesh", material_path, stronger_than_descendants=False)
+    # Keep the root rigid body and its mass, but replace the cuboid collider and visual with
+    # a compound five-box body. This leaves the empty bay physically open. All boxes belong
+    # to the same rigid body; the photo decal below is visual only.
+    stage = sim_utils.get_current_stage()
+    original = stage.GetPrimAtPath(f"{prim_path}/geometry/mesh")
+    UsdGeom.Imageable(original).MakeInvisible()
+    UsdPhysics.CollisionAPI(original).CreateCollisionEnabledAttr(False)
+    physics_path = cfg.physics_material_path
+    physics_path = physics_path if physics_path.startswith("/") else f"{prim_path}/geometry/{physics_path}"
+    for name, size, centre in _slot_collider_parts():
+        path = f"{prim_path}/geometry/{name}"
+        cube = UsdGeom.Cube.Define(stage, path)
+        cube.CreateSizeAttr(1.0)
+        translation_op = cube.AddTranslateOp()
+        translation_op.Set(Gf.Vec3d(*centre))
+        scale_op = cube.AddScaleOp()
+        scale_op.Set(Gf.Vec3d(*size))
+        cube.SetXformOpOrder([translation_op, scale_op])
+        schemas.define_collision_properties(path, cfg.collision_props, stage=stage)
+        if body_material is not None:
+            sim_utils.bind_visual_material(path, material_path, stronger_than_descendants=False)
+        if cfg.physics_material is not None:
+            sim_utils.bind_physics_material(path, physics_path, stage=stage)
     if not (cfg.top_texture and os.path.isfile(cfg.top_texture)):
         return prim
-    stage = sim_utils.get_current_stage()
     L, W, T = cfg.size
     nx, ny = int(round(L / 0.0005)), int(round(W / 0.0005))  # rows along local x, columns along local y
     # the photo: row 0 = the +x end, column 0 = the +y side (build_charger_texture.py)
@@ -75,6 +119,13 @@ def spawn_charger(prim_path: str, cfg: "ChargerCfg", translation=None, orientati
     idx = np.arange((nx + 1) * (ny + 1)).reshape(nx + 1, ny + 1)
     a, b, c, d = idx[:-1, :-1].ravel(), idx[:-1, 1:].ravel(), idx[1:, 1:].ravel(), idx[1:, :-1].ravel()
     faces = np.concatenate([np.stack([a, c, b], 1), np.stack([a, d, c], 1)]).astype(np.int32)  # counter-clockwise from above
+    # Remove photo triangles over the open bay, so the inserted battery is visible below the lid.
+    triangle_centres = pts[faces].mean(axis=1)
+    slot_x, slot_y = EMPTY_SLOT_CENTER
+    slot_l, slot_w = EMPTY_SLOT_SIZE
+    in_slot = ((np.abs(triangle_centres[:, 0] - slot_x) < slot_l / 2)
+               & (np.abs(triangle_centres[:, 1] - slot_y) < slot_w / 2))
+    faces = faces[~in_slot]
     decal = UsdGeom.Mesh.Define(stage, f"{prim_path}/top_decal")
     decal.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(pts))
     decal.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(faces), 3, np.int32)))

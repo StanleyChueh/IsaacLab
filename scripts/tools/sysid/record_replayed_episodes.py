@@ -14,8 +14,8 @@ The sim does not always carry the can (finger geometry and friction differ), so 
 own success condition (the hand-over) was met at some step are kept; the others are discarded and the next real episode is
 tried. --keep_all saves every replay.
 
-  # terminal 1: ./isaaclab.sh -p scripts/tools/lerobot_sim_server.py --enable_cameras --headless --real_look \\
-  #                 --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --task_mode handover --domain_randomization none
+  # terminal 1: ./isaaclab.sh -p scripts/tools/lerobot_sim_server.py --enable_cameras --headless \\
+  #                 --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1 --task_mode handover --domain_randomization none
   # terminal 2 (lerobot_openarm's venv):
   python scripts/tools/sysid/record_replayed_episodes.py --repo_id ethanCSL/openarm_pringles_lerobot_sim_v01_reallook \\
       --num_episodes 5

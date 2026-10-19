@@ -33,6 +33,10 @@ parser.add_argument("--random_batches", type=int, default=4)
 parser.add_argument("--calibration", default=os.path.expanduser("~/Stanley_ws/lerobot_openarm/calibration.json"))
 parser.add_argument("--settle_steps", type=int, default=20)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--max_object_xy_offset", type=float, default=None,
+                    help="Restrict each fitted x/y correction to +/- this many metres around camera-estimated starts.")
+parser.add_argument("--max_object_yaw_offset", type=float, default=None,
+                    help="Restrict each fitted yaw correction to +/- this many degrees around camera-estimated starts.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = False
@@ -88,6 +92,18 @@ class MinimalObs:
 
 
 def main() -> None:
+    if args_cli.max_object_xy_offset is not None:
+        bound = float(args_cli.max_object_xy_offset)
+        if bound <= 0:
+            raise ValueError("--max_object_xy_offset must be positive")
+        for key in ("charger_dx", "charger_dy", "battery_dx", "battery_dy"):
+            SPACE[key] = (-bound, bound, "lin")
+    if args_cli.max_object_yaw_offset is not None:
+        bound = float(args_cli.max_object_yaw_offset)
+        if bound <= 0:
+            raise ValueError("--max_object_yaw_offset must be positive")
+        for key in ("charger_yaw", "battery_yaw"):
+            SPACE[key] = (-bound, bound, "lin")
     traj = np.load(os.path.join(args_cli.replay, "trajectories.npz"))
     starts = json.load(open(os.path.join(args_cli.replay, "object_starts.json")))
     names = [str(n) for n in traj["names"]]

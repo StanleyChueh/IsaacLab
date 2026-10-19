@@ -12,7 +12,7 @@ RealSense cameras -- so a sim dataset has exactly the keys, units, action meanin
 a real one.
 
   ./isaaclab.sh -p scripts/tools/lerobot_sim_server.py --enable_cameras \\
-      --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --task_mode handover
+      --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1 --task_mode handover
 
 then, in lerobot_openarm's venv: lerobot-record --robot.type=openarm_isaac ... (see its README).
 
@@ -24,16 +24,17 @@ physics), so the window stays alive.
 The action space is replaced by absolute joint targets (openarm_joint_actions.swap_to_openarm_joint_actions):
 7 arm joints + one finger position per arm, the same joint convention calibration.json maps to the motors.
 Every termination is removed: the scene resets only when the robot asks (between episodes), as a real
-table does -- a dropped can stays dropped. The task's success term is still evaluated and reported.
+table does. A task's success term, when provided, is still evaluated and reported.
 
 Mimic source demos (--mimic_hdf5 PATH): every episode lerobot-record SAVES is also written to an Isaac Lab
 HDF5, the format record_demos_openarm.py's --teleop_device vr_joint_ros2_native writes -- 16D absolute joint
 targets [left arm 7 | left finger | right arm 7 | right finger] as `actions`, scene states after each step
 as `states`, the state at the X press as `initial_state`. Discarded episodes are dropped, so the HDF5 and
 the lerobot dataset hold the same demos in the same order. Feed it to annotate_demos.py --from_states and
-generate_dataset.py (Isaac Lab Mimic); the robot plugin's README section has the commands. Record these
-source demos WITHOUT --domain_randomization: randomization belongs to the generation step, and annotation
-replays the states in an env without it. An existing file is appended to.
+generate_dataset.py (Isaac Lab Mimic) only for tasks with a configured Mimic environment and subtask
+signals; the robot plugin's README has the Pringles commands. Record those source demos WITHOUT
+--domain_randomization: annotation replays their states in an unrandomized environment. An existing
+file is appended to.
 
 The wire protocol is lerobot_openarm's plugins/.../sim_link.py, loaded from --lerobot_openarm.
 """
@@ -66,16 +67,20 @@ parser.add_argument("--settle_steps", type=int, default=3, help="Steps run after
 parser.add_argument(
     "--real_look",
     nargs="?",
-    const="default",
+    const="task",
     default=None,
-    help="Render the scene to look like the real rig (robot colours, photo backdrop, lighting, sensor model fitted from"
-    " the real dataset; openarm_real_look.py). Bare flag = the shipped look; or pass another look folder. Not needed"
-    " with Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1, which has it built in.",
+    help="Dataset-fitted rendering profile. Bare flag uses the task cfg's profile; pass an explicit profile"
+    " folder for a task without one. A task with a built-in profile already uses it, so the flag is optional.",
 )
 parser.add_argument(
     "--mimic_hdf5",
     default=None,
     help="Also write every saved episode to this Isaac Lab HDF5, as Mimic source demos (appended if it exists).",
+)
+parser.add_argument(
+    "--contact_physics",
+    default=None,
+    help="Override the task profile's optional contact_physics.json with a fitted JSON file for replay tests.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -129,9 +134,10 @@ REPORTED_JOINTS = [f"openarm_{s}_joint{n}" for s in ("left", "right") for n in r
 
 
 class SimRobotServer:
-    def __init__(self, env, success_term, sensor=None):
+    def __init__(self, env, success_term, sensor=None, profile=None):
         self.env = env
         self.sensor = sensor  # openarm_real_look.SensorModel, or None for the renderer's raw frames
+        self.profile = profile
         self.robot = env.scene["robot"]
         self.success_term = success_term
         names = list(self.robot.data.joint_names)
@@ -160,7 +166,6 @@ class SimRobotServer:
             )
         self.action = torch.zeros(1, offset, device=env.device)
 
-        self.obs = None
         self.success = False
         self.step_count = 0
         self.demo: EpisodeData | None = None  # the Mimic source demo pending since episode_begin, until episode_end
@@ -168,6 +173,7 @@ class SimRobotServer:
         self.demo_file = self._open_demo_file(args_cli.mimic_hdf5) if args_cli.mimic_hdf5 else None
         self.step_s = 0.0  # time inside env.step (physics + rendering), for the rate line
         policy_obs = env.observation_manager.compute()["policy"]
+        self.obs = {"policy": policy_obs}  # allow observe before the client's first reset
         self.cameras = {
             k: list(v.shape[1:3]) for k, v in policy_obs.items() if v.ndim == 4 and v.shape[-1] in (3, 4)
         }
@@ -201,7 +207,8 @@ class SimRobotServer:
                 img = self.sensor(cam, img)
             images[cam] = img.cpu().numpy()
         objects = {}
-        for name in getattr(self.env.cfg, "report_objects", ()):  # props a task wants reported (poses in the env frame)
+        reported = getattr(self.env.cfg, "report_objects", None)
+        for name in (reported if reported is not None else self.env.scene.rigid_objects.keys()):
             asset = self.env.scene[name]
             pose = torch.cat([asset.data.root_pos_w[0] - self.env.scene.env_origins[0], asset.data.root_quat_w[0]])
             objects[name] = [float(v) for v in pose.cpu()]
@@ -222,18 +229,29 @@ class SimRobotServer:
             kept = (self.robot.data.joint_pos.clone(), self.robot.data.joint_vel.clone(), self.action.clone())
         self.obs, _ = self.env.reset()
         self.success = False
-        if object_xy is not None:  # a replay tool wants the can where a real episode had it
-            can = self.env.scene["can"]
-            root = can.data.default_root_state.clone()
-            root[:, :3] = self.env.scene.env_origins + torch.tensor([*object_xy, CAN_REST_Z], device=self.env.device)
-            root[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.env.device)
-            root[:, 7:] = 0.0
-            can.write_root_state_to_sim(root)
-        for name, (x, y, yaw_deg) in (objects or {}).items():  # a replay tool wants each prop where a real episode had it
+        # Legacy can replay uses object_xy; new tasks use the scene-asset keyed objects map.
+        objects = dict(objects or {})
+        legacy_can = object_xy is not None and "can" not in objects
+        if object_xy is not None:
+            if "can" not in self.env.scene.keys():
+                raise ValueError("object_xy is a legacy can-only reset field; use objects={asset: [x,y,yaw_deg]}")
+            objects.setdefault("can", [*object_xy, 0.0])
+        for name, pose in objects.items():
+            if len(pose) == 3:
+                x, y, yaw_deg = pose
+                z = None
+            elif len(pose) == 4:
+                x, y, z, yaw_deg = pose
+            else:
+                raise ValueError(f"objects[{name!r}] must be [x, y, yaw_deg] or [x, y, z, yaw_deg]")
             asset = self.env.scene[name]
             root = asset.data.default_root_state.clone()
             half = math.radians(yaw_deg) / 2.0
             root[:, :2] = self.env.scene.env_origins[:, :2] + torch.tensor([x, y], device=self.env.device)
+            if z is not None:
+                root[:, 2] = self.env.scene.env_origins[:, 2] + float(z)
+            if name == "can" and legacy_can:
+                root[:, 2] += 0.003  # preserve the legacy replay's 3 mm clearance above its cfg rest height
             root[:, 3:7] = torch.tensor([math.cos(half), 0.0, 0.0, math.sin(half)], device=self.env.device)  # about +z, from identity
             root[:, 7:] = 0.0
             asset.write_root_state_to_sim(root)
@@ -273,8 +291,10 @@ class SimRobotServer:
                 "cameras": self.cameras,
                 "control_hz": CONTROL_HZ,
                 "task": args_cli.task,
-                "task_mode": args_cli.task_mode,
+                "task_mode": args_cli.task_mode if getattr(self.env.cfg, "task_mode_applicable", True) else None,
                 "domain_randomization": args_cli.domain_randomization,
+                "real_dataset": self.profile["dataset_repo_id"] if self.profile else None,
+                "has_success_term": self.success_term is not None,
             }
         if cmd == "reset":
             return self.reset(msg.get("joints"), msg.get("object_xy"), msg.get("objects"))
@@ -344,7 +364,8 @@ class SimRobotServer:
         server.bind((host, port))
         server.listen(1)
         server.settimeout(0.05)
-        print(f"[lerobot_sim_server] ready on {host}:{port} -- {args_cli.task} ({args_cli.task_mode}),"
+        task_mode = args_cli.task_mode if getattr(self.env.cfg, "task_mode_applicable", True) else "no task mode"
+        print(f"[lerobot_sim_server] ready on {host}:{port} -- {args_cli.task} ({task_mode}),"
               f" {CONTROL_HZ} Hz, cameras {self.cameras}, randomization: {args_cli.domain_randomization}", flush=True)
         gui = self.env.sim.has_gui()
         while simulation_app.is_running():
@@ -390,9 +411,6 @@ class SimRobotServer:
         server.close()
 
 
-CAN_REST_Z = 0.28 + 0.1 + 0.003  # env-frame z of the can's origin standing on the pad (pad top + half its length + a hair)
-
-
 def _first_env(state):
     """scene.get_state()'s nested dict, cut to env 0 the way the recorder manager stores one env's episode."""
     if isinstance(state, dict):
@@ -405,14 +423,38 @@ def main() -> None:
     env_cfg.env_name = args_cli.task.split(":")[-1]
     if getattr(env_cfg, "task_mode_applicable", True):  # the battery task has no can and no task modes
         apply_task_mode(env_cfg, args_cli.task_mode)
-    look_dir = getattr(env_cfg, "real_look_dir", None)  # a task that carries its look (…-IK-Abs-v1) already applied it
-    if args_cli.real_look and look_dir is None:
-        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import LOOK_DIR, apply_real_look
+    from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.real_look_profile import (
+        contact_targets,
+        load_profile,
+    )
 
-        look_dir = LOOK_DIR if args_cli.real_look == "default" else args_cli.real_look
+    configured_look = getattr(env_cfg, "real_look_dir", None)
+    if args_cli.real_look == "task" and configured_look is None:
+        raise SystemExit("This task has no built-in real look. Pass --real_look /path/to/profile instead.")
+    look_dir = configured_look if args_cli.real_look in (None, "task") else os.path.abspath(args_cli.real_look)
+    if configured_look and look_dir and os.path.realpath(look_dir) != os.path.realpath(configured_look):
+        raise SystemExit(
+            f"{args_cli.task} already applied {configured_look} while building its scene."
+            " Select that task's profile or create a task cfg with the new look directory."
+        )
+    profile = load_profile(look_dir, args_cli.task) if look_dir else None
+    if profile and args_cli.domain_randomization not in profile.get("compatible_randomization", ["none"]):
+        raise SystemExit(
+            f"{look_dir}/profile.json allows randomization {profile.get('compatible_randomization', ['none'])},"
+            f" not {args_cli.domain_randomization!r}. Fit a coordinated profile before enabling it."
+        )
+    if look_dir and configured_look is None:
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import apply_real_look
+
         applied = apply_real_look(env_cfg, look_dir)
         print(f"[lerobot_sim_server] real look: {'; '.join(applied) or 'nothing found in the look folder'}")
+    if profile:
+        print(f"[lerobot_sim_server] real look profile: {look_dir} (dataset {profile['dataset_repo_id']})")
     if args_cli.domain_randomization != "none":
+        from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.pickup_ik_abs_env_cfg import PickUpEventCfg
+
+        if not isinstance(env_cfg.events, PickUpEventCfg):
+            raise SystemExit(f"{args_cli.task} has no compatible domain-randomization hook for this server.")
         attached = attach_domain_randomization(env_cfg, args_cli.domain_randomization, args_cli.enable_camera_shake)
         print(f"[lerobot_sim_server] domain randomization '{args_cli.domain_randomization}': {', '.join(attached)}")
     swap_to_openarm_joint_actions(env_cfg, absolute=True)
@@ -425,11 +467,16 @@ def main() -> None:
     env_cfg.observations.policy.concatenate_terms = False
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-    if look_dir is not None and os.path.isfile(os.path.join(look_dir, "contact_physics.json")):
+    contact_file = args_cli.contact_physics or (os.path.join(look_dir, "contact_physics.json") if look_dir else None)
+    if args_cli.contact_physics and not os.path.isfile(args_cli.contact_physics):
+        raise SystemExit(f"Contact calibration not found: {args_cli.contact_physics}")
+    if contact_file and os.path.isfile(contact_file):
         from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import apply_contact_physics
 
-        fitted = json.load(open(os.path.join(look_dir, "contact_physics.json")))["params"]
-        print(f"[lerobot_sim_server] contact physics fitted to the real episodes: {apply_contact_physics(env, fitted)} + {fitted}")
+        calibration = json.load(open(contact_file))
+        for object_asset, fitted in contact_targets(profile or {}, calibration):
+            print(f"[lerobot_sim_server] contact physics for {object_asset}:"
+                  f" {apply_contact_physics(env, fitted, object_asset=object_asset)} + {fitted}")
     env.reset()
     sensor = None
     if look_dir is not None:
@@ -437,7 +484,9 @@ def main() -> None:
 
         sensor = SensorModel(look_dir)
         print(f"[lerobot_sim_server] camera sensor model: {sensor.params or 'none fitted'}")
-    server = SimRobotServer(env, success_term, sensor)
+    server = SimRobotServer(env, success_term, sensor, profile)
+    if profile and set(server.cameras) != set(profile["cameras"]):
+        raise SystemExit(f"Profile cameras {profile['cameras']} differ from task cameras {list(server.cameras)}")
     try:
         server.serve(args_cli.host, args_cli.port)
     except KeyboardInterrupt:

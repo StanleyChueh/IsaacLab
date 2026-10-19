@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "dataset_repo_id": "ethanCSL/openarm_pringles_lerobot_real_v00",
+  "compatible_tasks": [
+    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0",
+    "Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1"
+  ],
+  "cameras": ["body_cam", "wrist_cam", "right_wrist_cam"],
+  "compatible_randomization": ["none"],
+  "required_assets": [
+    "albedo.json", "lighting.json", "sensor.json", "tone.json",
+    "backdrop_body.npz", "backdrop_wrist_cam.npz", "backdrop_right_wrist_cam.npz",
+    "contact_physics.json"
+  ],
+  "hide_visuals": ["table", "workspace_pad", "plane"],
+  "contact_asset": "can"
+}

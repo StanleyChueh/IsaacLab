@@ -2,21 +2,21 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Make the OpenArm scene look like the real rig the pringles dataset was recorded on.
+"""Apply a dataset-fitted visual profile to an OpenArm task scene.
 
-Everything here is fitted from the real recordings (ethanCSL/openarm_pringles_lerobot_real_v00), not drawn
-by hand -- see scripts/tools/sysid/README.md, "Real look", for the pipeline that produced each file in
-``LOOK_DIR``:
+Each profile folder identifies its source dataset and compatible tasks in ``profile.json``. The
+Pringles and battery folders both use this renderer. Task geometry, reset events and success
+conditions remain in their task cfgs. See scripts/tools/sysid/README.md for the calibration
+pipeline that produced the optional files in each folder:
 
 * ``albedo.json``     -- colour / roughness / metallic of every robot part (one material on one link), fitted
   by comparing the sim robot posed at real joint states against the real robot in the body camera.
 * ``backdrop_*.npz``  -- the static real scene (table, mats, room) as vertex-coloured meshes in the env
   frame, built from the cameras' clean plates and monocular depth. They are emissive: their colours are
   the real pixels, already lit by the real room, so sim lighting must not shade them again.
-* ``lighting.json``   -- intensity / colour of the dome light that lights the robot and the can (the backdrop
+* ``lighting.json``   -- intensity / colour of the dome light that lights dynamic scene objects (the backdrop
   is emissive and ignores it), fitted so the robot's shaded parts land on the real pixel values.
-* ``contact_physics.json`` -- friction / mass / gripper-squeeze values fitted by replaying the real episodes in sim until the
-  can stays in the gripper as it does in the real recordings (scripts/tools/sysid/fit_contact_physics.py);
+* ``contact_physics.json`` -- optional task-object friction / mass and gripper values fitted by replay;
   applied at run time by :func:`apply_contact_physics` after the env is built.
 * ``sensor.json``     -- per-camera blur / noise (the real D435i frames, after its lens, ISP and the dataset's video
   encoding, are softer than the renderer's), applied by :class:`SensorModel` to each frame the server sends.
@@ -25,7 +25,7 @@ by hand -- see scripts/tools/sysid/README.md, "Real look", for the pipeline that
 
 :func:`apply_real_look` patches an env cfg in place, the same way ``apply_task_mode`` does, so every entry
 point (the LeRobot sim server, the render/calibration tools) gets the identical scene. The physics is not
-touched: the pad, table and can collide exactly as before; only what the cameras see changes.
+touched: the task's objects and hidden background surfaces still collide as configured; only what the cameras see changes.
 """
 
 from __future__ import annotations
@@ -43,8 +43,10 @@ from isaaclab.assets import AssetBaseCfg
 from isaaclab.utils import configclass
 from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
 
+from .real_look_profile import load_profile
+
 LOOK_DIR = os.path.join(ISAACLAB_ASSETS_DATA_DIR, "real2sim", "pringles_v00")
-"""Fitted look of the real rig. Swap the folder (``look_dir``) to target another recording setup."""
+"""Legacy default for Pringles calibration scripts; the server selects a task profile explicitly."""
 
 
 def _set_input(shader_prim, name: str, value, type_name) -> None:
@@ -172,7 +174,7 @@ class BackdropMeshCfg(sim_utils.SpawnerCfg):
 class SensorModel:
     """Soften and add noise to rendered frames the way the real camera's pipeline does (per camera, from sensor.json)."""
 
-    def __init__(self, look_dir: str = LOOK_DIR):
+    def __init__(self, look_dir: str):
         path = os.path.join(look_dir, "sensor.json")
         self.params = json.load(open(path)) if os.path.isfile(path) else {}
         self._kernels = {}
@@ -206,12 +208,13 @@ class SensorModel:
         return x.clamp(0, 255).round().to(torch.uint8)[0].permute(1, 2, 0)
 
 
-def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
-    """Patch ``env_cfg`` (an OpenArm pick-up cfg, after apply_task_mode) to the fitted real look.
+def apply_real_look(env_cfg, look_dir: str) -> list[str]:
+    """Patch a task cfg with its dataset-fitted visual profile.
 
     Returns a list of what was applied, for the caller to print. Missing files are skipped, so a partially
     fitted look still works.
     """
+    profile = load_profile(look_dir, getattr(env_cfg, "env_name", None))
     applied = []
     albedo_path = os.path.join(look_dir, "albedo.json")
     if os.path.isfile(albedo_path):
@@ -235,13 +238,13 @@ def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
                 prim_path=f"{{ENV_REGEX_NS}}/Real_{name}",
                 spawn=BackdropMeshCfg(npz_path=path, tone_path=tone),
             ))
-        # The real scene replaces the sim's own table, pad and floor -- visually only: the pad keeps its
-        # collider (an invisible prim still collides), so the can rests and is grasped exactly as before.
-        for name in ("table", "workspace_pad", "plane"):
+        # Hide only the static surfaces named by this profile. Their colliders remain active.
+        for name in profile.get("hide_visuals", []):
             entity = getattr(env_cfg.scene, name, None)
             if entity is not None:
                 entity.spawn.visible = False
-        applied.append(f"real backdrop ({', '.join(os.path.basename(p) for p in backdrops)}); sim table/pad/floor hidden")
+        applied.append(f"real backdrop ({', '.join(os.path.basename(p) for p in backdrops)});"
+                       f" hidden visuals {profile.get('hide_visuals', [])}")
     return applied
 
 
@@ -253,17 +256,20 @@ CONTACT_DEFAULTS = {"can_friction": None, "finger_friction": None, "can_mass": N
 """Parameter names :func:`apply_contact_physics` understands; None / missing leaves the cfg's value alone."""
 
 
-def apply_contact_physics(env, params: dict) -> dict:
-    """Set contact-related physics on a built env (all envs): friction of the can and the robot's shapes, the can's mass,
-    and the gripper's PD gains and effort limit. Returns the values read back, for the caller to log.
+def apply_contact_physics(env, params: dict, object_asset: str = "can") -> dict:
+    """Set contact physics on a built env for the profile's manipulated scene object.
 
-    ``can_friction`` / ``finger_friction`` set static and dynamic friction (dynamic = 0.9 x static) on every shape of the
-    can / robot -- only the fingers ever touch the can, and PhysX averages the two surfaces' values.
+    ``object_friction`` / ``object_mass`` work for any object. The older ``can_*`` names remain
+    accepted for the Pringles fitter and its saved profile. Multi-object tasks can call this once
+    per fitted object; shared gripper parameters need only be supplied in one call.
+
+    ``object_friction`` / ``finger_friction`` set static and dynamic friction (dynamic = 0.9 x static)
+    on every shape of the object / robot; PhysX combines the touching surfaces' values.
     """
     import torch
 
     scene = env.scene
-    can, robot = scene["can"], scene["robot"]
+    obj, robot = scene[object_asset], scene["robot"]
     out = {}
 
     def set_friction(asset, mu):
@@ -272,14 +278,16 @@ def apply_contact_physics(env, params: dict) -> dict:
         mats[..., 0], mats[..., 1] = mu, 0.9 * mu
         view.set_material_properties(mats, torch.arange(mats.shape[0], dtype=torch.int32))
 
-    if params.get("can_friction") is not None:
-        set_friction(can, float(params["can_friction"]))
+    object_friction = params.get("object_friction", params.get("can_friction"))
+    object_mass = params.get("object_mass", params.get("can_mass"))
+    if object_friction is not None:
+        set_friction(obj, float(object_friction))
     if params.get("finger_friction") is not None:
         set_friction(robot, float(params["finger_friction"]))
-    if params.get("can_mass") is not None:
-        view = can.root_physx_view
+    if object_mass is not None:
+        view = obj.root_physx_view
         masses = view.get_masses().clone()
-        masses[:] = float(params["can_mass"])
+        masses[:] = float(object_mass)
         view.set_masses(masses, torch.arange(masses.shape[0], dtype=torch.int32))
     ids = robot.find_joints(["openarm_.*_finger_joint.*"])[0]
     gripper = robot.actuators["openarm_gripper"]
@@ -291,9 +299,10 @@ def apply_contact_physics(env, params: dict) -> dict:
         gripper.damping[:] = float(params["grip_damping"])
     if params.get("grip_effort") is not None:
         robot.write_joint_effort_limit_to_sim(float(params["grip_effort"]), joint_ids=ids)
-    out["can_friction"] = float(can.root_physx_view.get_material_properties()[..., 0].mean())
+    prefix = "can" if object_asset == "can" else "object"
+    out[f"{prefix}_friction"] = float(obj.root_physx_view.get_material_properties()[..., 0].mean())
     out["finger_friction"] = float(robot.root_physx_view.get_material_properties()[..., 0].mean())
-    out["can_mass"] = float(can.root_physx_view.get_masses().mean())
+    out[f"{prefix}_mass"] = float(obj.root_physx_view.get_masses().mean())
     out["grip_stiffness"] = float(robot.data.joint_stiffness[0, ids].mean())
     out["grip_damping"] = float(robot.data.joint_damping[0, ids].mean())
     return out

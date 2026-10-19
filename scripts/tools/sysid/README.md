@@ -92,7 +92,10 @@ than the hand-tuned one, robot-silhouette IoU 0.33 -> 0.71 median over 123 frame
 ### Real look (2026-10-18): recording with `--real_look`
 
 `Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1` is the pick-up task with this look built in (same physics, actions, success and
-task modes as `-v0`; `lerobot_sim_server.py --task ...-v1` needs no extra flag). On `-v0`, `--real_look` does the same.
+task modes as `-v0`; `lerobot_sim_server.py --task ...-v1` needs no extra flag). On `-v0`, pass
+`--real_look source/isaaclab_assets/data/real2sim/pringles_v00` explicitly. A bare `--real_look`
+uses only a profile already declared by the selected task cfg, so it cannot select the Pringles
+scene for another task.
 It renders the scene with a look fitted from the real
 dataset (`source/isaaclab_assets/data/real2sim/pringles_v00/`, applied by `openarm_real_look.py`):
 

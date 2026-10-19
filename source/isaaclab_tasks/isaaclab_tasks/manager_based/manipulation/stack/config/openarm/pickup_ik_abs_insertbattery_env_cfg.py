@@ -10,8 +10,8 @@ puts an AA battery into it. The scene is the OpenArm pick-up scene with the can 
 light and camera softness, and a photo backdrop built from this dataset's own frames (it has a white panel the pick-up
 scene does not).
 
-What this task does NOT do: insert. The charger is a box whose slots are only drawn. The task has no success term and no
-subtask signals; episodes end when the recorder says so. Objects start where the 9 real episodes had them
+The open bay now has an approximate collision cavity and a lift-plus-seat success term. Its dimensions
+still need measured CAD for real-fidelity insertion. Objects start where the 9 real episodes had them
 (``reset_root_state_uniform`` around their median, over their observed spread).
 
 Not a can task: ``lerobot_sim_server.py`` skips ``apply_task_mode`` for it (``task_mode_applicable``).
@@ -22,11 +22,11 @@ import os
 import isaaclab.envs.mdp as mdp_core
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
 from isaaclab.utils import configclass
 from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
 
-from . import openarm_battery_assets, openarm_real_look, pickup_ik_abs_env_cfg
+from . import battery_task_success, openarm_battery_assets, openarm_real_look, pickup_ik_abs_env_cfg
 
 BATTERY_LOOK_DIR = os.path.join(ISAACLAB_ASSETS_DATA_DIR, "real2sim", "battery_v01")
 PAD_TOP = 0.28
@@ -57,6 +57,7 @@ class InsertBatteryEventCfg:
             "asset_cfg": SceneEntityCfg("battery"),
         },
     )
+    reset_battery_progress = EventTerm(func=battery_task_success.reset_battery_progress, mode="reset")
 
 
 @configclass
@@ -72,7 +73,8 @@ class OpenarmInsertBatteryEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCf
         self.scene.cube_2 = None
         self.scene.contact_right_left_finger = None  # it was filtered against the cube
         self.observations.subtask_terms = None  # grasp / lift signals read the cube
-        self.terminations.success = None
+        self.terminations.success = TerminationTermCfg(func=battery_task_success.battery_insertion_success,
+                                                      time_out=False)
         self.terminations.time_out = None
 
         self.scene.charger = RigidObjectCfg(
