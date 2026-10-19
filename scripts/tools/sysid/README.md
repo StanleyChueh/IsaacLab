@@ -145,3 +145,42 @@ stiffness 455-636, damping 4-10. These are effective values (mass, friction and 
 weigh the can to pin the mass. `contact_physics.json` in the look folder is applied by the server for `-v1`
 (`openarm_real_look.apply_contact_physics`); through the live server 7/10 replayed real episodes now meet the hand-over
 success condition (5/10 before).
+
+### Battery insertion task (2026-10-19): `Isaac-InsertBattery-OpenArm-IK-Abs-v0`
+
+Built from ethanCSL/openarm_insertbattery_lerobot_real_v01 (left arm lifts a charging station, right arm inserts an AA battery).
+Same robot, cameras and joint calibration as the Pringles data (home pose equal to 0.01 rad). Assets and look in
+`source/isaaclab_assets/data/real2sim/battery_v01/`; code in `openarm_battery_assets.py`, `pickup_ik_abs_insertbattery_env_cfg.py`,
+and `lerobot_sim_server.py` (skips `apply_task_mode` for it, accepts `reset(objects={name: [x, y, yaw_deg]})`, reports object poses
+and the robot base pose).
+
+* Objects measured from the real frames through the calibrated body camera + table plane: charger top face 11.50 x 6.52 cm
+  (std 0.15 over 9 episodes), battery 5.22 x 1.50 cm against the true 5.05 x 1.45. Charger thickness 3.75 cm from the left jaws'
+  opening while holding it. Charger top-face texture = the nine episodes' first frames rectified onto the charger's top plane
+  (`build_charger_texture.py`); backdrop rebuilt from this dataset (white panel at the table's left edge).
+* **The charger has a real open bay** (the empty one in the photo): box colliders around a 1.8 x 5.5 cm, 1.2 cm deep trough plus a
+  5 mm 45-degree lead-in collar (a rigid box has no spring-loaded cradle). The other three bays are painted. The task's success
+  term is `battery_in_charger` (cell centre over the bay in the charger's frame, below the top face, axis within 10 degrees).
+* The real fingertips are foam pads about 7 cm longer than the stock finger (found by `fit_battery_replay.py`; the real right-wrist
+  camera shows them). `extend_fingers` adds one 2.2 x 1.6 cm pad per finger, 7 cm long, black, its inner face 7 mm outside the stock finger's (the open gripper then clears the 6.5 cm charger by 1 cm a side); the stock finger meshes stay as the
+  hand's look but stop colliding (they are 6 cm plates with 3.6 mm to spare either side of the charger). The same pad length makes
+  the Pringles carry WORSE, so it is specific to this recording (`gripper.json` in the look folder).
+* **Replaying the real joint commands cannot insert** (0-6 of 9 grasp-level, 0 inserted: the sim hand is off from the real one by
+  centimetres in x and nothing is closed-loop). So the dataset is made by a scripted expert instead:
+  - `battery_expert.py`: `BatteryExpert`, IK on the robot's URDF (scipy bounded least squares, joint ranges = the real operator's
+    + margin, left joint 2 <= 0 / right >= 0), stages `r_grasp, r_wait, l_grasp, l_carry, r_over, r_down, r_open, r_back, l_return,
+    home`. Each stage plans from the objects' and hands' poses when it starts; a joint-error integral makes the PD arms reach what
+    the plan asked for.
+  - `battery_meeting.py` -> `meeting.json`: where both hands can meet, solved over BOTH arms' 14 joints at once (hand-picked meeting
+    poses do not exist for these joint ranges). The solution has the charger rolled about 34 degrees (the real operator tilts it
+    too) in front of the robot at (0.40, -0.02, 0.37).
+  - `run_battery_expert.py`: the development loop, N envs headless, per-env expert; `--debug_env`, `--sweep`, `--goto`.
+  - `record_expert_episodes.py`: drives the live server like lerobot-record and writes the LeRobot dataset (only episodes that end
+    with the cell in the bay are kept).
+* Sim facts learned on the way (all in the task cfg / contact json): the robot's arm "stalls" were SELF-COLLISIONS between convex-hull
+  links (`robot_self_collisions=False`), not gravity (gravity is off for the robot already); the shoulder/elbow effort limit is scaled
+  1.6x (`arm_effort_scale`); the cell needs damping or it creeps across the mat; a gripper command queued behind another leg must
+  build on that leg's end, not on the stale pose.
+* Result: 16/16 headless, live server 3/3 then the recorded dataset (see below). Limits: the arm trajectories are scripted (smooth
+  min-jerk, not a human's), the bay is wider than the real one (1.8 vs 1.5 cm) with a collar, and the sim hand cannot be made to match
+  the real one's reach (a calibration gap of centimetres between real joint angles and the URDF).

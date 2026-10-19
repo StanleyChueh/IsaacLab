@@ -1,0 +1,12 @@
+{
+ "params": {
+  "grip_effort": 31.12,
+  "finger_friction": 0.351,
+  "object_friction": 0.476,
+  "arm_effort_scale": 1.6
+ },
+ "fitted_with": "scripts/tools/sysid/fit_battery_replay.py, 9 real episodes, finger_extension 0.07",
+ "result": "replayed real actions: charger and battery held off the mat for a good part of the episode in 5-6 of 9 episodes (score 0.71)",
+ "caveat": "effective values; grip effort at 31 N is higher than the pringles fit's 26 N and the cfg's 8 N",
+ "note": " arm_effort_scale added for the scripted expert: shoulder/elbow joints 1-4 saturate their 40/27 N m limits holding the arm out at a table-top grasp (sim arm is heavier or has no gravity comp)"
+}

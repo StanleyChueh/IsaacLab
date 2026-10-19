@@ -46,9 +46,12 @@ parser.add_argument("--probe", action="store_true", help="Apply each parameter g
 parser.add_argument("--calibration", default=os.path.expanduser("~/Stanley_ws/lerobot_openarm/calibration.json"))
 parser.add_argument("--settle_steps", type=int, default=20)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--finger_extension", type=float, default=None, help="m; lengthen the sim fingers (sets OPENARM_FINGER_EXTENSION).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = False
+if args_cli.finger_extension is not None:
+    os.environ["OPENARM_FINGER_EXTENSION"] = str(args_cli.finger_extension)
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -141,6 +144,8 @@ def main() -> None:
     for cam in ("front_cam", "body_cam", "wrist_cam", "right_wrist_cam"):
         if hasattr(env_cfg.scene, cam):
             setattr(env_cfg.scene, cam, None)  # replay needs no images: this is what makes 50 envs at once cheap
+    for attr in [a for a in vars(env_cfg.scene) if a.startswith("real_")]:
+        setattr(env_cfg.scene, attr, None)  # a real-look task's photo backdrop is for cameras
     env_cfg.observations.policy = MinimalObs.PolicyCfg()
     for name in list(vars(env_cfg.terminations)):
         if not name.startswith("_"):

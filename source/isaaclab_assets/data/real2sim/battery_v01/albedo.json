@@ -271,36 +271,36 @@
  },
  "openarm_left_right_finger/mat_0_009": {
   "diffuse": [
-   0.9843,
-   0.9765,
-   0.9569
+   0.073,
+   0.0724,
+   0.071
   ],
   "roughness": 0.5,
   "metallic": 0.0
  },
  "openarm_left_right_finger/mat_1_009": {
   "diffuse": [
-   0.0838,
-   0.0838,
-   0.0838
+   0.0978,
+   0.0978,
+   0.0978
   ],
   "roughness": 0.5,
   "metallic": 0.0
  },
  "openarm_left_left_finger/mat_0_009": {
   "diffuse": [
-   0.9843,
-   0.9765,
-   0.9569
+   0.073,
+   0.0724,
+   0.071
   ],
   "roughness": 0.5,
   "metallic": 0.0
  },
  "openarm_left_left_finger/mat_1_009": {
   "diffuse": [
-   0.1593,
-   0.1593,
-   0.1593
+   0.0978,
+   0.0978,
+   0.0978
   ],
   "roughness": 0.5,
   "metallic": 0.0
@@ -541,18 +541,18 @@
  },
  "openarm_right_left_finger/mat_0_009": {
   "diffuse": [
-   0.9843,
-   0.9765,
-   0.9569
+   0.073,
+   0.0724,
+   0.071
   ],
   "roughness": 0.5,
   "metallic": 0.0
  },
  "openarm_right_left_finger/mat_1_009": {
   "diffuse": [
-   0.0176,
-   0.0176,
-   0.0176
+   0.0978,
+   0.0978,
+   0.0978
   ],
   "roughness": 0.5,
   "metallic": 0.0

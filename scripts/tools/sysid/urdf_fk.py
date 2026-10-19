@@ -29,7 +29,11 @@ class URDFChain:
     def __init__(self, path: str = DEFAULT_URDF):
         root = ET.parse(path).getroot()
         self.joints = {}  # child link -> (parent link, joint name, type, origin, axis)
+        self.limits = {}  # joint name -> (lower, upper)
         for j in root.findall("joint"):
+            limit = j.find("limit")
+            if limit is not None and limit.get("lower") is not None:
+                self.limits[j.get("name")] = (float(limit.get("lower")), float(limit.get("upper")))
             axis = j.find("axis")
             self.joints[j.find("child").get("link")] = (
                 j.find("parent").get("link"), j.get("name"), j.get("type"), _origin(j.find("origin")),

@@ -205,9 +205,11 @@ class SimRobotServer:
             asset = self.env.scene[name]
             pose = torch.cat([asset.data.root_pos_w[0] - self.env.scene.env_origins[0], asset.data.root_quat_w[0]])
             objects[name] = [float(v) for v in pose.cpu()]
+        base = torch.cat([self.robot.data.root_pos_w[0] - self.env.scene.env_origins[0], self.robot.data.root_quat_w[0]])
         return {
             "joints": {name: float(v) for name, v in zip(REPORTED_JOINTS, pos)},
             "objects": objects,
+            "robot_base": [float(v) for v in base.cpu()],  # the robot's root link (openarm_body_link0) in the env frame, w first
             "images": images,
             "success": self.success,
             "sim_time": self.step_count / CONTROL_HZ,

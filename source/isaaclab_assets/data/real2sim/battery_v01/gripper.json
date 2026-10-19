@@ -1,0 +1,4 @@
+{
+ "finger_extension": 0.07,
+ "note": "foam fingertip pads about 7 cm longer than the stock finger (found by scripts/tools/sysid/fit_battery_replay.py: score vs 0/3/5/7/9 cm 0.64/0.61/0.70/0.71/0.52). Modelled by openarm_real_look.extend_fingers as a 2.2x1.6x7 cm black pad per finger; the stock finger meshes stay as visuals but stop colliding."
+}

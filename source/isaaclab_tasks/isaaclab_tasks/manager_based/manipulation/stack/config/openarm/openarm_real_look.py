@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 from collections.abc import Callable
 from dataclasses import MISSING
@@ -89,7 +90,63 @@ def recolor_robot(prim_path: str, albedo: dict[str, dict]) -> int:
     return changed
 
 
-def _robot_spawner(albedo: dict[str, dict]):
+FINGER_TIP_Z = 0.080
+"""m, where the sim finger meshes end in their own link frame (measured from the mesh; the frame sits 0.1025 m along the tool axis)."""
+FINGER_INNER_Y = {"left_finger": -0.0078, "right_finger": 0.0078}
+"""m, the stock finger collision meshes' inner faces in their link frames (finger.stl spans y -0.0078 .. +0.0271 for the left
+finger, its mirror for the right one). They cross at the centre: the closed gripper (q = 0) is 1.56 cm interpenetrating, and
+the jaw gap is 2 q - 1.56 cm."""
+PAD_WIDTH, PAD_THICKNESS, PAD_OUTSET = 0.022, 0.016, 0.007
+"""m: the foam fingertip pad's width (along the finger's x), its thickness (along its y, outwards from its inner face), and how
+far that inner face sits outside the stock finger's. The stock jaws open to 7.2 cm, 3.6 mm a side more than the 6.5 cm charger
+they must straddle; the pads open to 7.8 cm, and still close on the 1.45 cm cell (the closed gap is 2 q - 1.56 + 0.6 cm)."""
+PAD_COLOR = (0.035, 0.035, 0.035)
+
+
+def extend_fingers(prim_path: str, length: float) -> int:
+    """Lengthen the four gripper fingers by ``length`` metres along the tool axis with a foam-padded fingertip: the battery
+    recording's real pads reach about 7 cm further than the stock finger (the right-wrist camera sees them as big dark
+    padded jaws closing on the cell).
+
+    One box per finger, collider and visual both: ``PAD_WIDTH`` wide, ``PAD_THICKNESS`` thick, its inner face ``PAD_OUTSET`` outside
+    the stock finger's, continuing from the stock tip. The stock finger meshes stay (they are what the hand looks like) but stop
+    colliding: they are 6 cm wide plates that leave 3.6 mm either side of the 6.5 cm charger, so a hand yawed a few degrees off
+    the charger lands on it, whereas the real jaws are the 2 cm pads.
+    """
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    stage = sim_utils.get_current_stage()
+    added = 0
+    for side in ("left", "right"):
+        for finger, inner in FINGER_INNER_Y.items():
+            link = stage.GetPrimAtPath(f"{prim_path}/openarm_{side}_{finger}")
+            if not link.IsValid():
+                continue
+            for prim in Usd.PrimRange(link):
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr().Set(False)
+            pad = UsdGeom.Cube.Define(stage, f"{link.GetPath()}/tip_extension_pad")
+            pad.CreateSizeAttr(1.0)
+            xf = UsdGeom.Xformable(pad)
+            face = inner - math.copysign(PAD_OUTSET, inner)  # the pad's inner face, further from the centre than the finger's
+            xf.AddTranslateOp().Set(Gf.Vec3d(0.0, face - math.copysign(PAD_THICKNESS / 2, inner), FINGER_TIP_Z + length / 2))
+            xf.AddScaleOp().Set(Gf.Vec3d(PAD_WIDTH, PAD_THICKNESS, length))
+            UsdPhysics.CollisionAPI.Apply(pad.GetPrim())
+            UsdPhysics.MassAPI.Apply(pad.GetPrim()).CreateMassAttr(0.004)
+            pad.CreateDisplayColorAttr([Gf.Vec3f(*PAD_COLOR)])
+            added += 1
+    return added
+
+
+def finger_extension(look_dir: str) -> float:
+    """Fingertip extension in metres: OPENARM_FINGER_EXTENSION if set, else ``gripper.json`` in the look folder, else 0."""
+    if os.environ.get("OPENARM_FINGER_EXTENSION"):
+        return float(os.environ["OPENARM_FINGER_EXTENSION"])
+    path = os.path.join(look_dir, "gripper.json")
+    return float(json.load(open(path)).get("finger_extension", 0.0)) if os.path.isfile(path) else 0.0
+
+
+def _robot_spawner(albedo: dict[str, dict] | None, extension: float = 0.0):
     """spawn_from_usd that recolours the robot before it is cloned to the other envs."""
     from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
 
@@ -97,8 +154,11 @@ def _robot_spawner(albedo: dict[str, dict]):
 
     def spawn(prim_path, cfg, translation=None, orientation=None, **kwargs):
         prim = base(prim_path, cfg, translation, orientation, **kwargs)
-        n = recolor_robot(str(prim.GetPath()), albedo)
-        print(f"[openarm_real_look] robot: {n} materials set from the real-look albedo table")
+        if albedo:
+            n = recolor_robot(str(prim.GetPath()), albedo)
+            print(f"[openarm_real_look] robot: {n} materials set from the real-look albedo table")
+        if extension > 0:
+            print(f"[openarm_real_look] robot: {extend_fingers(str(prim.GetPath()), extension)} fingers lengthened by {extension * 100:.1f} cm")
         return prim
 
     return sim_utils.clone(spawn)
@@ -214,10 +274,14 @@ def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
     """
     applied = []
     albedo_path = os.path.join(look_dir, "albedo.json")
-    if os.path.isfile(albedo_path):
-        albedo = json.load(open(albedo_path))
-        env_cfg.scene.robot.spawn.func = _robot_spawner(albedo)
-        applied.append(f"robot colours ({len(albedo)} parts)")
+    albedo = json.load(open(albedo_path)) if os.path.isfile(albedo_path) else None
+    extension = finger_extension(look_dir)
+    if albedo or extension > 0:
+        env_cfg.scene.robot.spawn.func = _robot_spawner(albedo, extension)
+        if albedo:
+            applied.append(f"robot colours ({len(albedo)} parts)")
+        if extension > 0:
+            applied.append(f"fingers {extension * 100:.1f} cm longer")
 
     lighting_path = os.path.join(look_dir, "lighting.json")
     if os.path.isfile(lighting_path):
@@ -263,7 +327,8 @@ def apply_contact_physics(env, params: dict) -> dict:
     import torch
 
     scene = env.scene
-    can, robot = scene["can"], scene["robot"]
+    robot = scene["robot"]
+    props = {name: scene[name] for name in ("can", "charger", "battery") if name in scene.rigid_objects}
     out = {}
 
     def set_friction(asset, mu):
@@ -272,15 +337,23 @@ def apply_contact_physics(env, params: dict) -> dict:
         mats[..., 0], mats[..., 1] = mu, 0.9 * mu
         view.set_material_properties(mats, torch.arange(mats.shape[0], dtype=torch.int32))
 
-    if params.get("can_friction") is not None:
-        set_friction(can, float(params["can_friction"]))
+    if params.get("can_friction") is not None and "can" in props:
+        set_friction(props["can"], float(params["can_friction"]))
+    if params.get("object_friction") is not None:  # every prop the task has (charger and battery, say)
+        for asset in props.values():
+            set_friction(asset, float(params["object_friction"]))
     if params.get("finger_friction") is not None:
         set_friction(robot, float(params["finger_friction"]))
-    if params.get("can_mass") is not None:
-        view = can.root_physx_view
+    if params.get("can_mass") is not None and "can" in props:
+        view = props["can"].root_physx_view
         masses = view.get_masses().clone()
         masses[:] = float(params["can_mass"])
         view.set_masses(masses, torch.arange(masses.shape[0], dtype=torch.int32))
+    if params.get("arm_effort_scale") is not None:  # the shoulder / elbow joints saturate holding the arm out at a table grasp
+        arm_ids = robot.find_joints(["openarm_.*_joint[1-4]"])[0]
+        scaled = robot.data.joint_effort_limits[:, arm_ids] * float(params["arm_effort_scale"])
+        robot.write_joint_effort_limit_to_sim(scaled, joint_ids=arm_ids)
+        out["arm_effort_scale"] = float(params["arm_effort_scale"])
     ids = robot.find_joints(["openarm_.*_finger_joint.*"])[0]
     gripper = robot.actuators["openarm_gripper"]
     if params.get("grip_stiffness") is not None:
@@ -291,9 +364,10 @@ def apply_contact_physics(env, params: dict) -> dict:
         gripper.damping[:] = float(params["grip_damping"])
     if params.get("grip_effort") is not None:
         robot.write_joint_effort_limit_to_sim(float(params["grip_effort"]), joint_ids=ids)
-    out["can_friction"] = float(can.root_physx_view.get_material_properties()[..., 0].mean())
+    for name, asset in props.items():
+        out[f"{name}_friction"] = float(asset.root_physx_view.get_material_properties()[..., 0].mean())
+        out[f"{name}_mass"] = float(asset.root_physx_view.get_masses().mean())
     out["finger_friction"] = float(robot.root_physx_view.get_material_properties()[..., 0].mean())
-    out["can_mass"] = float(can.root_physx_view.get_masses().mean())
     out["grip_stiffness"] = float(robot.data.joint_stiffness[0, ids].mean())
     out["grip_damping"] = float(robot.data.joint_damping[0, ids].mean())
     return out

@@ -10,8 +10,8 @@ puts an AA battery into it. The scene is the OpenArm pick-up scene with the can 
 light and camera softness, and a photo backdrop built from this dataset's own frames (it has a white panel the pick-up
 scene does not).
 
-What this task does NOT do: insert. The charger is a box whose slots are only drawn. The task has no success term and no
-subtask signals; episodes end when the recorder says so. Objects start where the 9 real episodes had them
+The charger has one open bay (the empty one in the photo) the battery can be set into; ``battery_in_charger`` is the success
+term. There are no subtask signals; episodes end when the recorder says so. Objects start where the 9 real episodes had them
 (``reset_root_state_uniform`` around their median, over their observed spread).
 
 Not a can task: ``lerobot_sim_server.py`` skips ``apply_task_mode`` for it (``task_mode_applicable``).
@@ -23,6 +23,7 @@ import isaaclab.envs.mdp as mdp_core
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
 
@@ -66,13 +67,23 @@ class OpenarmInsertBatteryEnvCfg(pickup_ik_abs_env_cfg.OpenarmPickUpRedCubeEnvCf
     real_look_dir: str = BATTERY_LOOK_DIR
     task_mode_applicable: bool = False
     report_objects: tuple = ("charger", "battery")
+    arm_gravity_comp: bool = False
+    robot_self_collisions: bool = (os.environ.get("OPENARM_SELF_COLLISIONS", "0") == "1")
+    """The arms' links feel no gravity (a gravity-compensated arm). The PD gains are the real arm's (kp 230-290 on the big joints), and
+    at a table-top grasp the sim arm's own weight sags the shoulder by 0.1-0.5 rad and saturates its torque, so the hand never
+    gets within centimetres of an object it was sent to. The props (charger, battery) keep their weight."""
 
     def __post_init__(self):
         super().__post_init__()  # scene, cameras, actions, pad -- and the cube, which goes below
+        spawn = self.scene.robot.spawn
+        self.scene.robot.spawn = spawn.replace(articulation_props=spawn.articulation_props.replace(enabled_self_collisions=self.robot_self_collisions))
+        if self.arm_gravity_comp:
+            spawn = self.scene.robot.spawn
+            self.scene.robot.spawn = spawn.replace(rigid_props=spawn.rigid_props.replace(disable_gravity=True))
         self.scene.cube_2 = None
         self.scene.contact_right_left_finger = None  # it was filtered against the cube
         self.observations.subtask_terms = None  # grasp / lift signals read the cube
-        self.terminations.success = None
+        self.terminations.success = DoneTerm(func=openarm_battery_assets.battery_in_charger)
         self.terminations.time_out = None
 
         self.scene.charger = RigidObjectCfg(

@@ -9,7 +9,7 @@ objects at the positions estimated from the camera (prepare_battery_replay.py, g
 either: the grasp depends on where the finger pads land to a few millimetres. This searches, for all 9 episodes at once and
 many candidates in parallel (one env per candidate x episode, no cameras), a common offset for each object's start pose
 (x, y, yaw), the gripper's squeeze force, and the friction of fingers and objects, scoring each candidate by how high the
-charger and the battery are lifted (capped at 5 and 2.5 cm).
+charger and the battery are HELD off the mat (a good part of the episode, not just a brief pop).
 
   ./isaaclab.sh -p scripts/tools/sysid/fit_battery_replay.py --headless --replay logs/real2sim/battery/replay \\
       --out logs/real2sim/battery/fit
@@ -33,9 +33,13 @@ parser.add_argument("--random_batches", type=int, default=4)
 parser.add_argument("--calibration", default=os.path.expanduser("~/Stanley_ws/lerobot_openarm/calibration.json"))
 parser.add_argument("--settle_steps", type=int, default=20)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--finger_extension", type=float, default=None, help="m; lengthen the sim fingers (sets OPENARM_FINGER_EXTENSION).")
+parser.add_argument("--offset_scale", type=float, default=1.0, help="Scale the placement search ranges (x, y, yaw) by this.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = False
+if args_cli.finger_extension is not None:
+    os.environ["OPENARM_FINGER_EXTENSION"] = str(args_cli.finger_extension)
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -61,8 +65,11 @@ from real_states import real_state_to_sim  # noqa: E402
 SPACE = {
     "charger_dx": (-0.10, 0.10, "lin"), "charger_dy": (-0.06, 0.06, "lin"), "charger_yaw": (-25.0, 25.0, "lin"),
     "battery_dx": (-0.12, 0.12, "lin"), "battery_dy": (-0.08, 0.08, "lin"), "battery_yaw": (-30.0, 30.0, "lin"),
-    "grip_effort": (5.0, 80.0, "log"), "finger_friction": (0.2, 2.5, "log"), "object_friction": (0.3, 2.5, "log"),
+    "grip_effort": (3.0, 80.0, "log"), "finger_friction": (0.2, 2.5, "log"), "object_friction": (0.15, 2.5, "log"),
 }
+for _k in ("charger_dx", "charger_dy", "charger_yaw", "battery_dx", "battery_dy", "battery_yaw"):
+    _lo, _hi, _kind = SPACE[_k]
+    SPACE[_k] = (_lo * args_cli.offset_scale, _hi * args_cli.offset_scale, _kind)
 NAMES = list(SPACE)
 
 
@@ -179,20 +186,31 @@ def main() -> None:
         for _ in range(args_cli.settle_steps):
             env.step(act)
         zmax = {k: torch.full((n_env,), -1.0, device=dev) for k in z0}
+        held = {k: torch.zeros(n_env, device=dev) for k in z0}  # frames with the object clearly off the mat
+        up_sum = torch.zeros(n_env, device=dev)  # the charger's top-face normal (world z component), summed over held frames
         for k in range(T):
             env.step(actions_all[:, k])
             live = k < len_all
             for key, asset in (("charger", charger), ("battery", battery)):
                 z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
                 zmax[key] = torch.where(live, torch.maximum(zmax[key], z), zmax[key])
+                is_held = live & (z - z0[key] > (0.015 if key == "charger" else 0.010))
+                held[key] += is_held.float()
+                if key == "charger":
+                    q = asset.data.root_quat_w  # (w, x, y, z); the box's local z axis in world z is 1 - 2 (x^2 + y^2)
+                    up_sum += is_held.float() * (1.0 - 2.0 * (q[:, 1] ** 2 + q[:, 2] ** 2))
         lift = {key: (zmax[key] - z0[key]) * 100 for key in z0}
         out = []
         for c in range(n_cand):
             sel = cand_of_env == c
             lc, lb = lift["charger"][sel].clamp(min=0), lift["battery"][sel].clamp(min=0)
-            score = ((lc.clamp(max=5.0) / 5.0) + (lb.clamp(max=2.5) / 2.5)).mean().item() / 2
-            out.append({"score": score, "charger_lifted": int((lc > 4.0).sum()), "battery_lifted": int((lb > 2.0).sum()),
-                        "both": int(((lc > 4.0) & (lb > 2.0)).sum()), "charger_lift_cm": lc.mean().item(), "battery_lift_cm": lb.mean().item()})
+            hc, hb = held["charger"][sel] / len_all[sel], held["battery"][sel] / len_all[sel]
+            # held for a good part of the episode (the real arms carry the charger for most of it, the battery for a third)
+            upness = (up_sum[sel] / (held["charger"][sel].clamp(min=1.0))).clamp(0.0, 1.0)  # 1 = top face up while held, 0 = on its side or flipped
+            score = (((hc / 0.5).clamp(max=1.0) * (0.25 + 0.75 * upness)) + (hb / 0.25).clamp(max=1.0)).mean().item() / 2
+            out.append({"score": score, "charger_lifted": int((hc > 0.25).sum()), "battery_lifted": int((hb > 0.12).sum()),
+                        "both": int(((hc > 0.25) & (hb > 0.12)).sum()), "charger_lift_cm": lc.mean().item(), "battery_lift_cm": lb.mean().item(),
+                        "charger_held": hc.mean().item(), "battery_held": hb.mean().item(), "charger_upness": upness.mean().item()})
         return out
 
     os.makedirs(args_cli.out, exist_ok=True)
@@ -207,8 +225,8 @@ def main() -> None:
             U = np.clip(best_u + sigma * rng.standard_normal((n_cand, len(NAMES))), 0, 1)
             U[0] = best_u  # re-score the incumbent in the new batch (physics noise)
         if b == 0:  # the cfg's own contact settings, objects where the camera put them
-            U[0] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, (np.log(25.0) - np.log(5.0)) / (np.log(80.0) - np.log(5.0)),
-                    (np.log(0.5) - np.log(0.2)) / (np.log(2.5) - np.log(0.2)), (np.log(1.0) - np.log(0.3)) / (np.log(2.5) - np.log(0.3))]
+            U[0] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, (np.log(25.0) - np.log(3.0)) / (np.log(80.0) - np.log(3.0)),
+                    (np.log(0.5) - np.log(0.2)) / (np.log(2.5) - np.log(0.2)), (np.log(1.0) - np.log(0.15)) / (np.log(2.5) - np.log(0.15))]
         t0 = time.perf_counter()
         P = [to_params(u) for u in U]
         res = evaluate(P)
@@ -220,7 +238,7 @@ def main() -> None:
         sigma *= 0.85 if improved else 0.7
         top = max(res, key=lambda r: r["score"])
         print(f"[fit_battery_replay] batch {b:2d}: best of batch score {top['score']:.3f} (charger lifted {top['charger_lifted']}/{n_ep}, "
-              f"battery {top['battery_lifted']}/{n_ep}, both {top['both']}); overall best {best_s:.3f}  ({time.perf_counter() - t0:.0f} s)", flush=True)
+              f"battery {top['battery_lifted']}/{n_ep}, both {top['both']}, charger top-up {top['charger_upness']:.2f}); overall best {best_s:.3f}  ({time.perf_counter() - t0:.0f} s)", flush=True)
         json.dump({"best": to_params(best_u), "best_score": best_s, "log": log}, open(os.path.join(args_cli.out, "fit_log.json"), "w"), indent=1)
     print(f"[fit_battery_replay] BEST {to_params(best_u)} score {best_s:.3f}", flush=True)
     env.close()
