@@ -39,8 +39,9 @@ gym.register(
     },
 )
 
-# The same task rendered to look like the real rig (fitted robot colours, light, photo backdrop, camera sensor model --
-# openarm_real_look.py). Physics, actions and success are identical to v0; use --domain_randomization none.
+# The same task rendered to look like the real rig (fitted robot colours, light, photo table and room, camera sensor model --
+# openarm_real_look.py) with the contact physics fitted to the real episodes. Actions and success are identical to v0;
+# domain randomization works on top (openarm_real_look_randomization.py). Mimic: Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1.
 gym.register(
     id="Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

@@ -106,6 +106,13 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
         # aperture = 640 * 24 / fx instead of 20.955, which gave fx = 733. The mount is unchanged: hand-eye
         # calibration over the real episodes (scripts/tools/sysid/wrist_handeye.py) disagreed between the two
         # identical cameras by 15 deg, so it could not justify moving the URDF-derived mount.
+        # Lens position (2026-10-21): the mount above put the sensor 12.3 mm INSIDE the D435i housing (along its view
+        # axis; scripts/tools/sysid/add_openarm_camera_mount.py), hidden only by the 5 cm near clip -- which also
+        # clipped away the near wall of a can held in the gripper, so grasps rendered the inside of its far wall
+        # (mirrored label). The sensor now sits 0.5 mm in front of the housing's front face, 12.6 mm forward along its
+        # own view axis (-0.522, 0, 0.853) in ee_tcp, orientation unchanged, and the near clip is 1 mm. (The housing is
+        # turned about its bar's pivot to face along this axis -- see add_openarm_camera_mount.py, which prints the
+        # face distance.)
         self.scene.wrist_cam = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_left_ee_tcp/wrist_cam",
             update_period=0.0,
@@ -116,10 +123,10 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 focal_length=24.0,
                 focus_distance=400.0,
                 horizontal_aperture=25.3704,
-                clipping_range=(0.05, 2.0),
+                clipping_range=(0.001, 4.0),  # far: the real look's room walls stand up to ~3 m away; < 5.4 m (env_spacing)
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.06, 0.001, 0.11125),
+                pos=(0.05342, 0.001, 0.12199),
                 rot=(0.68057, -0.19188, -0.19188, 0.68057),
                 convention="ros",
             ),
@@ -140,10 +147,10 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 focal_length=24.0,
                 focus_distance=400.0,
                 horizontal_aperture=25.2720,
-                clipping_range=(0.05, 2.0),
+                clipping_range=(0.001, 4.0),  # far: the real look's room walls stand up to ~3 m away; < 5.4 m (env_spacing)
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.06, 0.001, 0.11125),
+                pos=(0.05342, 0.001, 0.12199),
                 rot=(0.68057, -0.19188, -0.19188, 0.68057),
                 convention="ros",
             ),
@@ -169,7 +176,7 @@ class OpenarmCubeStackVisuomotorEnvCfg(stack_ik_abs_env_cfg.OpenarmCubeStackEnvC
                 focal_length=24.0,
                 focus_distance=400.0,
                 horizontal_aperture=25.2956,
-                clipping_range=(0.1, 3.0),
+                clipping_range=(0.1, 4.0),  # far: the real look's room walls; < 5.4 m (env_spacing)
             ),
             offset=CameraCfg.OffsetCfg(
                 pos=(0.05621, -0.00305, 0.83062),

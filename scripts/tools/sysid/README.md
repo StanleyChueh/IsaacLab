@@ -98,12 +98,20 @@ dataset (`source/isaaclab_assets/data/real2sim/pringles_v00/`, applied by `opena
 
 | file | made by | what |
 |---|---|---|
-| `albedo.json` | `fit_robot_colors.py` (closed loop, brightness-only gains) | per-part robot colours |
+| `albedo.json` | `fit_robot_colors.py` (closed loop, brightness-only gains) | per-part robot colours (refit 2026-10-21 with the gripper rail, camera bar and housing) |
 | `lighting.json` | by hand, checked against part colours | dome light intensity / cool tint |
-| `backdrop_body.npz` | `build_clean_plate.py` -> `body_cam_depth.py` -> `build_backdrop.py` | real table + room as a photo-coloured mesh, table re-projected onto the pad plane (z=0.28), room flattened onto a wall at x=0.9 |
-| `backdrop_*wrist_cam.npz` | `build_wrist_backdrop.py` | rest-pose room view for each wrist cam, behind the wall |
+| `backdrop_body.npz` | `build_clean_plate.py` -> `body_cam_depth.py` -> `build_backdrop.py`, then `build_room_backdrop.py --body_backdrop` | the real table + mats as a photo-coloured mesh on the pad plane (z=0.28); trimmed to the table (the full one is in `superseded/`) |
+| `backdrop_room.npz` | `build_room_backdrop.py --box 2.0,1.6,0.5,0.6` | the room as a box (back wall x=2.0, side walls y=+1.6/-0.5, floor z=-0.6, fitted by plane sweep), each texel the median of thousands of real frames of all three cameras projected from their known poses -- holds up as the arms move, unlike the rest-pose posters it replaces (`superseded/backdrop_*wrist_cam.npz`) |
+| `contact_physics.json` | `fit_contact_physics.py` | friction / can mass / gripper squeeze, applied as a startup event |
 | `tone.json` | `fit_tone.py` | emissive -> pixel curve of the RTX tone mapper |
-| `sensor.json` | Laplacian-variance match | per-camera blur / noise applied to each frame the server sends |
+| `sensor.json` | Laplacian-variance match | per-camera blur / noise, applied inside the camera observations (server, Mimic and every other consumer get it) |
+
+Mimic: `Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1` is the Mimic env with this look -- annotate and generate demos
+recorded on `-v1` with it. `--enable_domain_randomization` (visual / full) works on top of the look
+(`openarm_real_look_randomization.py`): the light ranges are taken relative to the look's light and carried onto the photo
+backdrop, the full profile's skybox swap hides the photo room half the time so the random skybox is seen, the pad colour
+term tints the photo table, and pad-height randomization moves the photo table with the pad. The wrist and body cameras'
+far clip is 4 m so the room walls are not clipped.
 
 Measured with `eval_realism.py` (DINOv2): paired real-vs-sim feature distance 0.63 -> 0.55 (body), 0.88 -> 0.72 (left wrist),
 0.86 -> 0.75 (right wrist); a linear probe still separates real from sim perfectly (AUC 1.0).
@@ -111,8 +119,7 @@ Measured with `eval_realism.py` (DINOv2): paired real-vs-sim feature distance 0.
 Findings worth keeping: monocular depth put the table ~15 cm above the pad, contradicted by the real grasp heights (jaws at
 z~0.33 m at grasp), so the pad was left at 0.28; `wrist_handeye.py`'s two identical cameras disagreed by 15 deg, so wrist
 mounts were left at the URDF values and only the lenses (fx 605/608) were applied; COLMAP SfM of the room failed (blank walls,
-soft frames). `--real_look` is for `--domain_randomization none`: the pad/light randomizers would move things the backdrop
-has baked in.
+soft frames). Domain randomization works with the look since 2026-10-21 (see the Mimic note above the measurements).
 
 ### Transfer test (2026-10-18): does a sim look help on real frames?
 

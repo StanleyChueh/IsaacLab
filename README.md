@@ -122,6 +122,13 @@ source demos, generate with domain randomization, and convert to the real datase
 lerobot_openarm's `mimic_to_lerobot.py`. Full commands: lerobot_openarm README, "Isaac Sim through the same
 pipeline", Sim Steps 1-6.
 
+Real look: run the same steps with `--task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1` for the server and
+`--task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1` for `annotate_demos.py` / `generate_dataset.py`: the real robot's
+colours, the photographed table and room, the cameras' blur/noise and the contact physics fitted to the real episodes
+(`scripts/tools/sysid/README.md`, "Real look"). `--enable_domain_randomization --domain_randomization_profile visual|full`
+and `--randomize_object_size` work as on v0; under the look, the full profile's background swap hides the photo room so the
+random skybox shows, and lighting changes apply to the photo backdrop too.
+
 ## Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
 
 ```

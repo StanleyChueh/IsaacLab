@@ -40,6 +40,7 @@ class InsertBatteryEventCfg:
     """Reset the scene, then scatter the two props over the spread the 9 real episodes showed."""
 
     init_robot_pose = EventTerm(func=mdp_core.reset_scene_to_default, mode="reset")
+    sync_camera_mounts = pickup_ik_abs_env_cfg.PickUpEventCfg().sync_camera_mounts
     randomize_charger = EventTerm(
         func=mdp_core.reset_root_state_uniform,
         mode="reset",

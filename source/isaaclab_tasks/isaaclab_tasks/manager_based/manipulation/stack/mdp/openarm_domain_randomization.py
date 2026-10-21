@@ -377,12 +377,26 @@ def randomize_fixed_camera_pose(
     camera.set_world_poses_from_view(eyes, targets, env_ids=env_ids)
 
 
+def _drop_backward(delta: torch.Tensor, offset_quat_world: torch.Tensor) -> torch.Tensor:
+    """``delta`` (N, 3, parent frame) without its component pointing backwards along the camera's view axis.
+
+    The wrist cameras' lens sits just in front of their D435 housing (stack_ik_abs_visuomotor_env_cfg.py), which the
+    jitter does not move: a mount offset that slid the lens back would put it inside the housing and the frame would go
+    black. Sideways and forward jitter is kept as drawn.
+    """
+    forward = math_utils.quat_apply(offset_quat_world.expand(delta.shape[0], -1),
+                                    torch.tensor([[1.0, 0.0, 0.0]], device=delta.device).expand(delta.shape[0], -1))
+    along = (delta * forward).sum(-1, keepdim=True)
+    return delta - along.clamp(max=0.0) * forward
+
+
 def randomize_mounted_camera_pose(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     pos_range: dict[str, tuple[float, float]],
     rot_range: dict[str, tuple[float, float]],
     asset_cfg: SceneEntityCfg,
+    keep_lens_in_front: bool = False,
 ):
     """Jitter a robot-mounted camera's mount offset (position + small rotation) relative to its
     parent link, e.g. `wrist_cam`/`right_wrist_cam`/`body_cam`.
@@ -441,6 +455,8 @@ def randomize_mounted_camera_pose(
     rot_delta = math_utils.sample_uniform(rot_ranges[:, 0], rot_ranges[:, 1], (num_envs, 3), device=env.device)
     delta_quat = math_utils.quat_from_euler_xyz(rot_delta[:, 0], rot_delta[:, 1], rot_delta[:, 2])
 
+    if keep_lens_in_front:  # see _drop_backward
+        pos_delta = _drop_backward(pos_delta, offset_quat_world)
     local_pos = offset_pos.unsqueeze(0) + pos_delta
     local_quat_world = math_utils.quat_mul(offset_quat_world.expand(num_envs, -1), delta_quat)
     local_quat_opengl = math_utils.convert_camera_frame_orientation_convention(
@@ -507,6 +523,7 @@ def shake_mounted_camera_pose(
     env_ids: torch.Tensor,
     amplitude: dict[str, float],
     asset_cfg: SceneEntityCfg,
+    keep_lens_in_front: bool = False,
 ):
     """Continuously oscillate a mounted camera's LOCAL x/y offset around its nominal mount pose --
     real vibration, not a jump between independent random points. See :func:`init_camera_shake`
@@ -543,6 +560,11 @@ def shake_mounted_camera_pose(
     offset_quat_opengl = math_utils.convert_camera_frame_orientation_convention(
         offset_quat_native, origin=camera.cfg.offset.convention, target="opengl"
     ).expand(len(env_ids), -1)
+    if keep_lens_in_front:  # see _drop_backward
+        offset_quat_world = math_utils.convert_camera_frame_orientation_convention(
+            offset_quat_native, origin=camera.cfg.offset.convention, target="world"
+        )
+        local_pos = offset_pos.unsqueeze(0) + _drop_backward(local_pos - offset_pos.unsqueeze(0), offset_quat_world)
 
     camera._view.set_local_poses(local_pos, offset_quat_opengl, env_ids)
 

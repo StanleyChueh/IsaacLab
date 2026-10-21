@@ -29,6 +29,8 @@ the +2.5 cm offset is calibrated against real recorded teleop demos' peak lift h
 picked by analogy to an older design -- see the comment above `cube_rest_z` for why).
 """
 
+import os
+
 import torch
 
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
@@ -44,9 +46,9 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR
 
 import isaaclab.envs.mdp as mdp_core
 from isaaclab_tasks.manager_based.manipulation.stack import mdp
-from isaaclab_tasks.manager_based.manipulation.stack.mdp import openarm_domain_randomization
+from isaaclab_tasks.manager_based.manipulation.stack.mdp import openarm_camera_mount, openarm_domain_randomization
 
-from . import openarm_actuator_profile, openarm_sim_timing, openarm_task_modes
+from . import openarm_actuator_profile, openarm_sim_timing, openarm_task_modes, openarm_workspace_mat
 
 from . import stack_ik_abs_visuomotor_env_cfg
 
@@ -107,6 +109,14 @@ class PickUpEventCfg:
     init_robot_pose = EventTerm(
         func=mdp_core.reset_scene_to_default,
         mode="reset",
+    )
+
+    # Without this the wrist cams render from a mount baked off the arms' first-frame sag, not the
+    # cfg offset (right_wrist_cam lost its fingertips) -- see openarm_camera_mount.py.
+    sync_camera_mounts = EventTerm(
+        func=openarm_camera_mount.sync_mounted_camera_fabric_pose,
+        mode="reset",
+        params={"camera_names": ("wrist_cam", "right_wrist_cam", "body_cam")},
     )
 
     randomize_cube_2 = EventTerm(
@@ -272,6 +282,7 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
             "pos_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
             "asset_cfg": SceneEntityCfg("wrist_cam"),
+            "keep_lens_in_front": True,  # the lens sits 0.5 mm in front of the D435 housing
         },
     )
 
@@ -282,6 +293,7 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
             "pos_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
             "rot_range": {"roll": (-0.14, 0.14), "pitch": (-0.14, 0.14), "yaw": (-0.14, 0.14)},
             "asset_cfg": SceneEntityCfg("right_wrist_cam"),
+            "keep_lens_in_front": True,  # the lens sits 0.5 mm in front of the D435 housing
         },
     )
 
@@ -326,6 +338,7 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         params={
             "amplitude": {"x": 0.003, "y": 0.003},
             "asset_cfg": SceneEntityCfg("wrist_cam"),
+            "keep_lens_in_front": True,  # the lens sits 0.5 mm in front of the D435 housing
         },
     )
     init_right_wrist_cam_shake = EventTerm(
@@ -340,6 +353,7 @@ class PickUpDomainRandomizationEventCfg(PickUpEventCfg):
         params={
             "amplitude": {"x": 0.003, "y": 0.003},
             "asset_cfg": SceneEntityCfg("right_wrist_cam"),
+            "keep_lens_in_front": True,  # the lens sits 0.5 mm in front of the D435 housing
         },
     )
     init_body_cam_shake = EventTerm(
@@ -560,6 +574,11 @@ def attach_domain_randomization(env_cfg, profile: str = "full", enable_camera_sh
         # None is attached too, not skipped: that is how a profile switches OFF a term it inherits
         # from another profile (EventManager._prepare_terms skips any term whose cfg is None).
         setattr(env_cfg.events, term_name, term)
+    if getattr(env_cfg, "real_look_dir", None):
+        # The real look (openarm_real_look) changes what lighting, background and table colour mean -- re-target them.
+        from . import openarm_real_look_randomization
+
+        attached += [f"real look: {note}" for note in openarm_real_look_randomization.adapt_to_real_look(env_cfg, profile)]
     return attached
 
 
@@ -654,9 +673,19 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
     gripper_joint_names: list = ["openarm_left_finger_joint.*"]
     gripper_open_val: float = 0.044
     gripper_threshold: float = 0.018
+    robot_self_collisions: bool = (os.environ.get("OPENARM_SELF_COLLISIONS", "0") == "1")
+    """Collisions between the robot's own links (the arms with each other, the torso, a wrist's camera mount). Off by
+    default (OPENARM_SELF_COLLISIONS=1 turns them on): PhysX tests them on convex hulls, fatter than the real parts, and
+    they blocked joints the real arm moves freely -- replaying the real pringles episodes, a right shoulder lagged its
+    command by 0.29 rad (0.09 without), and a teleop session hit the robot's safety hold on a wrist 0.54 rad behind.
+    The battery task found the same (pickup_ik_abs_insertbattery_env_cfg.py). The robot still collides with the can and
+    the table; only contacts between the robot's own links are skipped -- so the two arms can pass through each other."""
 
     def __post_init__(self):
         super().__post_init__()  # cameras, IK-Abs action, pad, cubes
+        spawn = self.scene.robot.spawn
+        self.scene.robot.spawn = spawn.replace(
+            articulation_props=spawn.articulation_props.replace(enabled_self_collisions=self.robot_self_collisions))
 
         # Control rate: 30 Hz by default (OPENARM_CONTROL_HZ=20 restores the legacy 20 Hz). Set here
         # rather than in stack_env_cfg.py because that base is shared with every upstream stack task.
@@ -674,6 +703,9 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         # The scene builder skips attributes set to None.
         self.scene.cube_1 = None
         self.scene.cube_3 = None
+
+        # ── The real rig's black mats on the pad (visual only; see openarm_workspace_mat) ──
+        openarm_workspace_mat.add_workspace_mats(self)
 
         # ── Drop front_cam ───────────────────────────────────────────────────
         # The parent visuomotor cfg builds four non-tiled CameraCfg sensors at 640x480, and a
@@ -701,6 +733,9 @@ class OpenarmPickUpRedCubeEnvCfg(stack_ik_abs_visuomotor_env_cfg.OpenarmCubeStac
         #
         # 6.0 m clears both far planes with margin (nearest neighbour geometry lands at
         # ~5.4 m), so the frustum culls every neighbour regardless of how far the arm reaches.
+        # (The far planes are now 4.0 m, for the real look's room walls up to ~3 m away; still
+        # clear of 5.4 m. Under the real look a neighbour's room comes closer, but our own walls
+        # stand in front of it in every direction the cameras face.)
         # env_spacing only offsets the GridCloner origins -- no extra physics bodies, no extra
         # render products, no measurable cost. Raise this if any camera's far clip is ever
         # increased past ~5 m.

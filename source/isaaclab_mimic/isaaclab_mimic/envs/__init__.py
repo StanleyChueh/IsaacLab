@@ -74,6 +74,15 @@ gym.register(
     disable_env_checker=True,
 )
 
+gym.register(
+    id="Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1",
+    entry_point=f"{__name__}.openarm_pickup_ik_abs_mimic_env:OpenArmPickUpIKAbsMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.openarm_pickup_ik_abs_mimic_env_cfg:OpenArmPickUpIKAbsMimicRealLookEnvCfg",
+    },
+    disable_env_checker=True,
+)
+
 ##
 # SkillGen
 ##

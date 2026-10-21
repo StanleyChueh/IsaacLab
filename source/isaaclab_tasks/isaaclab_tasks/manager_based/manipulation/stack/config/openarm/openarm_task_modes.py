@@ -139,6 +139,9 @@ GRIPPER_OPEN_VAL = 0.044
 GRIPPER_THRESHOLD = 0.005
 """How far (m) a jaw must have travelled from open before it counts as closed on something.
 
+(With a 7 cm can -- :data:`CAN_SCALE` 0.94 -- jaws on the bare fingers met it only ~4 mm in from open, so this would have to
+drop to ~0.0025; with the foam pads, add_openarm_hand.py, they meet a 6 cm can ~12 mm in.)
+
 Sized against the can, and it has to be: a jaw closing on a 60 mm-wide can stops at the can's
 surface, so it travels much LESS than one closing on the small cube this number was originally
 picked for. Two rounds of measurement, each of which moved this number down:
@@ -163,9 +166,12 @@ air travel further than jaws shut on a can. That is why the hand-over's completi
 two-sided :data:`HANDOVER_RECEIVER_APERTURE_RANGE` instead of this one -- see
 :func:`receiver_grip_confirmed`."""
 
-HANDOVER_RECEIVER_APERTURE_RANGE = (0.015, 0.072)
+HANDOVER_RECEIVER_APERTURE_RANGE = (0.015, 0.076)
 """(min, max) total jaw aperture (m, the two finger joints summed) at which the RECEIVING hand
-counts as having actually got hold of the can. Fully open is 0.088; fully shut is ~0.
+counts as having actually got hold of the can. Fully open is 0.088; shut on nothing it is ~0.010 now (the fingers stop
+pad to pad, add_openarm_hand.py), still under the 0.015 floor. With the foam pads (2026-10-21) jaws squeezed on the can
+settle at 0.065-0.069 (six recorded grasp poses), so the upper bound went from 0.072 to 0.076 to keep the margin for
+looser grips the history below describes. A 7 cm can (:data:`CAN_SCALE` 0.94) would need ~0.085.
 
 Two-sided, so a hand that closed on empty air (aperture near zero) does not pass: an aperture near
 zero means the jaws met, i.e. the can is not there. This used to carry the WHOLE burden of
@@ -256,8 +262,9 @@ def _require_can_asset() -> str:
     return CAN_USD_PATH
 
 CAN_SCALE = 0.8
-"""Uniform spawn scale, matching the Isaac Sim stage transform verified by hand (Scale
-0.8/0.8/0.8). Post-scale the can is ~60 mm across and ~200 mm tall."""
+"""Uniform spawn scale of the 250.2 mm x 73.25 mm (body; 75.3 mm lid rim) Berkeley chips-can asset, matching the Isaac Sim
+stage transform verified by hand: post-scale ~200 mm tall and ~59 mm across. (The real can is 23.5 x 7 cm -- scale 0.94 --
+which was tried on 2026-10-21 and reverted on request; the derived constants below follow whichever is set.)"""
 
 CAN_ROT = (1.0, 0.0, 0.0, 0.0)
 """(w, x, y, z) spawn orientation -- identity, i.e. the can stands upright on the pad.
@@ -269,8 +276,8 @@ prim, whereas this one is the rigid body's own world orientation. Measuring the 
 tall axis along local +Z, and the stage's up-axis is Z, so identity already stands it up -- adding
 -90 about X lays it on its side, which is what the first attempt at this actually produced."""
 
-CAN_HALF_HEIGHT = 0.1
-"""m -- half the can's vertical extent once :data:`CAN_SCALE` is applied (0.8 * 250.2 mm / 2), and
+CAN_HALF_HEIGHT = CAN_SCALE * 0.2502 / 2
+"""m -- half the can's vertical extent once :data:`CAN_SCALE` is applied (0.1 at 0.8), and
 how far its own origin sits above its base: the asset's origin is at the geometric centre, not the
 base, so resting on the pad means ``pos[2] = pad_top + CAN_HALF_HEIGHT``."""
 
@@ -300,10 +307,9 @@ CAN_NOMINAL_LENGTH = 2.0 * CAN_HALF_HEIGHT
 """m -- the can's full length at :data:`CAN_SCALE` (0.2 m). The size that
 :func:`randomize_object_size` perturbs AROUND, so a delta of 0 reproduces today's can exactly."""
 
-CAN_NOMINAL_RADIUS = 0.030
-"""m -- the can's body radius at :data:`CAN_SCALE`. Half of the 0.0586 m body-visual diameter
-measured in-sim (see :data:`CAN_REST_OFFSET`), rounded to the 60 mm the rest of this module quotes.
-The other size :func:`randomize_object_size` perturbs around."""
+CAN_NOMINAL_RADIUS = CAN_SCALE * 0.036625
+"""m -- the can's body radius at :data:`CAN_SCALE` (0.0293 at 0.8): the asset's 73.25 mm body (0.0586 m measured in-sim at
+0.8, see :data:`CAN_REST_OFFSET`) halved. The other size :func:`randomize_object_size` perturbs around."""
 
 MAX_GRASPABLE_DIAMETER = 2.0 * GRIPPER_OPEN_VAL
 """m -- how wide an object the hand can close around at all: both jaws travel
@@ -325,10 +331,10 @@ Larger than :data:`EEF_TO_CAN_THRESHOLD` because a hand-over holds the can at tw
 heights at once (giving hand low, receiving hand high) -- budgeting a ~9 cm vertical offset from
 the origin on each side: sqrt(0.03^2 + 0.09^2) ~= 0.095 m, plus margin."""
 
-GRASP_AXIAL_TOLERANCE = 0.12
+GRASP_AXIAL_TOLERANCE = CAN_HALF_HEIGHT + 0.02
 """m -- how far along the can's own axis, measured from its centre, a hand may be and still count
-as holding it. The can is 200 mm long, so a hand on it is anywhere within ~100 mm of the centre
-along that axis; this is that half-length plus margin for gripping right at the rim.
+as holding it. A hand on the can is anywhere within its half-length (~100 mm) of the centre along
+that axis; this is that half-length plus 2 cm of margin for gripping right at the rim.
 
 This exists because "distance from the hand to the object's origin" is the wrong test for a long
 object: gripping the can perfectly at its top rim puts the hand ~100 mm from the origin, which no
@@ -537,6 +543,21 @@ def randomize_pad_height(
                         prim_spec, UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray
                     )
                 op_order_spec.default = Vt.TokenArray(["xformOp:translate", "xformOp:orient", "xformOp:scale"])
+
+    # The real look draws the table as a photo mesh (openarm_real_look, a backdrop with role "table") over the then
+    # invisible pad: raise / lower it with the pad, or the can would float above or sink into the table it is seen on.
+    followers = [cfg.prim_path.split("/")[-1] for cfg in vars(env.cfg.scene).values()
+                 if getattr(getattr(cfg, "spawn", None), "follows_pad", False)]
+    with Sdf.ChangeBlock():
+        for row, env_id in enumerate(ids):
+            for name in followers:
+                path = f"{env.scene.env_prim_paths[env_id]}/{name}"
+                spec = Sdf.CreatePrimInLayer(stage.GetRootLayer(), path)
+                attr = spec.GetAttributeAtPath(path + ".xformOp:translate")
+                if attr is None:
+                    attr = Sdf.AttributeSpec(spec, path + ".xformOp:translate", Sdf.ValueTypeNames.Double3)
+                base = Gf.Vec3d(0.0, 0.0, 0.0) if attr.default is None else Gf.Vec3d(attr.default)
+                attr.default = Gf.Vec3d(base[0], base[1], base[2] + float(height_delta[row]))
 
     # Record what was drawn -- every height-sensitive signal reads it back through
     # pad_height_deltas(). See that function for the list of what would be wrong without it.
@@ -1440,10 +1461,11 @@ OBJECT_SPAWN_RANGES = {
 # range a mode is given, including a wider one. The single-arm modes' full-pad range does reach
 # them, which is what keeps the rejection sampling in :func:`reset_object_free` load bearing -- and
 # the assert below is what keeps the hand-over range from quietly starting to lean on it too.
+_CAN_GROWTH = max(0.0, CAN_NOMINAL_RADIUS - 0.030)  # the boxes below were measured with a ~30 mm-radius can; grow with a bigger one
 _ARM_KEEP_OUT_BOXES = (
-    (0.19, 0.42, 0.085, 0.215),    # left arm's parked footprint  (x_min, x_max, y_min, y_max)
-    (0.19, 0.42, -0.215, -0.085),  # right arm's, mirrored
-)
+    (0.19 - _CAN_GROWTH, 0.42 + _CAN_GROWTH, 0.085 - _CAN_GROWTH, 0.215 + _CAN_GROWTH),    # left arm's parked footprint
+    (0.19 - _CAN_GROWTH, 0.42 + _CAN_GROWTH, -0.215 - _CAN_GROWTH, -0.085 + _CAN_GROWTH),  # right arm's, mirrored
+)  # (x_min, x_max, y_min, y_max)
 
 # The subset-of-the-source invariant this file used to enforce is now deliberately relaxed by
 # _HANDOVER_EXTRAPOLATION_MARGIN_X/_Y (see their docstring for why, and for the compute-not-
@@ -1473,6 +1495,43 @@ assert _HANDOVER_X_RANGE[0] >= _MIN_SPAWN_X, (
     " lower _HANDOVER_EXTRAPOLATION_MARGIN_X."
 )
 
+_RECORD_SPAWN_X_RANGE = (0.12, 0.40)
+_RECORD_SPAWN_Y_RANGE = (-0.08, 0.08)
+_RECORD_SPAWN_GAUSSIAN = ((0.235, 0.07), (0.01, 0.04))
+"""Hand-over spawn for RECORDING source demos (a cfg without Mimic subtask_configs, e.g. lerobot_sim_server.py):
+((mean_x, std_x), (mean_y, std_y)) in env-local m, truncated to the two ranges above.
+
+Measured, not chosen: the can's spot at the start of each of the 50 real episodes of
+ethanCSL/openarm_pringles_lerobot_real_v00 (lid centroid in the first body_cam frame, back-projected onto
+the plane of the can's top through the calibrated body_cam) gave x in [0.116, 0.394], median 0.232, sd 0.06,
+and y in [-0.062, 0.077], mean 0.012, sd 0.03 -- the operator put the can close to the robot's body. The
+uniform :data:`_HANDOVER_X_RANGE` (mean x 0.31) put it ~8 cm farther out than any real episode's median. Both
+stds are ~15% wider than measured, for a little more spread than the real set.
+
+x reaches inside :data:`_MIN_SPAWN_X` because the real demos do: that limit is about MIMIC re-anchoring a
+grasp near the base, which a person teleoperating avoids. Generation is unaffected -- it keeps
+:data:`_HANDOVER_X_RANGE` / :data:`_HANDOVER_Y_RANGE`; once demos recorded this way are annotated,
+re-measure :data:`_HANDOVER_SOURCE_X_RANGE` / ``_Y`` from them as that docstring says."""
+assert all(
+    _RECORD_SPAWN_Y_RANGE[1] < y_min or _RECORD_SPAWN_Y_RANGE[0] > y_max for _, _, y_min, y_max in _ARM_KEEP_OUT_BOXES
+), f"recording spawn y={_RECORD_SPAWN_Y_RANGE} overlaps an arm's parked footprint ({_ARM_KEEP_OUT_BOXES})."
+
+_HAND_KEEP_OUT_BOXES_AT_HOME = tuple(
+    (x0 - _CAN_GROWTH, x1 + _CAN_GROWTH, y0 - _CAN_GROWTH, y1 + _CAN_GROWTH) for x0, x1, y0, y1 in (
+        (0.265, 0.377, 0.029, 0.278),   # left hand plate (rail housing)  (x_min, x_max, y_min, y_max)
+        (0.265, 0.377, -0.278, -0.029),  # right, mirrored
+        (0.265, 0.440, 0.060, 0.278),   # left open fingers
+        (0.265, 0.440, -0.278, -0.060),  # right, mirrored
+    )
+)
+"""Where the can's CENTRE must not spawn while the arms wait at lerobot's start keyframe (joint4 = pi/2, the rest
+0, grippers open) -- lerobot_sim_server.py keeps them there through every scene reset. Measured in sim at that
+pose: each hand plate (v1_camera_isaac_hand.usda) spans x [0.306, 0.337], |y| [0.069, 0.238], z [0.450, 0.507]
+and the open fingers reach on to x ~0.40 with inner faces at |y| ~0.10, all below the can's top (z 0.515); these
+are those footprints grown by the can's radius + 1 cm (measured with a 30 mm radius, grown with the can since). A can spawned inside is clipped by the hand and
+tipped or pushed (seen: 20 deg, 3.7 cm). Only for the recording spawn: it describes that pose, not
+IsaacLab's default joint pose."""
+
 
 def reset_object_free(
     env,
@@ -1482,8 +1541,12 @@ def reset_object_free(
     y_range: tuple[float, float] = _OBJECT_Y_RANGE,
     keep_out_boxes: tuple = _ARM_KEEP_OUT_BOXES,
     rot: tuple[float, float, float, float] = CAN_ROT,
+    xy_gaussian: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> None:
     """Stand the object upright at a uniformly random spot on the pad, outside *keep_out_boxes*.
+
+    With *xy_gaussian* = ((mean_x, std_x), (mean_y, std_y)) the spot is instead normal on each axis,
+    truncated to *x_range* / *y_range* by the same rejection sampling (see :data:`_RECORD_SPAWN_GAUSSIAN`).
 
     Used instead of :func:`~isaaclab.envs.mdp.events.reset_root_state_uniform` because that one
     samples a plain rectangle, and the rectangle we want has two bites taken out of it (see
@@ -1502,8 +1565,13 @@ def reset_object_free(
     device = asset.device
     n = len(env_ids)
 
-    x = torch.empty(n, device=device).uniform_(*x_range)
-    y = torch.empty(n, device=device).uniform_(*y_range)
+    def draw(k: int, axis: int, rng: tuple[float, float]) -> torch.Tensor:
+        if xy_gaussian is None:
+            return torch.empty(k, device=device).uniform_(*rng)
+        return torch.empty(k, device=device).normal_(*xy_gaussian[axis])
+
+    x = draw(n, 0, x_range)
+    y = draw(n, 1, y_range)
 
     # Resample only the rejected ones, so every env keeps an independent uniform draw. The loop is
     # bounded because an unbounded one would hang forever on a mis-specified keep-out that covers
@@ -1513,14 +1581,15 @@ def reset_object_free(
     # (possibly illegal) draw rather than raising keeps a pathological config from killing a
     # recording session mid-run.
     for _ in range(100):
-        rejected = torch.zeros(n, dtype=torch.bool, device=device)
+        # outside the range only happens for a Gaussian draw: that is its truncation
+        rejected = (x < x_range[0]) | (x > x_range[1]) | (y < y_range[0]) | (y > y_range[1])
         for x_min, x_max, y_min, y_max in keep_out_boxes:
             rejected |= (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
         if not bool(rejected.any()):
             break
         k = int(rejected.sum())
-        x[rejected] = torch.empty(k, device=device).uniform_(*x_range)
-        y[rejected] = torch.empty(k, device=device).uniform_(*y_range)
+        x[rejected] = draw(k, 0, x_range)
+        y[rejected] = draw(k, 1, y_range)
 
     states = asset.data.default_root_state[env_ids].clone()
     states[:, 0] = env.scene.env_origins[env_ids, 0] + x
@@ -2301,12 +2370,12 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
     # segment onto the new object pose, so a spawn outside that region is extrapolation. See
     # OBJECT_SPAWN_RANGES / _HANDOVER_X_RANGE.
     object_x_range, object_y_range = OBJECT_SPAWN_RANGES[mode]
+    spawn = {"asset_cfg": object_cfg(), "x_range": object_x_range, "y_range": object_y_range}
+    if mode == TASK_MODE_HANDOVER and not hasattr(env_cfg, "subtask_configs"):  # recording: where the real demos put it
+        spawn.update(x_range=_RECORD_SPAWN_X_RANGE, y_range=_RECORD_SPAWN_Y_RANGE, xy_gaussian=_RECORD_SPAWN_GAUSSIAN,
+                     keep_out_boxes=_ARM_KEEP_OUT_BOXES + _HAND_KEEP_OUT_BOXES_AT_HOME)
     env_cfg.events.randomize_cube_2 = None
-    env_cfg.events.randomize_object = EventTerm(
-        func=reset_object_free,
-        mode="reset",
-        params={"asset_cfg": object_cfg(), "x_range": object_x_range, "y_range": object_y_range},
-    )
+    env_cfg.events.randomize_object = EventTerm(func=reset_object_free, mode="reset", params=spawn)
 
     # ── Mimic subtask structure ──────────────────────────────────────────────
     # Only present when the cfg is a Mimic one (annotate_demos.py / generate_dataset.py); the

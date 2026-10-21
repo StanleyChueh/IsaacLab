@@ -8,7 +8,8 @@ Drives the running sim server the way lerobot-record drives it through --robot.t
 observation, send the action, one control step each, 30 Hz lockstep -- and writes the frames to a LeRobot dataset with
 the real dataset's feature schema (motor-radian state and action, three 480x640 cameras). The actions are a real
 episode's recorded teleop commands, and the can is put where that episode's can started (prepare_real_replay.py), so
-the episode is a plausible handover. Whatever look the server runs with (--real_look) is what gets recorded.
+the episode is a plausible handover. Whatever look the server runs with (--real_look) is what gets recorded, and a server
+started with --mimic_hdf5 also writes each kept episode as a Mimic source demo.
 
 The sim does not always carry the can (finger geometry and friction differ), so by default only episodes in which the task's
 own success condition (the hand-over) was met at some step are kept; the others are discarded and the next real episode is
@@ -96,6 +97,7 @@ def main() -> None:
         first = dict(zip(names, states[0].tolist()))
         placement = {"objects": starts[str(ep)]} if props else {"object_xy": starts[str(ep)]}
         obs = client.request("reset", joints=motor_action_to_sim_joints(first, calib), **placement)
+        client.request("episode_begin")  # the server's Mimic source demo (--mimic_hdf5), as lerobot-record does
         z0 = {k: v[2] for k, v in obs.get("objects", {}).items()}
         zmax = dict(z0)
         t0 = time.perf_counter()
@@ -120,7 +122,12 @@ def main() -> None:
                   f"{100 * (b[2] - c[2]):+.1f}) cm -> grasp-level success: {success}", flush=True)
         else:
             print(f"real episode {ep}: {len(actions)} steps in {time.perf_counter() - t0:.0f} s, hand-over success condition met: {success}", flush=True)
-        if not args.keep_all and not success:
+        client.request("episode_close")
+        kept = args.keep_all or success
+        demo = client.request("episode_end", save=kept)
+        if demo.get("saved"):
+            print(f"  Mimic source demo: {demo['saved']} ({demo['steps']} steps)", flush=True)
+        if not kept:
             print("  not a successful handover in sim: discarded")
             ep += 1
             continue

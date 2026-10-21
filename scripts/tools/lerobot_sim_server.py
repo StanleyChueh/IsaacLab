@@ -427,14 +427,15 @@ def main() -> None:
     env_cfg.observations.policy.concatenate_terms = False
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-    if look_dir is not None and os.path.isfile(os.path.join(look_dir, "contact_physics.json")):
+    contact_event = getattr(env.cfg.events, "real_look_contact_physics", None) is not None  # the look applied it at startup
+    if look_dir is not None and not contact_event and os.path.isfile(os.path.join(look_dir, "contact_physics.json")):
         from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import apply_contact_physics
 
         fitted = json.load(open(os.path.join(look_dir, "contact_physics.json")))["params"]
         print(f"[lerobot_sim_server] contact physics fitted to the real episodes: {apply_contact_physics(env, fitted)} + {fitted}")
     env.reset()
     sensor = None
-    if look_dir is not None:
+    if look_dir is not None and not getattr(env.cfg, "real_look_sensor_in_obs", False):  # else the obs already carry it
         from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_real_look import SensorModel
 
         sensor = SensorModel(look_dir)

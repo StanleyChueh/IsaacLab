@@ -10,8 +10,9 @@ real robot's colours and lighting, the photo-textured table and room behind it, 
 noise, which ``lerobot_sim_server.py`` applies on its own when a task carries ``real_look_dir``. The physics is
 untouched; the pad and table keep their colliders and only stop being drawn.
 
-Domain randomization: use ``--domain_randomization none``. The randomizers move the pad and change the light, both of
-which the photo backdrop has baked in.
+Domain randomization (``--domain_randomization`` / generate_dataset.py's ``--domain_randomization_profile``) works on top of
+the look: openarm_real_look_randomization re-targets the light, background and table-colour terms to it. Mimic env:
+``Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1``.
 """
 
 from isaaclab.utils import configclass

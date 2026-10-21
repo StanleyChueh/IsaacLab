@@ -10,22 +10,25 @@ by hand -- see scripts/tools/sysid/README.md, "Real look", for the pipeline that
 
 * ``albedo.json``     -- colour / roughness / metallic of every robot part (one material on one link), fitted
   by comparing the sim robot posed at real joint states against the real robot in the body camera.
-* ``backdrop_*.npz``  -- the static real scene (table, mats, room) as vertex-coloured meshes in the env
-  frame, built from the cameras' clean plates and monocular depth. They are emissive: their colours are
+* ``backdrop_*.npz``  -- the static real scene as vertex-coloured meshes in the env frame: ``backdrop_body`` (the table
+  and mats, from body_cam's clean plate and monocular depth) and ``backdrop_room`` (the walls around the rig, fused
+  from thousands of real frames of all three cameras by build_room_backdrop.py). They are emissive: their colours are
   the real pixels, already lit by the real room, so sim lighting must not shade them again.
 * ``lighting.json``   -- intensity / colour of the dome light that lights the robot and the can (the backdrop
   is emissive and ignores it), fitted so the robot's shaded parts land on the real pixel values.
 * ``contact_physics.json`` -- friction / mass / gripper-squeeze values fitted by replaying the real episodes in sim until the
   can stays in the gripper as it does in the real recordings (scripts/tools/sysid/fit_contact_physics.py);
-  applied at run time by :func:`apply_contact_physics` after the env is built.
+  applied by :func:`apply_contact_physics` as a startup event once the env is built.
 * ``sensor.json``     -- per-camera blur / noise (the real D435i frames, after its lens, ISP and the dataset's video
-  encoding, are softer than the renderer's), applied by :class:`SensorModel` to each frame the server sends.
+  encoding, are softer than the renderer's), applied by :class:`SensorModel` inside the camera observations, so
+  the server, Mimic generation and every other consumer of the observations get the same frames.
 * ``tone.json``       -- per-channel curve from a wanted output pixel value to the emissive value that
   produces it through the RTX tone mapper (measured, not assumed).
 
 :func:`apply_real_look` patches an env cfg in place, the same way ``apply_task_mode`` does, so every entry
-point (the LeRobot sim server, the render/calibration tools) gets the identical scene. The physics is not
-touched: the pad, table and can collide exactly as before; only what the cameras see changes.
+point (the LeRobot sim server, Mimic, the render/calibration tools) gets the identical scene. Collision geometry is not
+touched: the pad, table and can collide exactly as before. Domain randomization on top of the look:
+:mod:`openarm_real_look_randomization`.
 """
 
 from __future__ import annotations
@@ -94,12 +97,13 @@ FINGER_TIP_Z = 0.080
 """m, where the sim finger meshes end in their own link frame (measured from the mesh; the frame sits 0.1025 m along the tool axis)."""
 FINGER_INNER_Y = {"left_finger": -0.0078, "right_finger": 0.0078}
 """m, the stock finger collision meshes' inner faces in their link frames (finger.stl spans y -0.0078 .. +0.0271 for the left
-finger, its mirror for the right one). They cross at the centre: the closed gripper (q = 0) is 1.56 cm interpenetrating, and
-the jaw gap is 2 q - 1.56 cm."""
+finger, its mirror for the right one). With the official finger joint offsets (add_openarm_hand.py, 5 mm a side since
+2026-10-21) the jaw gap is 2 q - 0.56 cm; before that, with both joints at the hand's centre line, it was 2 q - 1.56 cm."""
 PAD_WIDTH, PAD_THICKNESS, PAD_OUTSET = 0.022, 0.016, 0.007
 """m: the foam fingertip pad's width (along the finger's x), its thickness (along its y, outwards from its inner face), and how
 far that inner face sits outside the stock finger's. The stock jaws open to 7.2 cm, 3.6 mm a side more than the 6.5 cm charger
-they must straddle; the pads open to 7.8 cm, and still close on the 1.45 cm cell (the closed gap is 2 q - 1.56 + 0.6 cm)."""
+they must straddle; the pads open to 7.8 cm, and still close on the 1.45 cm cell (the closed gap is 2 q - 1.56 + 0.6 cm). Those are
+the figures the battery expert was tuned with; the official finger offsets (2026-10-21) add 1 cm to every gap."""
 PAD_COLOR = (0.035, 0.035, 0.035)
 
 
@@ -227,6 +231,35 @@ class BackdropMeshCfg(sim_utils.SpawnerCfg):
     npz_path: str = MISSING
     tone_path: str | None = None
     gain: float = 1.0
+    role: str = "scene"
+    """"table" (moves with the pad's height, tinted with the pad colour), "room" (hidden by the skybox swap), or "scene"."""
+
+    @property
+    def follows_pad(self) -> bool:
+        return self.role == "table"
+
+
+def _with_sensor(image_func: Callable, sensor: "SensorModel", camera: str) -> Callable:
+    """An image observation term that returns the frames the real camera would: ``image_func``'s, through ``sensor``."""
+    import functools
+
+    import torch
+
+    @functools.wraps(image_func)  # the observation manager checks the term's parameters against its signature
+    def term(env, **kwargs):
+        images = image_func(env, **kwargs)
+        if images.dtype != torch.uint8:  # normalized float images are left as they are
+            return images
+        out = images.clone()
+        for i in range(images.shape[0]):
+            out[i, ..., :3] = sensor(camera, images[i])
+        return out
+
+    return term
+
+
+def _contact_physics_startup(env, env_ids, params: dict) -> None:
+    print(f"[openarm_real_look] contact physics fitted to the real episodes: {apply_contact_physics(env, params)}")
 
 
 class SensorModel:
@@ -272,7 +305,10 @@ def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
     Returns a list of what was applied, for the caller to print. Missing files are skipped, so a partially
     fitted look still works.
     """
+    from isaaclab.managers import EventTermCfg
+
     applied = []
+    env_cfg.real_look_dir = look_dir  # consumers (DR, the server) read it to know the look is on
     albedo_path = os.path.join(look_dir, "albedo.json")
     albedo = json.load(open(albedo_path)) if os.path.isfile(albedo_path) else None
     extension = finger_extension(look_dir)
@@ -295,9 +331,10 @@ def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
         tone = os.path.join(look_dir, "tone.json")
         for path in backdrops:
             name = os.path.splitext(os.path.basename(path))[0]
+            role = {"backdrop_body": "table", "backdrop_room": "room"}.get(name, "scene")
             setattr(env_cfg.scene, f"real_{name}", AssetBaseCfg(
                 prim_path=f"{{ENV_REGEX_NS}}/Real_{name}",
-                spawn=BackdropMeshCfg(npz_path=path, tone_path=tone),
+                spawn=BackdropMeshCfg(npz_path=path, tone_path=tone, role=role),
             ))
         # The real scene replaces the sim's own table, pad and floor -- visually only: the pad keeps its
         # collider (an invisible prim still collides), so the can rests and is grasped exactly as before.
@@ -306,6 +343,26 @@ def apply_real_look(env_cfg, look_dir: str = LOOK_DIR) -> list[str]:
             if entity is not None:
                 entity.spawn.visible = False
         applied.append(f"real backdrop ({', '.join(os.path.basename(p) for p in backdrops)}); sim table/pad/floor hidden")
+
+    contact_path = os.path.join(look_dir, "contact_physics.json")
+    if os.path.isfile(contact_path) and getattr(env_cfg, "events", None) is not None:
+        params = json.load(open(contact_path))["params"]
+        env_cfg.events.real_look_contact_physics = EventTermCfg(
+            func=_contact_physics_startup, mode="startup", params={"params": params})
+        applied.append(f"contact physics ({', '.join(f'{k} {v:g}' for k, v in params.items())})")
+
+    sensor = SensorModel(look_dir)
+    policy = getattr(getattr(env_cfg, "observations", None), "policy", None)
+    wrapped = []
+    for camera in sensor.params:
+        term = getattr(policy, camera, None)
+        if term is not None and not getattr(term.func, "_real_look_sensor", False):
+            term.func = _with_sensor(term.func, sensor, camera)
+            term.func._real_look_sensor = True
+            wrapped.append(camera)
+    if wrapped:
+        env_cfg.real_look_sensor_in_obs = True
+        applied.append(f"camera blur/noise in the observations ({', '.join(wrapped)})")
     return applied
 
 

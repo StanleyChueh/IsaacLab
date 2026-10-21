@@ -7,6 +7,7 @@
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg
 from isaaclab.utils import configclass
 
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm import openarm_real_look
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
     TASK_MODE_LEFT,
     apply_task_mode,
@@ -66,3 +67,21 @@ class OpenArmPickUpIKAbsMimicEnvCfg(OpenarmPickUpRedCubeEnvCfg, MimicEnvCfg):
         # OpenArmPickUpIKAbsMimicEnv serves; re-applying another mode later replaces all of it
         # consistently, which is why none of it is spelled out here.
         apply_task_mode(self, TASK_MODE_LEFT)
+
+
+@configclass
+class OpenArmPickUpIKAbsMimicRealLookEnvCfg(OpenArmPickUpIKAbsMimicEnvCfg):
+    """Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1: the Mimic env of ``...-IK-Abs-v1``, i.e. with the real look.
+
+    Annotate and generate source demos recorded on ``...-IK-Abs-v1`` (lerobot_sim_server.py --mimic_hdf5) with this env so the
+    generated frames look like the ones recorded: the real robot colours, photo table and room, the fitted contact physics
+    and the cameras' blur / noise (openarm_real_look). --enable_domain_randomization works as on -v0; the light, background
+    and table-colour terms are re-targeted to the look (openarm_real_look_randomization).
+    """
+
+    real_look_dir: str = openarm_real_look.LOOK_DIR
+
+    def __post_init__(self):
+        super().__post_init__()
+        applied = openarm_real_look.apply_real_look(self, self.real_look_dir)
+        print(f"[OpenArmPickUpIKAbsMimicRealLookEnvCfg] real look: {'; '.join(applied) or 'nothing found in ' + self.real_look_dir}")
