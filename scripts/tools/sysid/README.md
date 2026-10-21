@@ -1,7 +1,7 @@
 # Sim <-> real system identification for the OpenArm
 
 Tools to find out where the simulated arm and the real follower respond differently, and to make the sim
-match where the data says it should. Lives on the `plate_wiping` branch.
+match where the data says it should. Lives on the `openarm-dev` branch.
 
 ```
 real dataset ──analyze_real_dataset.py──> real_arm_response.json + traces.npz

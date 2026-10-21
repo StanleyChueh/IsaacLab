@@ -1,377 +1,185 @@
-# Workflow
+# OpenArm × Isaac Lab (`openarm-dev`)
 
-<img width="5896" height="2260" alt="image" src="https://github.com/user-attachments/assets/4613ed23-8c02-4d02-97a2-5d3f5b0a8c2f" />
+<img width="5896" height="2260" alt="workflow" src="https://github.com/user-attachments/assets/4613ed23-8c02-4d02-97a2-5d3f5b0a8c2f" />
 
-# Demo: 
+<img width="1858" height="1053" alt="demo" src="https://github.com/user-attachments/assets/c82d8a0c-d545-45c4-acc3-1fc701660a3b" />
 
-<img width="1858" height="1053" alt="image" src="https://github.com/user-attachments/assets/c82d8a0c-d545-45c4-acc3-1fc701660a3b" />
+Video: https://youtu.be/4DKriauQ05g?si=INIHtNN7Frs6Tbzm
 
+This repo is the **simulator half** of the [lerobot_openarm](https://github.com/StanleyChueh/lerobot_openarm/tree/official-lerobot-quest)
+pipeline. Recording, training and evaluation — real and sim — are run from lerobot_openarm
+(real: Steps 0-5, sim: Sim Steps 1-6). Here: the sim server, Isaac Lab Mimic, and the robot / scene assets.
 
+## Setup
 
-video: https://youtu.be/4DKriauQ05g?si=INIHtNN7Frs6Tbzm
-
-# Record dataset w Meta Quest3 Pro
-
-Record in IsaacSim
-
-```
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/plate_wipe.hdf5 \
-    --enable_cameras \
-    --num_demos 10 \
-    --teleop_device vr_joint_ros2_native \
-    --ros2_domain_id 1 \
-    --manual_save
 ```
 
-Record in real world
+The robot's USD files are gitignored and live only on your machine (`source/isaaclab_assets/data/v1_camera_isaac/`);
+back that folder up. After changing the gripper or camera-mount scripts, rebuild their layers:
 
+```bash
+./isaaclab.sh -p scripts/tools/sysid/add_openarm_hand.py
+./isaaclab.sh -p scripts/tools/sysid/add_openarm_camera_mount.py
 ```
+
+## Tasks
+
+| Task | Use |
+|---|---|
+| `Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1` | **Recommended.** Pringles hand-over with the real look (real colours, room, camera noise, fitted contact physics) |
+| `Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0` | Same task, plain sim look |
+| `Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1` / `-Mimic-v0` | Mimic annotate / generate for the tasks above |
+| `Isaac-PlateWipe-OpenArm-IK-Abs-v0` | Plate wiping |
+| `Isaac-InsertBattery-OpenArm-IK-Abs-v0` | Battery insertion |
+
+## 1. Sim server (what `--robot.type=openarm_isaac` connects to)
+
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py     --task Isaac-PlateWipe-OpenArm-IK-Abs-v0     --dataset_file logs/demos/plate_wipe.hdf5     --num_demos 20     --teleop_device vr_joint_ros2_native --ros2_domain_id 1     --manual_save --headless --real_arm     --real_arm_dataset datasets/openarm_pringles_real_v00     --real_arm_task "Pick up the Pringles can with the right arm, hand it to the left arm"  --max-joint-speed 0.3
+./isaaclab.sh -p scripts/tools/lerobot_sim_server.py --enable_cameras --headless \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1 --task_mode handover \
+  --domain_randomization none \
+  --mimic_hdf5 logs/demos/pringles_sim_src_v00.hdf5
 ```
 
-Dora publish code
+- Start `lerobot-record` / `lerobot-rollout` only after `[lerobot_sim_server] ready on 127.0.0.1:5710`.
+- Drop `--mimic_hdf5 ...` for teleoperation and evaluation.
+- Restart the server after pulling changes.
 
-please refer to https://github.com/StanleyChueh/dora-openarm-data-collection.git 
+## 2. Mimic: synthetic data from the recorded sim demos
 
-Without MuJoCo GUI
+Stop the sim server first (Ctrl-C).
 
-```
-cd ~/Stanley_ws/dora-openarm-data-collection
-source .venv/bin/activate
-dora run dataflow-vr-mujoco-ros2.yaml --uv
-```
-
-With MuJoCo GUI
-
-```
-cd ~/Stanley_ws/dora-openarm-data-collection
-source .venv/bin/activate
-dora run dataflow-vr-mujoco-ros2-viewer.yaml --uv
-```
-
-note:
-make sure the ip in meta quest3 pro setup is as same as your pc, if not, you can use the following command to do the mapping
-
-```
-sudo ip addr add 10.100.1.240/24 dev wlp7s0
-```
-
-# Replay dataset
-
-Replay in IsaacSim
-
-```
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/replay_demos.py \
-    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/plate_wipe.hdf5  \
-    --enable_cameras
-```
 
-Replay in real world
-
-```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-env -u PYTHONPATH -u LD_LIBRARY_PATH ~/miniforge3/envs/lerobot-openarm-cf/bin/python   replay_hf_sim_episode_realgrip.py   --repo-id ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz --episode 0   --calibration calibration.json --model-path /home/csl/Stanley_ws/IsaacLab/source/isaaclab_assets/data/v1_camera_isaac/urdf/v1_camera.urdf   --grip-continuous --grip-input-closed 0.029 --grip-close-frac 1.0   --handshake-tolerance 1.0 --ramp-duration 3.0 --max-joint-speed 1.8   --max-steps 3000 --plot sim_vs_real_realgrip_continuous.png --playback-hz 7.5
-```
-
-# Remove episode
-
-```
-./isaaclab.sh -p scripts/tools/remove_demos_hdf5.py \
-    --dataset_file logs/demos/plate_wipe.hdf5 --episodes 3 7 10~13 \
-    --output logs/demos/plate_wipe_fixed.hdf5
-```
-
-# Isaac Lab Mimic
-
-## Record source demo (IsaacSim)
-
-Use the following commands to record dataset in IsaacSim with Meta Quest3 Pro(same as above)
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
-    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
-    --dataset_file logs/demos/plate_wipe.hdf5 \
-    --enable_cameras \
-    --num_demos 10 \
-    --teleop_device vr_joint_ros2_native \
-    --ros2_domain_id 1 \
-    --manual_save
-```
-
-```
-cd ~/Stanley_ws/dora-openarm-data-collection
-source .venv/bin/activate
-dora run dataflow-vr-mujoco-ros2.yaml --uv
-```
-
-## lerobot-compatible sim pipeline (recommended)
-
-Record sim demos through the official `lerobot-record` exactly like the real arm, get the same demos as Mimic
-source demos, generate with domain randomization, and convert to the real datasets' format:
-`scripts/tools/lerobot_sim_server.py` (`--mimic_hdf5`), then `annotate_demos.py --from_states` and
-`generate_dataset.py` below (they record the joint targets lerobot needs, `openarm_recorders.py`), then
-lerobot_openarm's `mimic_to_lerobot.py`. Full commands: lerobot_openarm README, "Isaac Sim through the same
-pipeline", Sim Steps 1-6.
-
-Real look: run the same steps with `--task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1` for the server and
-`--task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1` for `annotate_demos.py` / `generate_dataset.py`: the real robot's
-colours, the photographed table and room, the cameras' blur/noise and the contact physics fitted to the real episodes
-(`scripts/tools/sysid/README.md`, "Real look"). `--enable_domain_randomization --domain_randomization_profile visual|full`
-and `--randomize_object_size` work as on v0; under the look, the full profile's background swap hides the photo room so the
-random skybox shows, and lighting changes apply to the photo backdrop too.
-
-## Annotate with subtask signals (auto-mode uses get_subtask_term_signals)
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+# 2a. Annotate
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
-  --task Isaac-PlateWipe-OpenArm-IK-Abs-v0 \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1 \
   --task_mode handover --auto --from_states \
-  --enable_cameras \
-  --input_file logs/demos/plate_wipe.hdf5 \
-  --output_file logs/demos/plate_wipe_annotated.hdf5
-```
+  --enable_cameras --headless \
+  --input_file logs/demos/pringles_sim_src_v00.hdf5 \
+  --output_file logs/demos/pringles_sim_src_v00_annotated.hdf5
 
-## Generate augmented dataset
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+# 2b. Generate (domain randomization: visual)
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task Isaac-PlateWipe-OpenArm-IK-Abs-v0  \
-    --input_file logs/demos/plate_wipe_annotated.hdf5 \
-    --output_file logs/demos/plate_wipe_annotated_generated.hdf5 \
-    --task_mode handover \
-    --generation_num_trials 50 --num_envs 4 --enable_cameras
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1 --task_mode handover \
+  --input_file logs/demos/pringles_sim_src_v00_annotated.hdf5 \
+  --output_file logs/demos/pringles_sim_mimic_v00.hdf5 \
+  --generation_num_trials 500 --num_envs 4 --enable_cameras --headless \
+  --enable_domain_randomization --domain_randomization_profile visual
 ```
 
-### Generate augemented dataset w domain randomization(lighting,camera angle...)
+Other generate options:
 
-```
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_lighting_generated.hdf5     --generation_num_trials 10 --num_envs 4 --enable_cameras     --enable_domain_randomization --domain_randomization_profile visual  --task_mode handover
-```
-
-### Generate augemented dataset w domain randomization(pringles's size)
-
-Add "--randomize_object_size" to randomize pringles'size
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+```bash
+# no randomization
 ./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0 \
-    --input_file logs/demos/pickup_pringles_annotated.hdf5 \
-    --output_file logs/demos/pickup_pringles_dr_size_generated.hdf5 \
-    --task_mode handover \
-    --generation_num_trials 50 --num_envs 4 --enable_cameras \
-    --randomize_object_size
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1 --task_mode handover \
+  --input_file logs/demos/pringles_sim_src_v00_annotated.hdf5 \
+  --output_file logs/demos/pringles_sim_mimic_v00.hdf5 \
+  --generation_num_trials 500 --num_envs 4 --enable_cameras --headless
+
+# strong randomization: background swap + any colour + table position + can size
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v1 --task_mode handover \
+  --input_file logs/demos/pringles_sim_src_v00_annotated.hdf5 \
+  --output_file logs/demos/pringles_sim_mimic_v00.hdf5 \
+  --generation_num_trials 500 --num_envs 4 --enable_cameras --headless \
+  --enable_domain_randomization --domain_randomization_profile full --randomize_object_size
 ```
 
-### Generate augemented dataset w domain randomization(background changing)
+Then convert to a LeRobot dataset with lerobot_openarm's `mimic_to_lerobot.py` (lerobot_openarm README, Sim Step 4).
 
-```
+## Check or clean recorded demos
+
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-Mimic-v0     --input_file logs/demos/pickup_pringles_V9_annotated.hdf5     --output_file logs/demos/pickup_pringles_dr_strong_generated.hdf5     --generation_num_trials 50 --num_envs 4 --enable_cameras     --enable_domain_randomization --task_mode handover --domain_randomization_profile full --randomize_object_size
+
+# replay one demo (episode 0)
+./isaaclab.sh -p scripts/tools/replay_demos.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v1 --task_mode handover \
+  --dataset_file logs/demos/pringles_sim_src_v00.hdf5 --select_episodes 0 --enable_cameras
+
+# remove bad demos (here 3, 7 and 11-13) into a new file
+./isaaclab.sh -p scripts/tools/remove_demos_hdf5.py \
+  --dataset_file logs/demos/pringles_sim_src_v00.hdf5 --episodes 3 7 11-13 \
+  --output logs/demos/pringles_sim_src_v00_clean.hdf5
 ```
 
-# Convert HDF5 to LeRobot format 
+## Domain randomization profiles
 
+| Profile | Changes |
+|---|---|
+| `none` | nothing (recording source demos) |
+| `visual` | lighting, object/table colour (hue kept), camera mount jitter, table height |
+| `full` | `visual` + background swap (random skybox), any object colour, table position |
+
+On `-v1` / `-Mimic-v1` the lighting change also applies to the photographed room and table.
+
+## Tips
+
+- **SAFETY HOLD in sim** (`request is ... from the measured joint`): add `--robot.max_tracking_error=1.0` to `lerobot-record`.
+- **Robot self-collisions** are off by default (the arms can pass through each other); turn them on with
+  `OPENARM_SELF_COLLISIONS=1 ./isaaclab.sh -p ...`.
+- **One sim server at a time** on a 16 GB GPU.
+- **Disk:** Mimic output is ~250 MB per generated demo (cameras included).
+- **New recording set:** bump `_v00` in the dataset / HDF5 names.
+
+## Sim ↔ real fidelity
+
+Gripper with the official finger offsets and foam pads (opens like the real one), real D435i bar + clamp ring + cable,
+black mats, room backdrop fused from the real recordings, fitted robot colours and contact physics.
+Tools and how each was measured: [`scripts/tools/sysid/README.md`](scripts/tools/sysid/README.md).
+
+<details>
+<summary><b>Legacy workflow</b> (before lerobot_openarm; kept for reference, not maintained)</summary>
+
+Record in Isaac Sim with Quest 3 Pro (dora + MuJoCo IK):
+
+```bash
+cd ~/Stanley_ws/dora-openarm-data-collection && source .venv/bin/activate
+dora run dataflow-vr-mujoco-ros2.yaml --uv
 ```
+
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-python -u scripts/tools/convert_hdf5_to_lerobot.py     --hdf5 logs/demos/pickup_pringle.hdf5     --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_test     --task "Pick up the Pringles can with the right arm, hand it to the left arm"     --fps 30 --cameras right_wrist_cam wrist_cam body_cam
+./isaaclab.sh -p scripts/tools/record_demos_openarm.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --task_mode handover \
+  --dataset_file logs/demos/pickup_pringle.hdf5 \
+  --enable_cameras --num_demos 10 \
+  --teleop_device vr_joint_ros2_native --ros2_domain_id 1 --manual_save
 ```
 
-# Push dataset to the Hub
+Add `--real_arm` to drive the real arms alongside (`--real_arm_dataset <dir>` also records the real cameras).
 
-```
-conda activate env_isaaclab && cd ~/Stanley_ws/IsaacLab
-python scripts/push_to_hub.py
-```
+Convert an HDF5 to LeRobot (old converter):
 
-# Train in LeRobot format
-
-### SmolVLA
-
-```
-cd ~/CSL/lerobot/ && conda activate lerobot
- lerobot-train   --policy.path=lerobot/smolvla_base   --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_test   --batch_size=16   --steps=40000   --output_dir=outputs/train/openarm_visuomotor_VR_pringles_test   --job_name=my_smolvla_training   --policy.device=cuda   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_test  --wandb.enable=false   --rename_map='{
-    "observation.images.right_wrist_cam": "observation.images.camera1",
-    "observation.images.wrist_cam":       "observation.images.camera2",
-    "observation.images.body_cam":        "observation.images.camera3"
-  }'   --dataset.video_backend=pyav --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
+```bash
+cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
+python -u scripts/tools/convert_hdf5_to_lerobot.py \
+  --hdf5 logs/demos/pickup_pringle.hdf5 \
+  --output ~/Stanley_ws/IsaacLab/datasets/ethanCSL/openarm_visuomotor_VR_pringles_test \
+  --task "Pick up the Pringles can with the right arm, hand it to the left arm" \
+  --fps 30 --cameras right_wrist_cam wrist_cam body_cam
 ```
 
-### GR00T N1.7 (Testing, unstable)
+Evaluate a SmolVLA policy inside Isaac Lab (old eval loop):
 
-For 2x RTX 4090(48GB VRAM)
-
-Multiple modules are frozen during training
-
-```
-torchrun --nproc-per-node=2 $(which lerobot-train)   --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --dataset.image_transforms.enable=true   --policy.type=groot   --policy.device=cuda   --policy.base_model_path=nvidia/GR00T-N1.7-3B   --policy.embodiment_tag=new_embodiment   --policy.chunk_size=16   --policy.n_action_steps=16   --policy.use_relative_actions=true   --policy.relative_exclude_joints='["LJ8", "RJ8"]'   --policy.use_bf16=true   --policy.push_to_hub=true   --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --seed=42   --batch_size=16   --steps=20000   --save_checkpoint=true   --save_freq=5000   --use_policy_training_preset=true   --env_eval_freq=0   --eval_steps=0   --log_freq=10   --output_dir=outputs/trains/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t   --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz   --wandb.enable=false   --wandb.disable_artifact=false   --parallelism.dp_shard=2   --accelerator.mixed_precision=bf16   --accelerator.fsdp.wrap_modules='["Qwen3VLVisionBlock", "Qwen3VLTextDecoderLayer", "BasicTransformerBlock"]'
-```
-
-=> It takes around 46GB VRAM 
-
-For a single RTX Pro 6000(96GB VRAM)
-
-Standard fine-tuning
-
-```
-lerobot-train \
-  --dataset.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
-  --dataset.image_transforms.enable=true \
-  --policy.type=groot \
-  --policy.device=cuda \
-  --policy.base_model_path=nvidia/GR00T-N1.7-3B \
-  --policy.embodiment_tag=new_embodiment \
-  --policy.chunk_size=16 \
-  --policy.n_action_steps=16 \
-  --policy.use_relative_actions=true \
-  --policy.relative_exclude_joints='["LJ8", "RJ8"]' \
-  --policy.use_bf16=true \
-  --policy.push_to_hub=true \
-  --policy.repo_id=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
-  --seed=42 \
-  --batch_size=64 \
-  --steps=20000 \
-  --save_checkpoint=true \
-  --save_freq=20000 \
-  --use_policy_training_preset=true \
-  --env_eval_freq=0 \
-  --eval_steps=0 \
-  --log_freq=10 \
-  --output_dir=outputs/train/ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
-  --job_name=ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t_v2 \
-  --wandb.enable=false \
-  --wandb.disable_artifact=false
-  --dataset.image_transforms.enable=true --dataset.image_transforms.random_order=true --dataset.image_transforms.max_num_transforms=6
-```
-
-=> It takes around 47GB VRAM
-
-# Model Evaluation
-
-## Deploy in Isaac Sim
-
-### SmolVLA
-
-Launch SmolVLA Policy Server
-
-```
+```bash
 conda activate lerobot && cd ~/Stanley_ws/IsaacLab
 python scripts/imitation_learning/lerobot/smolvla_server.py \
-    --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
-    --task "Pick up the Pringles can with the right arm, hand it to the left arm." \
-    --port 5556
+  --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz \
+  --task "Pick up the Pringles can with the right arm, hand it to the left arm." --port 5556
 ```
 
-Run Isaac Lab Eval
-
-```
+```bash
 cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
- ./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover
+./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py \
+  --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0 --task_mode handover \
+  --num_rollouts 5 --horizon 300 --enable_cameras --cameras right_wrist_cam,wrist_cam,body_cam
 ```
 
-### GR00T N1.7 (Testing, unstable)
-
-Launch GR00T N1.7 Policy Server
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate lerobot-latest
-python scripts/imitation_learning/lerobot/gr00t_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz_gr00t     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
-```
-
-Run Isaac Lab Eval
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_groot_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover   
-```
-
-## Run Isaac Lab Eval, and send command to real robot
-
-Checking possible sim2real gap with this experiment
-
-<img width="1686" height="839" alt="image" src="https://github.com/user-attachments/assets/c4c7885c-d578-4fa7-9b7f-b1c1ff8908d3" />
-
-Run smolvla server
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate lerobot
-python scripts/imitation_learning/lerobot/smolvla_server.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz     --task "Pick up the Pringles can with the right arm, hand it to the left arm."     --port 5556
-```
-
-Run Isaac Lab control
-
-```
-cd ~/Stanley_ws/IsaacLab && conda activate env_isaaclab
-./isaaclab.sh -p scripts/imitation_learning/lerobot/eval_smolvla_jointspace.py     --task Isaac-PickUp-RedCube-OpenArm-IK-Abs-v0     --num_rollouts 5 --horizon 300 --enable_cameras     --cameras right_wrist_cam,wrist_cam,body_cam --task_mode handover     --mirror_udp_port 5557 --mirror_feedback_port 5558 --mirror_rate_hz 20
-```
-
-Run UDP to broadcast joint states
-
-```
-cd ~/Stanley_ws/lerobot_openarm && uv sync && source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python mirror_bridge.py \
-    --calibration calibration.json \
-    --udp-port 5557 \
-    --feedback-port 5558 \
-    --model-path /home/csl/Stanley_ws/lerobot_openarm/model/openarm_description.urdf \
-    --right-port can0 --left-port can1 \
-    --max-joint-speed 0.3
-```
-
-### Press "Enter" in the "Run Isaac Lab control" terminal to start!!
-
-# Run in Real-world
-
-## Activate CAN-FD
-
-```
-cd ~/Stanley_ws/openarm_can/setup
-```
-
-```
-sudo ./my_arm 
-```
-
-## Model evaluation on real robot
-
-```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_pickup_jointspace.py     --checkpoint ethanCSL/openarm_visuomotor_VR_pringles_V14_background_30hz     --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --inference-hz 30 --max-joint-speed 1.5 --max-episode-seconds 600 
-```
-
-Deploy in async evaluation
-
-```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_smolvla_async.py     --checkpoint ethanCSL/openarm_plate_wiping_real_v00_smolvla    --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right     --calibration calibration.json     --control-hz 20 --max-joint-speed 1.5     --actions-per-chunk 50 --chunk-size-threshold 0.5     --max-episode-seconds 20 --max-episodes 20 --rerun  --no-live-view --gripper-squeeze-tau 1.0
-```
-
-Deploy in async evaluation(GR00T N1.7)
-
-```
-cd ~/Stanley_ws/lerobot_openarm
-uv sync
-source .venv/bin/activate
-env -u PYTHONPATH LD_LIBRARY_PATH=/usr/local/cuda/lib64 python deploy_gr00t_async.py \
-  --checkpoint ethanCSL/openarm_pringles_gr00t_real_v00 \
-  --body-cam-index rs_body --wrist-cam-index rs_wrist_left --right-wrist-cam-index rs_wrist_right \
-  --calibration calibration.json \
-  --control-hz 30 --max-joint-speed 1.5 --chunk-size-threshold 0.8 \
-  --max-episode-seconds 20 --max-episodes 20 --rerun --no-live-view
-```
-
+</details>
