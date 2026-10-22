@@ -2071,10 +2071,11 @@ def _handover_subtask_configs() -> tuple[dict, list]:
     # SubTaskConfig(...) call. Same loose style as _idle_subtasks.
     def _subtask(term_signal, description, interp: int = SEAM_INTERP, object_ref: str | None = None):
         # 'nearest_neighbor_object' needs an object to measure against, so a segment with no
-        # object_ref falls back to 'random' -- same pairing as _idle_subtasks. 'random' does not
-        # mean this segment picks its own demo: with generation_select_src_per_arm False the demo
-        # is already fixed by whichever subtask selected first, and only the first subtask of each
-        # arm selects at all (generation_select_src_per_subtask is False too).
+        # object_ref falls back to 'random' -- same pairing as _idle_subtasks. With
+        # generation_select_src_per_arm False the demo is picked ONCE, by the first subtask of the
+        # first arm in subtask_configs (the generator walks the arms in insertion order), and every
+        # other arm reuses it -- which is why the right arm, whose segment is the one anchored on
+        # the can, has to come first (see subtask_configs below).
         return SubTaskConfig(
             object_ref=object_ref,  # type: ignore[arg-type]  (annotated `str` upstream, None is valid)
             subtask_term_signal=term_signal,
@@ -2159,10 +2160,22 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             description=description,
         )
 
-    # Insertion order stays left-then-right to match the single-arm modes, so the eef ordering a
-    # Mimic env sees never depends on the mode -- only the CONTENT differs, the left arm here
-    # being the receiving hand.
+    # Right arm FIRST: the generator picks the source demo for every arm at the first subtask of
+    # the first arm it meets, in insertion order. With the left arm first that pick was 'random'
+    # (its segment has no object_ref), so nn_k=1 below never ran: measured over
+    # logs/demos/openarm_pringles_lerobot_sim_10_v00_generated.hdf5, episode 2 took source demo 1,
+    # whose can stood 20 cm nearer the robot, and the right arm's whole reach was shifted 20 cm
+    # out -- the straight-elbow rise of the right arm in 73 of 500 episodes. Actions and recorded
+    # data are keyed by arm name, so nothing else depends on this order.
     subtask_configs = {
+        RIGHT_EEF: [
+            # The only transformed segment in the mode: the can is wherever it spawned.
+            _subtask("grasp_right", "Reach and grasp the can", object_ref=CAN_NAME),
+            # Untransformed, so it brings the can back onto the source trajectory and hands it over
+            # at the source's pass point. object_ref=CAN_NAME here would re-anchor on a pose this
+            # very arm is producing and walk the pass point away from the waiting left hand.
+            _subtask(None, "Present the can, release it and withdraw"),
+        ],
         # One segment, untransformed, from step 0 to the end of the episode: the arm waits, takes
         # the can where the source demo's giving hand presents it, and carries it away. There is no
         # boundary to place because there is nothing this arm has to adapt to -- see the
@@ -2172,14 +2185,6 @@ def _handover_subtask_configs() -> tuple[dict, list]:
             # interpolation from its rest pose to its rest pose, so the extra steps are extra
             # waiting, deliberately matched to the right arm's total. See LEFT_INTERP above.
             _subtask(None, "Wait, take the presented can and carry it away", interp=LEFT_INTERP),
-        ],
-        RIGHT_EEF: [
-            # The only transformed segment in the mode: the can is wherever it spawned.
-            _subtask("grasp_right", "Reach and grasp the can", object_ref=CAN_NAME),
-            # Untransformed, so it brings the can back onto the source trajectory and hands it over
-            # at the source's pass point. object_ref=CAN_NAME here would re-anchor on a pose this
-            # very arm is producing and walk the pass point away from the waiting left hand.
-            _subtask(None, "Present the can, release it and withdraw"),
         ],
     }
     return subtask_configs, []
@@ -2387,9 +2392,10 @@ def apply_task_mode(env_cfg, mode: str, lift_height_offset: float = 0.025) -> No
     else:
         working_eef = LEFT_EEF if mode == TASK_MODE_LEFT else RIGHT_EEF
         idle_eef = RIGHT_EEF if mode == TASK_MODE_LEFT else LEFT_EEF
-        # Insertion order is left-then-right regardless of which one works, so the eef ordering
-        # a Mimic env sees never depends on the mode.
-        subtask_configs = {LEFT_EEF: None, RIGHT_EEF: None}
+        # Working arm first: the source demo is picked once, at the first arm's first subtask, and
+        # only the working arm's picks by object (the idle arm's is 'random') -- see
+        # _handover_subtask_configs.
+        subtask_configs = {working_eef: None, idle_eef: None}
         subtask_configs[working_eef] = _pick_subtasks(term_signal_grasp="grasp")
         subtask_configs[idle_eef] = _idle_subtasks()
         env_cfg.subtask_configs = subtask_configs

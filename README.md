@@ -91,6 +91,13 @@ Other generate options:
   --enable_domain_randomization --domain_randomization_profile full --randomize_object_size
 ```
 
+Check the output for jolts no source demo has (a can lurch at the hand-over, ~15% of episodes), then run the
+remove command it prints. It writes `pringles_sim_mimic_v00_clean.hdf5`:
+
+```bash
+./isaaclab.sh -p scripts/tools/check_mimic_demos.py --dataset_file logs/demos/pringles_sim_mimic_v00.hdf5
+```
+
 Then convert to a LeRobot dataset with lerobot_openarm's `mimic_to_lerobot.py` (lerobot_openarm README, Sim Step 4).
 
 ## Check or clean recorded demos

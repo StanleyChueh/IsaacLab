@@ -8,6 +8,7 @@ from isaaclab.envs.mimic_env_cfg import MimicEnvCfg
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm import openarm_real_look
+from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_mimic_actions import use_source_like_motion
 from isaaclab_tasks.manager_based.manipulation.stack.config.openarm.openarm_task_modes import (
     TASK_MODE_LEFT,
     apply_task_mode,
@@ -35,6 +36,10 @@ class OpenArmPickUpIKAbsMimicEnvCfg(OpenarmPickUpRedCubeEnvCfg, MimicEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Joint-limit aware IK and source-speed grippers: without them the generated motion has elbow flips and
+        # gripper snaps the source demos never had (see openarm_mimic_actions).
+        use_source_like_motion(self)
 
         # Dataset generation settings (relative mode = delta pose controller)
         self.datagen_config.name = "demo_src_pickup_openarm_task_D0"
